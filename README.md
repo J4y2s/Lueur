@@ -37,7 +37,7 @@ L'iPhone, le pont Hue et la VM doivent être sur le **même réseau** (même VLA
 Dans le shell de l'hôte Proxmox, en root :
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/TON-PSEUDO/lueur/main/create-hue-sync-vm.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/J4y2s/lueur/V.1/create-hue-sync-vm.sh)"
 ```
 
 > Utilise bien cette forme et non `curl … | bash` : le script doit pouvoir te poser une question si tu as plusieurs adaptateurs Bluetooth.
