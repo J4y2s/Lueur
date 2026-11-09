@@ -346,6 +346,11 @@ def plan_channels(area, plans):
     (le long du ruban, ou de gauche à droite) et sa vraie position gauche / droite."""
     plan = (plans or {}).get(area.get("id"), {}) if isinstance(plans, dict) else {}
     pts = plan.get("ch", {}) if isinstance(plan, dict) else {}
+    try:                                   # proportions de la pièce : profondeur / largeur
+        dims = plan.get("dims") or {}
+        ratio = float(dims["d"]) / float(dims["w"]) if dims.get("w") and dims.get("d") else 1.0
+    except (TypeError, ValueError, ZeroDivisionError, AttributeError):
+        ratio = 1.0
     out = []
     for ch in area.get("channels", []):
         c = dict(ch)
@@ -353,7 +358,7 @@ def plan_channels(area, plans):
         if isinstance(q, dict):
             try:
                 t, x, y = (max(-1.0, min(1.0, float(q[k]))) for k in ("t", "x", "y"))
-                c["position"] = {"x": t * 2 - 1, "y": y, "z": 0, "sx": x}
+                c["position"] = {"x": t * 2 - 1, "y": y, "z": 0, "sx": x, "sy": y * ratio}
             except (KeyError, TypeError, ValueError):
                 pass
         out.append(c)
@@ -393,18 +398,54 @@ TEST_COLORS = ["#ff0000", "#ff7a00", "#ffe600", "#00d000", "#00e5ff", "#0030ff",
                "#ff00a8", "#ffffff", "#7a3b00"]
 
 
+def _pos2(c):
+    """Position réelle d'un canal dans la pièce (gauche-droite, avant-fond à l'échelle)."""
+    p = c["position"]
+    return p.get("sx", p["x"]), p.get("sy", p.get("y", 0))
+
+
+def strip_anchor(strip, o):
+    """Point du ruban le plus proche d'une lampe : (canal a, canal b, f). La lampe prend la couleur
+    a et b mélangées (f = 0 : tout a, f = 1 : tout b). `strip` est trié dans l'ordre du ruban."""
+    if len(strip) == 1:
+        c = strip[0]["channel_id"]
+        return c, c, 0.0
+    pts = [_pos2(c) for c in strip]
+    ox, oy = _pos2(o)
+    steps = [((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2) ** 0.5 for i in range(len(pts) - 1)]
+    pairs = list(range(len(pts) - 1))
+    close = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2) ** 0.5
+    if len(pts) > 2 and close <= 1.6 * sorted(steps)[len(steps) // 2]:
+        pairs.append(-1)                   # le ruban fait le tour : le dernier segment touche le premier
+    best = None
+    for i in pairs:
+        a, b = (len(pts) - 1, 0) if i == -1 else (i, i + 1)
+        (ax, ay), (bx, by) = pts[a], pts[b]
+        dx, dy = bx - ax, by - ay
+        L = dx * dx + dy * dy
+        f = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy) / L))
+        d = (ax + dx * f - ox) ** 2 + (ay + dy * f - oy) ** 2
+        if best is None or d < best[0]:
+            best = (d, strip[a]["channel_id"], strip[b]["channel_id"], f)
+    return best[1], best[2], best[3]
+
+
+def mix_hex(a, b, f):
+    ca, cb = hex_to_rgb(a), hex_to_rgb(b)
+    return "#%02x%02x%02x" % tuple(int(round((x + (y - x) * f) * 255)) for x, y in zip(ca, cb))
+
+
 def test_color_map(channels, kinds):
     """{canal: couleur} pour le test : segments du ruban en couleurs distinctes (dans l'ordre du
-    plan), les autres lampes prennent la couleur du segment le plus proche d'elles."""
-    pos2 = lambda c: (c["position"].get("sx", c["position"]["x"]), c["position"].get("y", 0))
+    plan), les autres lampes prennent la couleur du point du ruban le plus proche d'elles, avec
+    l'entre-deux (à mi-chemin entre deux segments : le mélange des deux couleurs)."""
     strip = sorted([c for c in channels if kinds.get(c["channel_id"]) == "ruban"], key=lambda c: c["position"]["x"])
     out = {c["channel_id"]: TEST_COLORS[i % len(TEST_COLORS)] for i, c in enumerate(strip)}
     others = [c for c in channels if c["channel_id"] not in out]
     for k, o in enumerate(others):
         if strip:
-            ox, oy = pos2(o)
-            near = min(strip, key=lambda c: (pos2(c)[0] - ox) ** 2 + (pos2(c)[1] - oy) ** 2)
-            out[o["channel_id"]] = out[near["channel_id"]]
+            a, b, f = strip_anchor(strip, o)
+            out[o["channel_id"]] = mix_hex(out[a], out[b], f)
         else:
             out[o["channel_id"]] = TEST_COLORS[k % len(TEST_COLORS)]
     return out
@@ -1192,15 +1233,13 @@ class Layered:
         # Effets « le long du ruban » : le ruban joue l'effet, et chaque autre lampe du même groupe
         # (spot, Play…) reprend la couleur du point du ruban le plus proche d'elle dans la pièce.
         self.follow = {}
-        pos2 = lambda c: (c["position"].get("sx", c["position"]["x"]), c["position"].get("y", 0))
         for name, (m, sp, chs) in list(groups.items()):
             strip = [c for c in chs if kinds.get(c["channel_id"]) == "ruban"]
             others = [c for c in chs if kinds.get(c["channel_id"]) != "ruban"]
             if m in ALONG and len(strip) > 1 and others:
+                order = sorted(strip, key=lambda c: c["position"]["x"])
                 for o in others:
-                    ox, oy = pos2(o)
-                    near = min(strip, key=lambda c: (pos2(c)[0] - ox) ** 2 + (pos2(c)[1] - oy) ** 2)
-                    self.follow[o["channel_id"]] = near["channel_id"]
+                    self.follow[o["channel_id"]] = strip_anchor(order, o)
                 groups[name] = (m, sp, strip)
         fx = {}
         for name, (m, sp, chs) in groups.items():
@@ -1224,7 +1263,9 @@ class Layered:
             out += e.update(rms, bands, beat, strength)
         if self.follow:
             by = {o[0]: o for o in out}
-            out += [(cid, *by[src][1:]) for cid, src in self.follow.items() if src in by]
+            for cid, (a, b, f) in self.follow.items():
+                if a in by and b in by:
+                    out.append((cid, *(x + (y - x) * f for x, y in zip(by[a][1:], by[b][1:]))))
         self.last_out = out
         return out
 
