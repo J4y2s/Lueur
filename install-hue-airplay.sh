@@ -480,6 +480,28 @@ def plan_eq(area, plans):
     return out
 
 
+# Couleurs du test « couleurs par segment » (dans l'ordre des segments du ruban)
+TEST_COLORS = ["#ff0000", "#ff7a00", "#ffe600", "#00d000", "#00e5ff", "#0030ff", "#9a00ff",
+               "#ff00a8", "#ffffff", "#7a3b00"]
+
+
+def test_color_map(channels, kinds):
+    """{canal: couleur} pour le test : segments du ruban en couleurs distinctes (dans l'ordre du
+    plan), les autres lampes prennent la couleur du segment le plus proche d'elles."""
+    pos2 = lambda c: (c["position"].get("sx", c["position"]["x"]), c["position"].get("y", 0))
+    strip = sorted([c for c in channels if kinds.get(c["channel_id"]) == "ruban"], key=lambda c: c["position"]["x"])
+    out = {c["channel_id"]: TEST_COLORS[i % len(TEST_COLORS)] for i, c in enumerate(strip)}
+    others = [c for c in channels if c["channel_id"] not in out]
+    for k, o in enumerate(others):
+        if strip:
+            ox, oy = pos2(o)
+            near = min(strip, key=lambda c: (pos2(c)[0] - ox) ** 2 + (pos2(c)[1] - oy) ** 2)
+            out[o["channel_id"]] = out[near["channel_id"]]
+        else:
+            out[o["channel_id"]] = TEST_COLORS[k % len(TEST_COLORS)]
+    return out
+
+
 MAX_AREA_LIGHTS = 10
 # Position d'un ruban à segments dans une zone de divertissement : seul cet endroit (avant, mi-hauteur)
 # garde un canal par segment. Mesuré le 9/11 sur un Flux à 7 segments : 2 points ou tout autre point
@@ -1696,6 +1718,12 @@ def cmd_run(args):
                 # effets (début en rouge, fin en bleu), même sans musique.
                 session.acquire()
                 silent_since = now
+                if test.get("mode") == "colors":
+                    # Couleurs par segment : chaque segment du ruban a sa couleur, chaque spot prend
+                    # celle du segment le plus proche sur le plan (pour vérifier où sont les spots).
+                    cmap = test_color_map(plan_channels(area, settings["plans"]), kinds)
+                    session.send([(cid, *(v * 0.85 for v in hex_to_rgb(hx))) for cid, hx in cmap.items()])
+                    continue
                 order = [c["channel_id"] for c in sorted(plan_channels(area, settings["plans"]),
                                                          key=lambda c: c["position"]["x"])]
                 n = len(order)
@@ -1804,6 +1832,7 @@ Sert la page index.html et une petite API JSON :
   POST /api/light/order  {"light", "order"}               sens du contenu sur un ruban (forward / reversed)
   POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
   POST /api/area/from_room {"id", "rubans"?, "spots"?}    crée la zone de divertissement d'une pièce d'après son plan
+  POST /api/plan/colortest {"id", "rubans", "spots", "dims", "stop"?}  test « couleurs par segment » d'une pièce
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -2023,6 +2052,7 @@ def save_plan(body):
             plans.pop(aid, None)
         else:
             plans[aid] = {
+                "dims": dict(zip("wd", dims_of(body.get("dims")))),
                 "spots": {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()},
                 "rubans": {str(d)[:64]: {"walls": int(num(r.get("walls", 1), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                          "dir": 1 if r.get("dir", 1) >= 0 else -1}
@@ -2030,6 +2060,11 @@ def save_plan(body):
         s["room_plans"] = plans
         write_json(SETTINGS_PATH, s)
         rooms_cache["t"] = 0
+        if not body.get("reset"):
+            try:
+                refresh_room_zone(aid)          # la zone de synchro de la pièce suit le nouveau plan
+            except Exception as e:              # pas de zone, pont injoignable… : le plan reste enregistré
+                print(f"Plan de synchro non recopié : {e}", flush=True)
         return {"ok": True}
     ch = {}
     for k, q in (body.get("ch") or {}).items():
@@ -2047,7 +2082,8 @@ def save_plan(body):
         if eq:
             plans[aid] = {"eq": eq}
     else:
-        plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, **({"eq": eq} if eq else {})}
+        plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, "dims": dict(zip("wd", dims_of(body.get("dims")))),
+                      **({"eq": eq} if eq else {})}
     s["plans"] = plans
     write_json(SETTINGS_PATH, s)
     return {"ok": True}
@@ -2321,6 +2357,34 @@ def perim(sv):
     return a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f
 
 
+def dims_of(dims):
+    """Largeur (mur de l'écran) et profondeur de la pièce en mètres ; carré par défaut."""
+    try:
+        w, d = float((dims or {}).get("w") or 1), float((dims or {}).get("d") or 1)
+    except (TypeError, ValueError, AttributeError):
+        w, d = 1.0, 1.0
+    return max(0.5, min(40.0, w)), max(0.5, min(40.0, d))
+
+
+def along(rb, u, dims=None):
+    """Point du ruban à la fraction u (0-1) de sa longueur, en suivant les murs depuis son coin de
+    départ et dans son sens, avec la vraie longueur de chaque mur (pièce rectangulaire)."""
+    w, d = dims_of(dims)
+    lens = [w, d, w, d]                       # mur avant, droit, fond, gauche
+    c, seq = int(rb.get("corner", 0)) % 4, []
+    for _ in range(max(1, min(4, int(rb.get("walls", 1))))):
+        if rb.get("dir", 1) >= 0:
+            seq.append((c, True)); c = (c + 1) % 4
+        else:
+            c = (c - 1) % 4; seq.append((c, False))
+    s = max(0.0, min(1.0, u)) * sum(lens[e] for e, _ in seq)
+    for k, (e, fwd) in enumerate(seq):
+        if s <= lens[e] or k == len(seq) - 1:
+            f = min(1.0, s / lens[e])
+            return perim(e + (f if fwd else 1 - f))
+        s -= lens[e]
+
+
 def to_hue(px, py):
     return {"x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
 
@@ -2363,7 +2427,7 @@ def rooms_state(force=True):
             for lid, q in (pl.get("spots") or {}).items():
                 pos_r[lid] = to_hue(q[0], q[1])
             for lid, rb in (pl.get("rubans") or {}).items():
-                at = lambda u: to_hue(*perim(rb["corner"] + rb["dir"] * u * rb["walls"]))
+                at = lambda u: to_hue(*along(rb, u, pl.get("dims")))
                 pts = [at(k / (GRAD_POINTS - 1)) for k in range(GRAD_POINTS)]   # points du dégradé, du début à la fin
                 line = [at(k / 48) for k in range(49)]                          # tracé fin (coins compris)
                 pos_r[lid] = {"pos": pts[GRAD_POINTS // 2], "path": pts, "line": line}
@@ -2685,6 +2749,97 @@ ZONE_PREFIX = "Lueur · "
 STRIP_SPOT = hms.STRIP_SPOT
 
 
+def room_sync_plan(cfg, room, area, plan, lights, strips=None):
+    """Plan de la zone de synchro d'une pièce, recopié de son plan Lueur (mêmes conventions que
+    l'éditeur) : ordre et place de chaque segment du ruban, place de chaque spot."""
+    if strips is None:
+        strips = {l["id"]: dict({"walls": 1, "corner": 0, "dir": 1}, **((plan.get("rubans") or {}).get(l["id"]) or {}))
+                  for l in room["lights"] if l.get("has_gradient")}
+    rows = hms.channel_info(cfg, area)
+    light_of_dev = {lights.get(l["id"], {}).get("owner", {}).get("rid"): l["id"] for l in room["lights"]}
+    ch, rubans, spots, by_dev = {}, {}, {}, {}
+    for r in rows:
+        by_dev.setdefault(r["dev"], []).append(r)
+    for dev, rs in by_dev.items():
+        lid = light_of_dev.get(dev)
+        rb = strips.get(lid)
+        if rb and len(rs) > 1:
+            rubans[dev] = rb
+            rs.sort(key=lambda r: r["idx"])
+            for k, r in enumerate(rs):
+                u = (k + 0.5) / len(rs)
+                px, py = along(rb, u, plan.get("dims"))
+                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
+        else:
+            for r in rs:
+                q = (plan.get("spots") or {}).get(lid) or [(r["x"] + 1) / 2, (1 - r["y"]) / 2]
+                q = [max(PM, min(1 - PM, float(q[0]))), max(PM, min(1 - PM, float(q[1])))]
+                spots[str(r["id"])] = q
+                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4)}
+    return rows, ch, rubans, spots, light_of_dev, by_dev
+
+
+def refresh_room_zone(rid):
+    """Recopie le plan d'une pièce dans le plan de sa zone de synchro « Lueur · <pièce> », si elle existe
+    (sans rien changer sur le pont). Renvoie (zone, lignes des canaux, lampe de chaque appareil)."""
+    cfg = _cfg()
+    room = next((r for r in rooms_state(force=False) if r["id"] == rid), None)
+    if not room:
+        return None
+    zname = (ZONE_PREFIX + room["name"])[:32]
+    area = next((a for a in hms.get_areas(cfg) if a.get("metadata", {}).get("name") == zname), None)
+    if not area:
+        return None
+    plan = (get_settings().get("room_plans") or {}).get(rid) or {}
+    lights = {l["id"]: l for l in hms.bridge_get(cfg, "light")}
+    rows, ch, rubans, spots, light_of_dev, _ = room_sync_plan(cfg, room, area, plan, lights)
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    old = plans.get(area["id"]) if isinstance(plans.get(area["id"]), dict) else {}
+    plans[area["id"]] = {"ch": ch, "rubans": rubans, "spots": spots, "dims": plan.get("dims") or {},
+                         **({"eq": old["eq"]} if old.get("eq") else {})}
+    s["plans"] = plans
+    write_json(SETTINGS_PATH, s)
+    return room, area, rows, light_of_dev
+
+
+def color_test(body):
+    """Test « couleurs par segment » depuis le plan d'une pièce : enregistre le plan, recalcule le plan
+    de sa zone de synchro et allume chaque segment d'une couleur (2 min). Renvoie les couleurs pour
+    que l'écran montre les mêmes."""
+    rid = str(body.get("id", ""))[:64]
+    s = get_settings()
+    if body.get("stop"):
+        s["test"] = {}
+        write_json(SETTINGS_PATH, s)
+        return {"ok": True, "stopped": True}
+    save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
+               "dims": body.get("dims")})
+    got = refresh_room_zone(rid)
+    if not got:
+        raise ValueError("Crée d'abord la zone de synchro de cette pièce.")
+    room, area, rows, light_of_dev = got
+    if get_settings().get("area") != area["id"]:
+        update_settings({"area": area["id"]})          # le test passe par la zone de synchro de la pièce
+    s = get_settings()
+    s["test"] = {"area": area["id"], "until": time.time() + 120, "mode": "colors"}
+    write_json(SETTINGS_PATH, s)
+    plans = s.get("plans") or {}
+    started = False
+    if not service_state()["active"]:
+        systemctl("start", SERVICE)
+        started = True
+    cmap = hms.test_color_map(hms.plan_channels(area, plans), {r["id"]: r["kind"] for r in rows})
+    seg, spot = [], {}
+    for r in sorted(rows, key=lambda r: r["idx"]):
+        lid = light_of_dev.get(r["dev"])
+        if lid in (l["id"] for l in room["lights"] if l.get("has_gradient")):
+            seg.append(cmap.get(r["id"]))
+        elif lid:
+            spot[lid] = cmap.get(r["id"])
+    return {"ok": True, "segments": seg, "spots": spot, "started": started, "seconds": 120}
+
+
 def area_from_room(body):
     """Crée (ou met à jour) sur le pont la zone de divertissement « Lueur · <pièce> » à partir du plan
     Lueur de la pièce : chaque lampe à sa place, le ruban de son début à sa fin. Le plan est recopié
@@ -2692,7 +2847,8 @@ def area_from_room(body):
     cfg = _cfg()
     rid = str(body.get("id", ""))[:64]
     if "rubans" in body or "spots" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
-        save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {}})
+        save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
+                   "dims": body.get("dims")})
     room = next((r for r in rooms_state() if r["id"] == rid), None)
     if not room:
         raise ValueError("Pièce introuvable.")
@@ -2748,34 +2904,12 @@ def area_from_room(body):
     area = next((a for a in hms.get_areas(cfg) if a["id"] == aid), None)
     if not area:
         raise hms.HueError("Zone créée, mais introuvable sur le pont.")
-    # Plan de la zone de synchro, recopié du plan de la pièce (mêmes conventions que l'éditeur)
-    rows = hms.channel_info(cfg, area)
-    light_of_dev = {lights.get(lid, {}).get("owner", {}).get("rid"): lid for lid in used}
-    ch, rubans, spots = {}, {}, {}
-    by_dev = {}
-    for r in rows:
-        by_dev.setdefault(r["dev"], []).append(r)
-    for dev, rs in by_dev.items():
-        lid = light_of_dev.get(dev)
-        rb = strips.get(lid)
-        if rb and len(rs) > 1:
-            rubans[dev] = rb
-            rs.sort(key=lambda r: r["idx"])
-            for k, r in enumerate(rs):
-                u = (k + 0.5) / len(rs)
-                px, py = perim(rb["corner"] + rb["dir"] * u * rb["walls"])
-                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
-        else:
-            for r in rs:
-                q = (plan.get("spots") or {}).get(lid) or [(r["x"] + 1) / 2, (1 - r["y"]) / 2]
-                q = [max(PM, min(1 - PM, float(q[0]))), max(PM, min(1 - PM, float(q[1])))]
-                spots[str(r["id"])] = q
-                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4)}
+    rows, ch, rubans, spots, light_of_dev, by_dev = room_sync_plan(cfg, room, area, plan, lights, strips)
     update_settings({"area": aid})                   # la zone devient celle de la musique
     s = get_settings()
     plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
     eq = (plans.get(aid) or {}).get("eq") if isinstance(plans.get(aid), dict) else None
-    plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, **({"eq": eq} if eq else {})}
+    plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, "dims": plan.get("dims") or {}, **({"eq": eq} if eq else {})}
     s.update(plans=plans, area_rev=int(s.get("area_rev", 0)) + 1)
     write_json(SETTINGS_PATH, s)
     areas_cache["data"] = None
@@ -3347,6 +3481,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/area/from_room":
                 try:
                     return self._send(200, area_from_room(body))
+                except hms.HueError as e:
+                    return self._send(502, {"error": str(e)})
+            if path == "/api/plan/colortest":
+                try:
+                    return self._send(200, color_test(body))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
             if path == "/api/plan/eq":
@@ -4086,6 +4225,13 @@ function renderPlans() {
   $$("[data-plan]").forEach(b => b.onclick = () => go("plan", b.dataset.plan));
 }
 const PM = 0.07, PC = [[PM, PM], [1 - PM, PM], [1 - PM, 1 - PM], [PM, 1 - PM]];
+function alongP(r, u, dims) {   // point du ruban à la fraction u, avec la vraie longueur des murs
+  const w = Math.max(.5, +(dims && dims.w) || 1), d = Math.max(.5, +(dims && dims.d) || 1), lens = [w, d, w, d], seq = [];
+  let c = ((r.corner | 0) % 4 + 4) % 4;
+  for (let k = 0; k < Math.max(1, Math.min(4, r.walls | 0)); k++) { if (r.dir >= 0) { seq.push([c, 1]); c = (c + 1) % 4; } else { c = (c + 3) % 4; seq.push([c, 0]); } }
+  let s = Math.max(0, Math.min(1, u)) * seq.reduce((a, [e]) => a + lens[e], 0);
+  for (let k = 0; k < seq.length; k++) { const [e, fwd] = seq[k]; if (s <= lens[e] || k === seq.length - 1) { const f = Math.min(1, s / lens[e]); return perim(e + (fwd ? f : 1 - f)); } s -= lens[e]; }
+}
 function perim(sv) { sv = ((sv % 4) + 4) % 4; const e = Math.floor(sv) % 4, f = sv - Math.floor(sv), a = PC[e], b = PC[(e + 1) % 4]; return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]; }
 function planDevs() {   // lampes à plusieurs segments (rubans) et lampes simples
   const by = {}; PLAN.channels.forEach(c => (by[c.dev] = by[c.dev] || []).push(c));
@@ -4095,7 +4241,7 @@ function planDevs() {   // lampes à plusieurs segments (rubans) et lampes simpl
 }
 function planLayout() {  // positions à l'écran (0-1) et ordre de parcours de chaque canal
   const { rub, single } = planDevs(), pos = {};
-  rub.forEach(([d, cs]) => { const r = PED.rubans[d], n = cs.length; cs.forEach((c, i) => { const u = (i + .5) / n; pos[c.id] = { p: perim(r.corner + r.dir * u * r.walls), t: u, dev: d, i, n }; }); });
+  rub.forEach(([d, cs]) => { const r = PED.rubans[d], n = cs.length; cs.forEach((c, i) => { const u = (i + .5) / n; pos[c.id] = { p: alongP(r, u, PED.dims), t: u, dev: d, i, n }; }); });
   single.forEach(([d, cs]) => cs.forEach(c => { const q = PED.spots[c.id]; pos[c.id] = { p: q, t: q[0], dev: d }; }));
   return pos;
 }
@@ -4105,7 +4251,8 @@ async function renderPlan() {
     $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
-    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) } };
+    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) } };
+    COLORTEST = null;
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
     single.forEach(([, cs]) => cs.forEach(c => PED.spots[c.id] = (pl.spots || {})[c.id] || [clamp((c.x + 1) / 2), clamp((1 - c.y) / 2)]));
@@ -4115,8 +4262,9 @@ async function renderPlan() {
   const { rub, single } = planDevs();
   $("#planHint").textContent = single.length ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   const seg = (k, d, opts, cur) => `<div class="seg">${opts.map(([v, n]) => `<button data-rk="${k}" data-rd="${esc(d)}" data-rv="${v}" class="${cur === v ? "on" : ""}">${n}</button>`).join("")}</div>`;
-  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? (cs[0].sync_segments ? `Synchro : ${cs[0].sync_segments} segments · scènes : ${cs[0].grad_points || 5} points de couleur` : `Dégradé à ${cs[0].grad_points || cs.length} points de couleur · pas encore de zone de synchro`) : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
-    <div class="seg" style="margin-bottom:4px;background:var(--card2)"><button data-ident="${esc(cs[0].light || "")}">Montrer le début</button>${PLAN.type === "room" ? "" : `<button data-ordre>Tester l'ordre</button>`}</div>
+  $("#planRubans").innerHTML = dimsCard() + rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? (cs[0].sync_segments ? `Synchro : ${cs[0].sync_segments} segments · scènes : ${cs[0].grad_points || 5} points de couleur` : `Dégradé à ${cs[0].grad_points || cs.length} points de couleur · pas encore de zone de synchro`) : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
+    <div class="seg" style="margin-bottom:4px;background:var(--card2)"><button data-ident="${esc(cs[0].light || "")}">Montrer le début</button>${PLAN.type === "room" ? (cs[0].sync_segments ? `<button data-ctest class="${COLORTEST ? "on" : ""}">${COLORTEST ? "Arrêter le test" : "Couleurs par segment"}</button>` : "") : `<button data-ordre>Tester l'ordre</button>`}</div>
+    ${COLORTEST ? `<p class="hint" style="margin:6px 2px 0">Chaque segment du ruban a sa couleur (comme sur le plan), et chaque spot prend la couleur du segment le plus proche <b>sur le plan</b>. Si un spot n'a pas la même couleur que le bout de ruban à côté de lui dans la pièce, déplace-le sur le plan : les lampes suivent. Le test s'arrête seul après 2 min.</p>` : ""}
     <p class="hint" style="margin:6px 2px 0">${PLAN.type === "room" ? "Le ruban s'allume du <b style=\"color:#ff5a4a\">rouge</b> (début) au <b style=\"color:#4b8dff\">bleu</b> (fin) pendant 10 s : place la flèche du plan là où tu vois le rouge." : "« Montrer le début » : rouge au début, bleu à la fin (synchro arrêtée). « Tester l'ordre » : avec la synchro en marche, un point blanc parcourt les segments dans l'ordre des effets, du rouge au bleu."}</p>
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
@@ -4129,13 +4277,15 @@ async function renderPlan() {
   if ($("#planArea")) $("#planArea").onclick = async () => {
     const b = $("#planArea"); b.disabled = true; b.textContent = "Création sur le pont…";
     try {
-      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots });
+      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
       toast(`« ${r.name} » ${r.created ? "créée" : "mise à jour"} : ${r.channels} canaux${r.segments ? `, ruban en ${r.segments} segments` : ""}`);
       zones = null; roomsLock = 0; loadRooms(); await refresh(true); PLAN = null; renderPlan();
     } catch (e) { toast("Échec : " + e.message); b.disabled = false; b.textContent = "Réessayer"; }
   };
   $$("[data-eq]").forEach(el => slider(el, t => { const v = Math.round((0.1 + t * 0.9) * 100) / 100; setSl(el, t); PED.eq[el.dataset.eq] = v; el.parentElement.querySelector("[data-eqv]").textContent = Math.round(v * 100) + " %"; clearTimeout(eqTimer); eqTimer = setTimeout(sendEq, 250); }, sendEq));
-  $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); });
+  $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); colorTestSoon(); });
+  $$("[data-dim]").forEach(el => el.onchange = () => { const v = parseFloat(String(el.value).replace(",", ".")); PED.dims[el.dataset.dim] = v > 0 ? Math.min(40, v) : 0; renderPlan(); colorTestSoon(); });
+  $$("[data-ctest]").forEach(b => b.onclick = () => colorTest(!!COLORTEST));
   $$("[data-ident]").forEach(b => b.onclick = async () => {
     if (!b.dataset.ident) return toast("Lampe introuvable sur le pont.");
     try { await api("/api/plan/identify", { light: b.dataset.ident }); toast("Regarde le ruban : rouge = début, bleu = fin (10 s)"); } catch (e) { toast(e.message); }
@@ -4156,6 +4306,25 @@ function areaCard() {    // zone de divertissement de la pièce, créée d'aprè
     <button class="cta" id="planArea" style="margin-top:4px">${z ? "Mettre à jour la zone de synchro" : "Créer la zone de synchro"}</button>
     <p class="hint" style="margin:8px 2px 0">${z ? "Remet" : "Crée"} sur le pont la zone de divertissement « ${esc(name)} » avec les lampes de la pièce placées comme sur ce plan, recopie le plan pour la synchro et la choisit pour la musique. Le nombre de segments du ruban reste celui réglé dans l'app Hue.</p></div>`;
 }
+let COLORTEST = null, ctTimer = null, ctEnd = null;
+function dimsCard() {   // dimensions de la pièce : le plan prend la bonne forme et le ruban suit la vraie longueur des murs
+  const v = k => PED.dims[k] ? String(PED.dims[k]).replace(".", ",") : "";
+  return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon("zones", 22)}</span><span><b>Dimensions de la pièce</b><br><small>${PED.dims.w && PED.dims.d ? "Le plan suit ces proportions" : "Non renseignées : pièce carrée"}</small></span></div>
+    <div style="display:flex;gap:10px"><label class="field" style="flex:1;min-width:0;margin:0;padding:0 10px;gap:6px;background:var(--card2)"><span style="font-size:13px">Largeur</span><input data-dim="w" size="4" style="width:100%;min-width:3.4ch;font-size:16px" inputmode="decimal" placeholder="m" value="${v("w")}"><span>m</span></label><label class="field" style="flex:1;min-width:0;margin:0;padding:0 10px;gap:6px;background:var(--card2)"><span style="font-size:13px">Profondeur</span><input data-dim="d" size="4" style="width:100%;min-width:3.4ch;font-size:16px" inputmode="decimal" placeholder="m" value="${v("d")}"><span>m</span></label></div>
+    <p class="hint" style="margin:8px 2px 0">En mètres. Largeur = le mur de l'écran (en haut du plan), profondeur = de ce mur au mur d'en face. Les segments du ruban sont répartis selon la vraie longueur de chaque mur.</p></div>`;
+}
+async function colorTest(stop) {   // test « couleurs par segment » (plan d'une pièce)
+  clearTimeout(ctTimer);
+  if (stop) { COLORTEST = null; clearTimeout(ctEnd); try { await api("/api/plan/colortest", { id: PLAN.id, stop: true }); } catch (e) {} if (route.v === "plan") renderPlan(); return; }
+  try {
+    const r = await api("/api/plan/colortest", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
+    const first = !COLORTEST; COLORTEST = { segments: r.segments || [], spots: r.spots || {} };
+    if (first) toast(r.started ? "Synchro démarrée : chaque segment s'allume de sa couleur" : "Chaque segment s'allume de sa couleur (2 min)");
+    clearTimeout(ctEnd); ctEnd = setTimeout(() => { COLORTEST = null; if (route.v === "plan") renderPlan(); }, (r.seconds || 120) * 1000);
+    renderPlan();
+  } catch (e) { toast(e.message); COLORTEST = null; renderPlan(); }
+}
+function colorTestSoon() { if (COLORTEST && PLAN && PLAN.type === "room") { clearTimeout(ctTimer); ctTimer = setTimeout(() => colorTest(false), 300); } }
 let eqTimer = null;
 function eqCard() {      // équilibre de luminosité de chaque lampe de la zone de synchro
   const by = {}; PLAN.channels.forEach(c => { if (!by[c.dev]) by[c.dev] = c; });
@@ -4170,37 +4339,39 @@ async function sendEq() {
   try { await api("/api/plan/eq", { id: PLAN.id, eq: PED.eq }); const p = { ...(S.settings.plans || {}) }; p[PLAN.id] = { ...(p[PLAN.id] || {}), eq: { ...PED.eq } }; S.settings.plans = p; } catch (e) { toast(e.message); }
 }
 function drawPlan() {
-  const pos = planLayout(), pal = palColors(S.settings.palette), W = 100, H = 75, X = p => p[0] * W, Y = p => p[1] * H;
+  // proportions de la pièce : largeur (mur de l'écran) × profondeur, carré si non renseignées
+  const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0, W = 100, H = dw && dd ? Math.max(35, Math.min(150, 100 * dd / dw)) : 75;
+  const pos = planLayout(), pal = palColors(S.settings.palette), X = p => p[0] * W, Y = p => p[1] * H;
   let h = `<rect x="${PM * W}" y="${PM * H}" width="${(1 - 2 * PM) * W}" height="${(1 - 2 * PM) * H}" rx="2" fill="none" stroke="#3a3b40" stroke-width=".5" stroke-dasharray="1.5 1.5"/>`;
   h += `<rect x="38" y="1.2" width="24" height="1.6" rx=".8" fill="#4a4b52"/>`;
-  const { rub, single } = planDevs();
+  const { rub, single } = planDevs(), CT = COLORTEST;
   rub.forEach(([d, cs]) => {
-    const r = PED.rubans[d], pts = []; for (let k = 0; k <= 60; k++) pts.push(perim(r.corner + r.dir * k / 60 * r.walls));
+    const r = PED.rubans[d], pts = []; for (let k = 0; k <= 60; k++) pts.push(alongP(r, k / 60, PED.dims));
     h += `<polyline points="${pts.map(p => X(p).toFixed(1) + "," + Y(p).toFixed(1)).join(" ")}" fill="none" stroke="#2a2b30" stroke-width="3.2" stroke-linecap="round"/>`;
-    cs.forEach((c, i) => { const q = pos[c.id], col = i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade"; const nx = X(q.p), ny = Y(q.p), cx = 50 - nx, cy = 37.5 - ny, k = 4.2 / (Math.hypot(cx, cy) || 1);
-      h += `<circle cx="${nx}" cy="${ny}" r="1.9" fill="${col}"/><text x="${nx + cx * k}" y="${ny + cy * k + 1}" text-anchor="middle" font-size="2.8" font-weight="700" fill="${col}">${i + 1}</text>`; });
-    const a = perim(r.corner + r.dir * .02 * r.walls), b = perim(r.corner + r.dir * .12 * r.walls), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = perim(r.corner);
+    cs.forEach((c, i) => { const q = pos[c.id], tc = CT && CT.segments[i], col = tc || (i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade"); const nx = X(q.p), ny = Y(q.p), cx = 50 - nx, cy = H / 2 - ny, k = 4.2 / (Math.hypot(cx, cy) || 1);
+      h += `<circle cx="${nx}" cy="${ny}" r="${tc ? 2.6 : 1.9}" fill="${col}"${tc ? ` stroke="#fff" stroke-width=".4"` : ""}/><text x="${nx + cx * k}" y="${ny + cy * k + 1}" text-anchor="middle" font-size="2.8" font-weight="700" fill="${col}">${i + 1}</text>`; });
+    const a = alongP(r, .02, PED.dims), b = alongP(r, .12, PED.dims), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = alongP(r, 0, PED.dims);
     h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
   });
-  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, col = boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && CT.spots[c.light || c.id], col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
     h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
-  const svg = $("#planSvg"); svg.innerHTML = h;
+  const svg = $("#planSvg"); svg.setAttribute("viewBox", `0 0 ${W} ${H.toFixed(1)}`); svg.innerHTML = h;
   svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
   svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
-  svg.onpointerup = svg.onpointercancel = () => { planDrag = null; };
+  svg.onpointerup = svg.onpointercancel = () => { if (planDrag !== null) colorTestSoon(); planDrag = null; };
 }
 async function savePlanQuiet() {   // enregistre le plan de la zone de synchro (pour tester l'ordre)
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
-  await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots });
+  await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
   S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } };
 }
 $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
   try {
-    if (PLAN.type === "room") { await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots }); roomsLock = 0; loadRooms(); }
-    else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } }; }
+    if (PLAN.type === "room") { if (COLORTEST) colorTest(true); await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); roomsLock = 0; loadRooms(); }
+    else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } }; }
     toast("Plan enregistré"); PLAN = null; back();
   }
   catch (e) { toast("Échec : " + e.message); }
