@@ -481,6 +481,10 @@ def plan_eq(area, plans):
 
 
 MAX_AREA_LIGHTS = 10
+# Position d'un ruban à segments dans une zone de divertissement : seul cet endroit (avant, mi-hauteur)
+# garde un canal par segment. Mesuré le 9/11 sur un Flux à 7 segments : 2 points ou tout autre point
+# donnent 1 à 5 canaux, quelles que soient les autres lampes de la zone.
+STRIP_SPOT = {"x": 0.0, "y": 0.8, "z": 0.0}
 CUSTOM_AREA_NAME = "Hue Sync"
 
 
@@ -525,9 +529,12 @@ def save_custom_area(cfg, ent_ids, area_id=None):
     if not ent_ids:
         raise HueError("Choisis au moins une lampe.")
     n = len(ent_ids)
+    strips = {e["id"] for e in bridge_get(cfg, "entertainment")
+              if ((e.get("segments") or {}).get("max_segments") or 1) > 1}
     locations = {"service_locations": [
         {"service": {"rid": eid, "rtype": "entertainment"},
-         "positions": [{"x": round(-1 + 2 * i / (n - 1), 3) if n > 1 else 0.0, "y": 0.8, "z": 0.0}]}
+         "positions": [dict(STRIP_SPOT) if eid in strips else
+                       {"x": round(-1 + 2 * i / (n - 1), 3) if n > 1 else 0.0, "y": 0.8, "z": 0.0}]}
         for i, eid in enumerate(ent_ids)]}
     existing = {a["id"]: a for a in get_areas(cfg)}
     if not area_id or area_id not in existing:
@@ -2657,6 +2664,7 @@ def plan_eq(body):
 
 
 ZONE_PREFIX = "Lueur · "
+STRIP_SPOT = hms.STRIP_SPOT
 
 
 def area_from_room(body):
@@ -2684,10 +2692,10 @@ def area_from_room(body):
         pt = lambda q: {"x": round(q[0] * 2 - 1, 3), "y": round(1 - q[1] * 2, 3), "z": z}
         if l.get("has_gradient"):
             rb = dict({"walls": 1, "corner": 0, "dir": 1}, **((plan.get("rubans") or {}).get(l["id"]) or {}))
-            # 2 points : début et fin du ruban. S'il fait tout le tour, la fin serait sur le début :
-            # on donne le point opposé, pour que les autres applis étalent quand même les segments.
-            span = 0.5 if rb["walls"] >= 4 else 1.0
-            pos = [pt(perim(rb["corner"])), pt(perim(rb["corner"] + rb["dir"] * rb["walls"] * span))]
+            # Un seul point, à l'avant à mi-hauteur : c'est la seule position où le pont garde tous
+            # les segments du ruban séparés (testé le 9/11 : ailleurs, ou avec 2 points, il les
+            # regroupe en 1 à 5 canaux). Lueur n'en a pas besoin : il suit son propre plan.
+            pos = [dict(STRIP_SPOT)]
             strips[l["id"]] = rb
         else:
             q = (plan.get("spots") or {}).get(l["id"])
