@@ -1455,7 +1455,23 @@ def cmd_run(args):
         cfg = load_config()
         area = pick_area(get_areas(cfg), settings["area"])
         if not area:
-            sys.exit("Aucune zone de divertissement : crée-en une dans l'app Hue.")
+            # Pas de zone : on attend qu'une zone soit créée (depuis Lueur ou l'app Hue) au lieu de
+            # quitter, sinon le service redémarrerait en boucle.
+            log("Aucune zone de divertissement : crée-en une dans Lueur (Réglages > Pièces et zones de synchro).")
+            stop_wait = threading.Event()
+            signal.signal(signal.SIGTERM, lambda *_: stop_wait.set())
+            signal.signal(signal.SIGINT, lambda *_: stop_wait.set())
+            while not area and not stop_wait.wait(5):
+                try:
+                    found = get_areas(cfg)
+                    if found:
+                        settings = load_settings(args.settings, args)
+                        area = pick_area(found, settings["area"])
+                except HueError:
+                    area = None
+            if not area:
+                return
+            log("Zone de divertissement trouvée : synchro prête.")
     area_name = area.get("metadata", {}).get("name")
     log(f"Zone : {area_name} ({len(area['channels'])} canaux)")
 
@@ -3610,7 +3626,7 @@ button:active{transform:scale(.96);opacity:.82}
 
   <!-- PLANS DES PIÈCES -->
   <section class="view" data-view="plans">
-    <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Plans des pièces</span></div>
+    <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Pièces et zones de synchro</span></div>
     <p class="note" style="padding:16px 20px 0">Place tes lampes comme dans la vraie pièce. La synchro (Comète, Vague, Stéréo…) et les couleurs des scènes suivent ce plan.</p>
     <div id="plansList"></div>
   </section>
@@ -3661,7 +3677,7 @@ button:active{transform:scale(.96);opacity:.82}
     <div class="list">
       <button class="row" id="bridgeRow"><span class="ic" data-i="pont"></span><span class="bd"><span class="tx"><span class="t1">Pont d'éclairage</span><span class="t2" id="bridgeSub">—</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="lampsRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Lampes de la synchro</span><span class="t2" id="lampsSub">Zone utilisée pour la musique</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
-      <button class="row" id="plansRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Plans des pièces</span><span class="t2">Où sont tes lampes et ton ruban</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
+      <button class="row" id="plansRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Pièces et zones de synchro</span><span class="t2">Plans, et création des zones pour la musique</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="syncRow" role="switch"><span class="ic" data-i="sync"></span><span class="bd"><span class="tx"><span class="t1">Synchro active</span><span class="t2" id="syncSub">—</span></span><span class="sw" id="syncSw"><i></i></span></span></button>
     </div>
     <div class="label">Son · AirPlay</div>
@@ -3932,13 +3948,23 @@ let PLAN = null, PED = null, planDrag = null;
 $("#plansRow").onclick = () => go("plans");
 function renderPlans() {
   const el = $("#plansList");
-  if (!zones) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">Chargement…</span></span></div>`; return; }
-  if (zones.error || !zones.length) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">${esc(zones.error || "Aucune zone de divertissement")}</span></span></div>`; return; }
-  const plans = S.settings.plans || {}, RM = ROOMS && !ROOMS.error ? ROOMS : [];
-  const row = (id, ic, name, sub) => `<button class="row" data-plan="${esc(id)}"><span class="ic">${ic}</span><span class="bd"><span class="tx"><span class="t1">${esc(name)}</span><span class="t2">${sub}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`;
+  if (!zones || !ROOMS) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">Chargement…</span></span></div>`; return; }
+  const plans = S.settings.plans || {}, RM = ROOMS && !ROOMS.error ? ROOMS : [], ZS = zones.error ? [] : zones;
+  const chev = `<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>`;
+  const row = (id, ic, name, sub) => `<button class="row" data-plan="${esc(id)}"><span class="ic">${ic}</span><span class="bd"><span class="tx"><span class="t1">${esc(name)}</span><span class="t2">${sub}</span></span>${chev}</span></button>`;
+  // pièces et zones de l'app : on y règle le plan, puis on crée leur zone de synchro sur le pont
+  const zoneOf = r => ZS.find(z => z.name === ("Lueur · " + r.name).slice(0, 32));
+  const sub = r => { const z = zoneOf(r); return `${r.lights.length} lampe${r.lights.length > 1 ? "s" : ""}${r.planned ? " · plan fait" : ""} · ${z ? `<span style="color:var(--green)">zone de synchro prête</span>` : "pas encore de zone de synchro"}`; };
   const rooms = RM.filter(r => r.type !== "zone"), hz = RM.filter(r => r.type === "zone");
-  const grp = (t, list) => list.length ? `<div class="label">${t}</div><div class="list">${list.map(r => row("r:" + r.id, icon(roomKind(r.archetype, r.name)), r.name, `${r.lights.length} lampe${r.lights.length > 1 ? "s" : ""}${r.planned ? " · plan personnalisé" : ""}`)).join("")}</div>` : "";
-  el.innerHTML = `<div class="label">Zones de divertissement · musique</div><div class="list">` + zones.map(z => `<button class="row" data-plan="${esc(z.id)}"><span class="ic">${icon("zones")}</span><span class="bd"><span class="tx"><span class="t1">${esc(z.name)}</span><span class="t2">${Object.entries(z.kinds || {}).map(([k, n]) => `${KIND_N[k] || k} ${n}`).join(" · ") || z.lights + " lampes"}${plans[z.id] ? " · plan personnalisé" : ""}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`).join("") + `</div>` + grp("Pièces · scènes et couleurs", rooms) + grp("Zones de l'app · scènes et couleurs", hz);
+  const grp = (t, list) => list.length ? `<div class="label">${t}</div><div class="list">${list.map(r => row("r:" + r.id, icon(roomKind(r.archetype, r.name)), r.name, sub(r))).join("")}</div>` : "";
+  const own = new Set(RM.map(r => ("Lueur · " + r.name).slice(0, 32)));
+  const others = ZS.filter(z => !own.has(z.name));
+  el.innerHTML = (ROOMS.error ? `<p class="note">${esc(ROOMS.error)}</p>` : "")
+    + grp("Pièces", rooms) + grp("Zones de l'app", hz)
+    + (RM.length || ROOMS.error ? "" : `<p class="note">Aucune pièce sur le pont.</p>`)
+    + (zones.error ? `<p class="note">${esc(zones.error)}</p>`
+      : others.length ? `<div class="label">Autres zones de divertissement</div><div class="list">${others.map(z => row(z.id, icon("zones"), z.name, `${Object.entries(z.kinds || {}).map(([k, n]) => `${KIND_N[k] || k} ${n}`).join(" · ") || z.lights + " lampes"}${plans[z.id] ? " · plan fait" : ""}`)).join("")}</div>` : "")
+    + `<p class="note">Ouvre une pièce, place tes lampes et ton ruban, puis touche « Créer la zone de synchro » : Lueur crée la zone de divertissement sur le pont et la choisit pour la musique.</p>`;
   $$("[data-plan]").forEach(b => b.onclick = () => go("plan", b.dataset.plan));
 }
 const PM = 0.07, PC = [[PM, PM], [1 - PM, PM], [1 - PM, 1 - PM], [PM, 1 - PM]];
@@ -4208,7 +4234,7 @@ function renderZoneMenu() {
   const g = $("#zoneList");
   if (!zones) { g.innerHTML = '<div class="row"><span class="bd" style="padding-left:16px"><span class="spin"></span>Chargement…</span></div>'; return; }
   if (zones.error) { g.innerHTML = `<div class="note" style="padding:16px">${esc(zones.error)}</div>`; return; }
-  if (!zones.length) { g.innerHTML = `<div class="note" style="padding:16px">Aucune zone de divertissement. Crée-en une dans l'app d'éclairage, ou choisis tes lampes ci-dessous.</div>`; return; }
+  if (!zones.length) { g.innerHTML = `<div class="note" style="padding:16px">Aucune zone de synchro pour l'instant. Touche « Créer la zone d'une pièce… » ci-dessous.</div>`; return; }
   const cz = currentZone();
   g.innerHTML = zones.map(z => `<button class="row" data-zone="${z.id}" style="min-height:60px"><span style="width:44px;text-align:center;color:var(--blue);font-weight:700">${cz && cz.id === z.id ? "✓" : ""}</span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">${esc(z.name)}</span><span class="t2" style="font-size:13px">${z.lights} lampe${z.lights > 1 ? "s" : ""}</span></span></span></button>`).join("");
   $$("[data-zone]").forEach(b => b.onclick = () => { save({ area: b.dataset.zone }, true); renderZoneMenu(); renderSync(); });
@@ -4327,7 +4353,7 @@ async function loadRooms() {
   clearTimeout(roomsTimer);
   if (Date.now() > roomsLock) {
     try { ROOMS = await api("/api/rooms"); } catch (e) { ROOMS = { error: e.message }; }
-    if (["lumieres", "piece", "lampe"].includes(route.v)) render();
+    if (["lumieres", "piece", "lampe", "plans"].includes(route.v)) render();
   }
   roomsTimer = setTimeout(loadRooms, ["lumieres", "piece", "lampe"].includes(route.v) && !document.hidden ? 4000 : 15000);
 }
