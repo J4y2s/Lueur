@@ -3879,6 +3879,92 @@ button:active{transform:scale(.96);opacity:.82}
   .stage{margin-top:10px}.stitle{margin-top:12px;font-size:20px}.pbar{margin-top:10px}.pchip{margin-top:8px}
   .ctrls{margin-top:16px}.ctrl .ci{width:52px;height:52px}.dock{margin-top:16px}.power{width:78px!important;height:78px!important}
 }
+
+/* =================== ORDINATEUR (écran large) =================== */
+.brand{display:none}
+@media (min-width:960px){
+  :root{--side:236px}
+  body{background:radial-gradient(1200px 700px at 70% -10%,#26272d 0%,var(--bg) 60%) fixed}
+  .app{max-width:none;margin:0 0 0 var(--side);padding-bottom:48px}
+  .view{max-width:1180px;margin:0 auto;padding:0 32px}
+  .nh{margin:20px 0 0;padding:14px 18px;border-radius:20px;top:12px}
+
+  /* barre d'onglets → colonne de gauche */
+  .tabs{left:0;top:0;bottom:0;right:auto;width:var(--side);flex-direction:column;justify-content:flex-start;align-items:stretch;
+        border-top:0;border-right:.5px solid rgba(255,255,255,.07);padding:30px 14px;background:rgba(16,16,18,.78)}
+  .tabs .in{flex-direction:column;gap:4px;max-width:none}
+  .tabs button{flex:none;flex-direction:row;gap:14px;padding:11px 14px;border-radius:12px;font-size:15px;font-weight:600}
+  .tabs button:hover{background:rgba(255,255,255,.05);color:#d1d1d6}
+  .tabs button.on{background:var(--card);color:#fff}
+  .tabs svg{width:22px;height:22px}
+  .brand{display:flex;align-items:center;gap:12px;padding:0 10px 26px;font-size:20px;font-weight:800;letter-spacing:-.2px}
+  .brand i{width:34px;height:34px;border-radius:10px;background:var(--card);display:grid;place-items:center}
+  .brand i:after{content:"";width:16px;height:16px;border-radius:50%;background:radial-gradient(circle at 40% 35%,#ffd27a,#ff6a3d 55%,#ff375f);box-shadow:0 0 14px #ff375f88}
+  .brand small{display:block;color:var(--t3);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
+
+  .big{padding:48px 0 26px;font-size:44px}
+  .label{padding-left:4px;padding-right:4px}
+  .note{padding-left:4px;padding-right:4px}
+  .pad{padding:0}
+
+  /* Synchro : pochette à gauche, commandes à droite */
+  .view[data-view=sync].on{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);grid-template-areas:"head head" "stage ." "stage ctrls" "stage dock" "stage .";
+        grid-template-rows:auto 1fr auto auto 1fr;column-gap:56px;min-height:100vh;padding-bottom:40px;align-items:center}
+  .syhead{grid-area:head;justify-content:flex-start;padding:30px 0 0}
+  .zonebtn{align-items:flex-start;padding:8px 14px;border-radius:14px;background:var(--card)}
+  .zonebtn:hover{filter:brightness(1.15)}
+  .stage{grid-area:stage;margin:0;align-self:center}
+  .coverwrap{width:min(34vw,440px,58vh)}
+  .stitle{font-size:28px;margin-top:28px}
+  .pbar,.leds{width:min(34vw,440px)}
+  .ctrls{grid-area:ctrls;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:0}
+  .ctrl{flex-direction:row;align-items:center;gap:14px;padding:16px;border-radius:20px;background:var(--card);text-align:left;display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto auto}
+  .ctrl .ci{grid-row:1/3;width:54px;height:54px;background:var(--card2)}
+  .ctrl small,.ctrl em{justify-self:start}
+  .ctrl em{font-size:16px;font-weight:600}
+  .ctrl:hover{filter:brightness(1.12)}
+  .dock{grid-area:dock;margin:30px 0 0;justify-content:center;gap:48px}
+  .dock .side:hover{color:#fff}
+
+  /* Lumières : pièces en grille */
+  .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;padding:0}
+  .room:hover{filter:brightness(1.06)}
+
+  /* Pièce : plan à gauche, scènes et lampes à droite */
+  .pgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:32px;align-items:start;margin-top:20px}
+  .pgrid .pl{position:sticky;top:20px}
+  .pgrid .plan{margin:0}
+  .pgrid .spr{margin:14px 4px 0}
+  .pgrid .pr .label.in:first-child{padding-top:0}
+  .rhead{margin:20px 0 0;border-radius:24px;padding:18px 22px 22px}
+  .grid3{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  .grid2{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+
+  /* écrans de réglages : colonne lisible, listes en cartes */
+  .view[data-view=reglages],.view[data-view=lampe],.view[data-view=creer]{max-width:820px}
+  .view[data-view=plans],.view[data-view=plan],.view[data-view=avances]{max-width:1000px}
+  .list{border-radius:18px;overflow:hidden}
+  .row:hover{background:rgba(255,255,255,.03)}
+  .stagebox{margin:18px 0 0}
+  .proom{max-width:min(860px,calc((100vh - 190px) * 1.3));margin:0 auto}
+
+  /* feuilles → fenêtres au centre */
+  .sheet{top:50%;bottom:auto;left:calc(50% + var(--side) / 2);right:auto;width:min(600px,calc(100vw - var(--side) - 64px));margin:0;max-height:84vh;
+         border-radius:22px;padding:0 22px 24px;opacity:0;pointer-events:none;transform:translate(-50%,-47%) scale(.97);
+         transition:transform .22s cubic-bezier(.2,.8,.2,1),opacity .18s;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+  .sheet.open{transform:translate(-50%,-50%);opacity:1;pointer-events:auto}
+  .sheet .grab{display:none}
+  .sheet .sh{margin:0 -22px 12px;padding:20px 22px 12px}
+  .toast{left:calc(50% + var(--side) / 2);bottom:32px}
+
+  /* souris : survol et pas d'écrasement au clic */
+  .tile:hover,.orb:hover,.lamp:hover,.cta:hover,.rb:hover{filter:brightness(1.12)}
+  button:active{transform:scale(.98)}
+  .proom .spot:active{cursor:grabbing}
+}
+@media (min-width:960px) and (max-height:760px){
+  .coverwrap{width:min(30vw,360px,50vh)}
+}
 </style>
 </head>
 <body>
@@ -4021,7 +4107,7 @@ button:active{transform:scale(.96);opacity:.82}
     </div>
   </section>
 
-  <nav class="tabs" aria-label="Onglets"><div class="in">
+  <nav class="tabs" aria-label="Onglets"><div class="brand"><i></i><span>Lueur<small>AirPlay · Hue</small></span></div><div class="in">
     <button data-tab="sync"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 11v2"/></svg>Synchro</button>
     <button data-tab="lumieres"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-4 10.5c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/></svg>Lumières</button>
     <button data-tab="reglages"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>Réglages</button>
@@ -4496,7 +4582,7 @@ function closeSheets() { $("#sheetBg").classList.remove("open"); $$(".sheet").fo
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheets(); });
 $$(".sheet").forEach(sh => {   // tirer la feuille vers le bas (depuis son en-tête) pour la fermer
   let y0 = null, dy = 0;
-  sh.addEventListener("touchstart", e => { const t = e.target; y0 = (sh.scrollTop <= 0 && (t.closest(".sh") || t.closest(".grab"))) ? e.touches[0].clientY : null; dy = 0; }, { passive: true });
+  sh.addEventListener("touchstart", e => { const t = e.target; if (matchMedia("(min-width:960px)").matches) { y0 = null; return; } y0 = (sh.scrollTop <= 0 && (t.closest(".sh") || t.closest(".grab"))) ? e.touches[0].clientY : null; dy = 0; }, { passive: true });
   sh.addEventListener("touchmove", e => { if (y0 === null) return; dy = Math.max(0, e.touches[0].clientY - y0); sh.style.transition = "none"; sh.style.transform = `translateY(${dy}px)`; }, { passive: true });
   sh.addEventListener("touchend", () => { if (y0 === null) return; sh.style.transition = ""; if (dy > 90) closeSheets(); else sh.style.transform = ""; y0 = null; });
 });
@@ -4872,13 +4958,15 @@ function renderPiece() {
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
     <button class="pwbtn" id="pPow" aria-label="${r.on ? "Éteindre" : "Allumer"}" style="width:48px;height:48px;background:${r.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 22, "currentColor", 2.4)}</button></div>
     ${r.on ? `<div class="sl" id="pBri" style="margin:18px 4px 2px"><div class="tr" style="background:rgba(0,0,0,.12)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>
+    <div class="pgrid"><div class="pl">
     <div class="plan" style="position:relative">${planSvg(r)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
     <div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Animation des scènes</span><div class="seg wide">${ANIMS.map(([v, n]) => `<button data-anim="${v}" class="${(ANIM[r.id] || 0) === v ? "on" : ""}">${n}</button>`).join("")}</div></div>
     ${gmodes.length > 1 ? `<div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Rendu du ruban</span><div class="seg wide">${gmodes.map(([k, n]) => `<button data-gmode="${k}" class="${gmodeOf(r) === k ? "on" : ""}">${n}</button>`).join("")}</div><span style="font-size:12px;color:var(--t3)">${GMODE_D[gmodeOf(r)] || ""}</span></div>` : ""}
+    </div><div class="pr">
     <div class="pad"><div class="label in">Scènes</div><div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>
     ${effs.length ? `<div class="label in">Effets</div><div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>` : ""}
-    <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div>`;
+    <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
   if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 1200; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
   $$("[data-spr]").forEach(b => b.onclick = () => { spread = b.dataset.spr; store("spread", spread); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else renderPiece(); });
