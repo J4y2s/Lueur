@@ -1887,13 +1887,31 @@ def room_plan_info(rid):
     room = next((r for r in rooms_state() if r["id"] == rid), None)
     if not room:
         raise hms.HueError("Pièce introuvable.")
+    # Si la pièce a sa zone de synchro, le ruban est dessiné avec ses vrais segments de synchro
+    # (ex. 7) ; sinon avec les 5 points de couleur des scènes.
+    segs = {}
+    try:
+        cfg = _cfg()
+        zname = (ZONE_PREFIX + room["name"])[:32]
+        area = next((a for a in hms.get_areas(cfg) if a.get("metadata", {}).get("name") == zname), None)
+        if area:
+            owner = {l["id"]: l.get("owner", {}).get("rid") for l in hms.bridge_get(cfg, "light")}
+            cnt = {}
+            for r in hms.channel_info(cfg, area):
+                cnt[r["dev"]] = cnt.get(r["dev"], 0) + 1
+            for l in room["lights"]:
+                if cnt.get(owner.get(l["id"]), 0) > 1:
+                    segs[l["id"]] = cnt[owner[l["id"]]]
+    except hms.HueError:
+        pass
     chs, n = [], len(room["lights"])
     for i, l in enumerate(room["lights"]):
         p = l.get("pos") or {"x": round(-0.7 + 1.4 * i / max(1, n - 1), 3) if n > 1 else 0, "y": 0}
         base = {"dev": l["id"], "light": l["id"], "name": l["name"], "archetype": l["archetype"], "x": p["x"], "y": p["y"],
-                "grad_points": GRAD_POINTS if l.get("has_gradient") else None, "order": l.get("order")}
+                "grad_points": GRAD_POINTS if l.get("has_gradient") else None, "order": l.get("order"),
+                "sync_segments": segs.get(l["id"])}
         if l.get("has_gradient"):                   # un ruban : on le trace le long des murs
-            chs += [dict(base, id=f"{l['id']}#{k}", idx=k) for k in range(GRAD_POINTS)]
+            chs += [dict(base, id=f"{l['id']}#{k}", idx=k) for k in range(segs.get(l["id"]) or GRAD_POINTS)]
         else:
             chs.append(dict(base, id=l["id"], idx=0))
     plan = (get_settings().get("room_plans") or {}).get(rid) or {}
@@ -4005,7 +4023,7 @@ async function renderPlan() {
   const { rub, single } = planDevs();
   $("#planHint").textContent = single.length ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   const seg = (k, d, opts, cur) => `<div class="seg">${opts.map(([v, n]) => `<button data-rk="${k}" data-rd="${esc(d)}" data-rv="${v}" class="${cur === v ? "on" : ""}">${n}</button>`).join("")}</div>`;
-  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? `Dégradé à ${cs[0].grad_points || cs.length} points de couleur` : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
+  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? (cs[0].sync_segments ? `Synchro : ${cs[0].sync_segments} segments · scènes : ${cs[0].grad_points || 5} points de couleur` : `Dégradé à ${cs[0].grad_points || cs.length} points de couleur · pas encore de zone de synchro`) : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
     <div class="seg" style="margin-bottom:4px;background:var(--card2)"><button data-ident="${esc(cs[0].light || "")}">Montrer le début</button>${PLAN.type === "room" ? "" : `<button data-ordre>Tester l'ordre</button>`}</div>
     <p class="hint" style="margin:6px 2px 0">${PLAN.type === "room" ? "Le ruban s'allume du <b style=\"color:#ff5a4a\">rouge</b> (début) au <b style=\"color:#4b8dff\">bleu</b> (fin) pendant 10 s : place la flèche du plan là où tu vois le rouge." : "« Montrer le début » : rouge au début, bleu à la fin (synchro arrêtée). « Tester l'ordre » : avec la synchro en marche, un point blanc parcourt les segments dans l'ordre des effets, du rouge au bleu."}</p>
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
