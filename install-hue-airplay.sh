@@ -15,14 +15,19 @@ echo "==> Système : $PRETTY_NAME"
 echo "==> Paquets"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends \
+apt-get install -y --no-install-recommends --no-remove \
   build-essential git autoconf automake libtool pkg-config ca-certificates \
   libpopt-dev libconfig-dev libasound2-dev avahi-daemon avahi-utils libavahi-client-dev \
   libssl-dev libsoxr-dev libplist-dev libplist-utils libsodium-dev libavutil-dev libavcodec-dev \
   libavformat-dev uuid-dev libgcrypt-dev xxd \
   python3 python3-numpy openssl \
   bluez bluez-tools bluez-alsa-utils libasound2-plugin-bluez alsa-utils rfkill usbutils
-apt-get install -y --no-install-recommends systemd-dev 2>/dev/null || true
+# systemd.pc (utile à la compilation d'AirPlay) : déjà fourni par "systemd" sur Debian 12.
+# Ne JAMAIS installer systemd-dev depuis les backports : APT retirerait systemd et le noyau
+# (la VM tombe alors sur "grub>" au redémarrage suivant).
+if ! pkg-config --exists systemd 2>/dev/null; then
+  apt-get install -y --no-install-recommends --no-remove -t "${VERSION_CODENAME}" systemd-dev 2>/dev/null || true
+fi
 
 echo "==> Firmwares Bluetooth (Intel, Realtek, Atheros...)"
 if [ ! -f /etc/apt/sources.list.d/hue-firmware.sources ]; then
@@ -35,7 +40,7 @@ Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 SRC
   apt-get update || true
 fi
-apt-get install -y --no-install-recommends firmware-realtek firmware-iwlwifi firmware-atheros \
+apt-get install -y --no-install-recommends --no-remove firmware-realtek firmware-iwlwifi firmware-atheros \
   firmware-misc-nonfree 2>/dev/null || echo "(firmwares non installés, ce n'est pas bloquant)"
 
 # Avahi échoue souvent dans un LXC non privilégié à cause de rlimit-nproc
@@ -47,12 +52,15 @@ echo "==> Chargeur de démarrage (GRUB)"
 # Les images cloud Debian visent un autre nom de disque que celui de la VM :
 # après une mise à jour de GRUB, la VM ne redémarre plus (invite grub>).
 # On réinstalle GRUB sur le vrai disque et on le mémorise pour les mises à jour futures.
-if [ -d /boot/grub/i386-pc ] && command -v grub-install >/dev/null; then
+if [ ! -d /sys/firmware/efi ] && command -v grub-install >/dev/null; then
+  # Démarrage BIOS : il faut les fichiers GRUB "PC" pour réécrire le secteur de démarrage
+  # (sinon grub-install vise l'EFI et le vieux secteur BIOS reste -> invite grub>).
+  apt-get install -y --no-install-recommends --no-remove grub-pc-bin >/dev/null 2>&1 || true
   ROOTDEV=$(findmnt -no SOURCE /)
   DISK=$(lsblk -no PKNAME "$ROOTDEV" 2>/dev/null | head -n1)
-  if [ -n "$DISK" ] && [ -b "/dev/$DISK" ]; then
+  if [ -n "$DISK" ] && [ -b "/dev/$DISK" ] && [ -d /usr/lib/grub/i386-pc ]; then
     echo "grub-pc grub-pc/install_devices multiselect /dev/$DISK" | debconf-set-selections
-    grub-install "/dev/$DISK" && echo "    GRUB réinstallé sur /dev/$DISK"
+    grub-install --target=i386-pc "/dev/$DISK" && echo "    GRUB (BIOS) réinstallé sur /dev/$DISK"
   fi
 fi
 mkdir -p /etc/default/grub.d
