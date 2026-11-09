@@ -330,6 +330,8 @@ def channel_info(cfg, area):
         r["max_segments"] = sg.get("max_segments")
         r["grad_points"] = (lt.get("gradient") or {}).get("points_capable")
         r["pixels"] = (lt.get("gradient") or {}).get("pixel_count")
+        r["seg_configurable"] = sg.get("configurable")
+        r["order"] = ((lt.get("content_configuration") or {}).get("order") or {}).get("order")
     return rows
 
 
@@ -355,6 +357,19 @@ def plan_channels(area, plans):
             except (KeyError, TypeError, ValueError):
                 pass
         out.append(c)
+    return out
+
+
+def plan_eq(area, plans):
+    """Équilibre de luminosité du plan : {lampe: facteur 0,1-1} (lampes absentes = 1)."""
+    plan = (plans or {}).get(area.get("id"), {}) if isinstance(plans, dict) else {}
+    eq = plan.get("eq") if isinstance(plan, dict) else None
+    out = {}
+    for k, v in (eq or {}).items() if isinstance(eq, dict) else []:
+        try:
+            out[k] = max(0.1, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            pass
     return out
 
 
@@ -1411,12 +1426,16 @@ def cmd_run(args):
     area_name = area.get("metadata", {}).get("name")
     log(f"Zone : {area_name} ({len(area['channels'])} canaux)")
 
+    devs = {}                         # canal -> lampe (pour l'équilibre de luminosité)
+
     def kinds_for(a):
+        devs.clear()
         if args.dry_run:
             return {}
         try:
-            k, _ = channel_kinds(cfg, a)
-            return k
+            rows = channel_info(cfg, a)
+            devs.update({r["id"]: r["dev"] for r in rows})
+            return {r["id"]: r["kind"] for r in rows}
         except HueError as e:
             log(f"Familles de lampes inconnues ({e}) : un seul effet pour toute la zone.")
             return {}
@@ -1542,6 +1561,11 @@ def cmd_run(args):
                 session.send(colors)
                 continue
             colors = fx.update(rms, bands, beat, strength)
+            # Équilibre de luminosité choisi dans le plan : une lampe trop forte est atténuée
+            eq = plan_eq(area, settings["plans"])
+            if eq:
+                colors = [(c, r * f, g * f, b * f) for c, r, g, b in colors
+                          for f in (eq.get(devs.get(c), 1.0),)]
             # Le Bluetooth joue le son en retard : on retarde les lumières d'autant
             delay = int(settings["bt_offset_ms"] / 20) if player and player.playing else 0
             delayed.append(colors)
@@ -1627,7 +1651,10 @@ Sert la page index.html et une petite API JSON :
   GET  /api/rooms      pièces du pont avec leurs lampes (état, couleur, type)
   POST /api/light      {"id", "on"?, "bri"?, "color"?}  pilote une lampe hors synchro
   POST /api/room       {"id", "on"?, "bri"?}             pilote toute une pièce
-  POST /api/room/palette {"id", "colors": [...]}         applique une scène / palette à la pièce
+  POST /api/room/palette {"id", "colors": [...], "grad_mode"?}  applique une scène / palette à la pièce
+  POST /api/room/effect  {"id", "effect", "speed"?}       effet intégré au pont (bougie, étincelles…)
+  POST /api/light/order  {"light", "order"}               sens du contenu sur un ruban (forward / reversed)
+  POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -1807,7 +1834,7 @@ def room_plan_info(rid):
     for i, l in enumerate(room["lights"]):
         p = l.get("pos") or {"x": round(-0.7 + 1.4 * i / max(1, n - 1), 3) if n > 1 else 0, "y": 0}
         base = {"dev": l["id"], "light": l["id"], "name": l["name"], "archetype": l["archetype"], "x": p["x"], "y": p["y"],
-                "grad_points": GRAD_POINTS if l.get("has_gradient") else None}
+                "grad_points": GRAD_POINTS if l.get("has_gradient") else None, "order": l.get("order")}
         if l.get("has_gradient"):                   # un ruban : on le trace le long des murs
             chs += [dict(base, id=f"{l['id']}#{k}", idx=k) for k in range(GRAD_POINTS)]
         else:
@@ -1847,10 +1874,13 @@ def save_plan(body):
     spots = {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
     s = get_settings()
     plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    eq = (plans.get(aid) or {}).get("eq") if isinstance(plans.get(aid), dict) else None
     if body.get("reset"):
-        plans.pop(aid, None)
+        plans.pop(aid, None)                # positions de l'app Hue, mais on garde l'équilibre
+        if eq:
+            plans[aid] = {"eq": eq}
     else:
-        plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots}
+        plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, **({"eq": eq} if eq else {})}
     s["plans"] = plans
     write_json(SETTINGS_PATH, s)
     return {"ok": True}
@@ -1888,8 +1918,13 @@ def identify_light(body):
         before["gradient"] = {"points": pts}
     elif (l.get("color") or {}).get("xy"):
         before["color"] = {"xy": l["color"]["xy"]}
-    _put(cfg, "light", lid, {"on": {"on": True}, "dimming": {"brightness": 100},
-                              "gradient": {"points": [{"color": {"xy": dict(zip("xy", hex_to_xy(c)))}} for c in marks]}})
+    if (l.get("gradient") or {}).get("mode") and pts:
+        before["gradient"]["mode"] = l["gradient"]["mode"]
+    # rendu « fondu » forcé : en miroir ou en blocs, le rouge ne serait pas forcément au début
+    mark = {"points": [{"color": {"xy": dict(zip("xy", hex_to_xy(c)))}} for c in marks]}
+    if "interpolated_palette" in ((l.get("gradient") or {}).get("mode_values") or []):
+        mark["mode"] = "interpolated_palette"
+    _put(cfg, "light", lid, {"on": {"on": True}, "dimming": {"brightness": 100}, "gradient": mark})
     gen = identify_jobs.get(lid, 0) + 1
     identify_jobs[lid] = gen
 
@@ -2055,6 +2090,10 @@ def _cfg():
 
 
 APPLIED = {}          # dernière couleur envoyée à chaque lampe : {id: {"xy", "hex", "grad"}}
+# Effets intégrés au pont (CLIP v2, effects_v2) et façons de déployer un dégradé sur un ruban
+EFFECTS_V2 = ("prism", "opal", "glisten", "sparkle", "fire", "candle", "underwater", "cosmos",
+              "sunbeam", "enchant", "no_effect")
+GRAD_MODES = ("interpolated_palette", "interpolated_palette_mirrored", "segmented_palette", "random_pixelated")
 
 
 def _near(a, b, tol=0.012):
@@ -2092,6 +2131,14 @@ def _light_view(l, positions):
         "pos": (positions.get(l["id"]) or {}).get("pos") if "pos" in (positions.get(l["id"]) or {}) else positions.get(l["id"]),
         "path": (positions.get(l["id"]) or {}).get("path"),
         "line": (positions.get(l["id"]) or {}).get("line"),
+        # effets intégrés au pont (effects_v2) que la lampe sait jouer, et celui en cours
+        "effects": [e for e in ((l.get("effects_v2") or {}).get("action") or {}).get("effect_values", [])
+                    if e in EFFECTS_V2 and e != "no_effect"],
+        "effect": ((l.get("effects_v2") or {}).get("status") or {}).get("effect", "no_effect"),
+        # rendus possibles du dégradé (fondu, blocs, miroir…) et sens du contenu sur le ruban
+        "grad_modes": [m for m in (l.get("gradient") or {}).get("mode_values", []) if m in GRAD_MODES],
+        "grad_mode": (l.get("gradient") or {}).get("mode"),
+        "order": (((l.get("content_configuration") or {}).get("order") or {}).get("order")),
     }
 
 
@@ -2226,7 +2273,7 @@ def dynamic_scene(cfg, room, jobs, colors, speed):
     actions = []
     for lid, b in jobs:
         a = {"on": {"on": True}, "dimming": {"brightness": bri.get(lid, 100.0)}}
-        for k in ("color", "gradient"):
+        for k in ("color", "gradient", "effects_v2"):
             if k in b:
                 a[k] = b[k]
         actions.append({"target": {"rid": lid, "rtype": "light"}, "action": a})
@@ -2249,7 +2296,7 @@ def dynamic_scene(cfg, room, jobs, colors, speed):
     except hms.HueError as e:
         if "effects" not in str(e):
             raise
-        body["palette"]["effects"] = []          # certains ponts exigent aussi la liste des effets
+        body["palette"]["effects_v2"] = []       # certains ponts exigent aussi la liste des effets (v2)
         if existing:
             req("PUT", f"/clip/v2/resource/scene/{existing['id']}", body)
             sid = existing["id"]
@@ -2273,6 +2320,7 @@ def room_palette(body):
     if not room:
         raise ValueError("Pièce introuvable.")
     spread = body.get("spread", "lr")
+    gmode = body.get("grad_mode") if body.get("grad_mode") in GRAD_MODES else None
     ls = room["lights"]
     import math
 
@@ -2330,7 +2378,10 @@ def room_palette(body):
             grad = [along(by_lum, k / (GRAD_POINTS - 1)) for k in range(GRAD_POINTS)]
         gh = [hexc(c) for c in grad]
         gxy = [hex_to_xy(c) for c in gh]
-        jobs.append((l["id"], {"on": {"on": True}, "gradient": {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}}))
+        gb = {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}
+        if gmode and gmode in (l.get("grad_modes") or []):
+            gb["mode"] = gmode
+        jobs.append((l["id"], {"on": {"on": True}, "gradient": gb}))
         APPLIED[l["id"]] = {"grad": gh, "gxy": gxy}
         result[l["id"]] = {"gradient": gh, "color": gh[len(gh) // 2]}
 
@@ -2355,6 +2406,10 @@ def room_palette(body):
             result[l["id"]] = {"color": c}
         else:
             jobs.append((l["id"], {"on": {"on": True}}))
+    running = {l["id"] for l in ls if l.get("effect") not in (None, "no_effect")}
+    for lid, b in jobs:                     # une scène remplace l'effet intégré en cours
+        if lid in running:
+            b["effects_v2"] = {"action": {"effect": "no_effect"}}
     gen = room_jobs.get(room["id"], 0) + 1
     room_jobs[room["id"]] = gen
     try:
@@ -2379,6 +2434,84 @@ def room_palette(body):
         rooms_cache["t"] = 0
     threading.Thread(target=send, daemon=True).start()
     return {"ok": True, "lights": result, "ms": len(jobs) * 110}
+
+
+def room_effect(body):
+    """Lance un effet intégré au pont (bougie, étincelles…) sur les lampes de la pièce qui le savent
+    jouer. Chaque lampe garde sa couleur actuelle comme base ; « no_effect » arrête l'effet."""
+    cfg = _cfg()
+    eff = body.get("effect")
+    if eff not in EFFECTS_V2:
+        raise ValueError("Effet inconnu.")
+    room = next((r for r in rooms_state(force=False) if r["id"] == body.get("id")), None)
+    if not room:
+        raise ValueError("Pièce introuvable.")
+    try:
+        speed = max(0.0, min(1.0, float(body.get("speed", 0.5))))
+    except (TypeError, ValueError):
+        speed = 0.5
+    jobs = []
+    for l in room["lights"]:
+        if eff == "no_effect":
+            if l.get("effect") not in (None, "no_effect"):
+                jobs.append((l["id"], {"effects_v2": {"action": {"effect": "no_effect"}}}))
+            continue
+        if eff not in (l.get("effects") or []):
+            continue
+        params = {"speed": speed}
+        ap = APPLIED.get(l["id"], {})
+        hx = ap.get("hex") or (ap.get("grad") or [None])[len(ap.get("grad") or [None]) // 2] or l.get("color")
+        if l.get("has_color") and hx and HEX_RE.match(hx):
+            params["color"] = {"xy": dict(zip("xy", hex_to_xy(hx)))}
+        jobs.append((l["id"], {"on": {"on": True}, "effects_v2": {"action": {"effect": eff, "parameters": params}}}))
+    if not jobs and eff != "no_effect":
+        raise ValueError("Aucune lampe de cette pièce ne sait jouer cet effet.")
+    gen = room_jobs.get(room["id"], 0) + 1
+    room_jobs[room["id"]] = gen
+
+    def send():
+        for lid, b in jobs:
+            if room_jobs.get(room["id"]) != gen:
+                return
+            try:
+                _put(cfg, "light", lid, b)
+            except hms.HueError as e:
+                print(f"Effet {eff} refusé par {lid} : {e}", flush=True)
+            time.sleep(0.1)
+        rooms_cache["t"] = 0
+    threading.Thread(target=send, daemon=True).start()
+    return {"ok": True, "count": len(jobs), "lights": {lid: {"effect": eff} for lid, _ in jobs}}
+
+
+def light_order(body):
+    """Sens du contenu sur un ruban (content_configuration.order) : dans quel sens le pont déroule
+    ses effets et ses dégradés le long des LED."""
+    order = body.get("order")
+    if order not in ("forward", "reversed"):
+        raise ValueError("Sens invalide.")
+    _put(_cfg(), "light", body.get("light"), {"content_configuration": {"order": {"order": order}}})
+    rooms_cache["t"] = 0
+    return {"ok": True, "order": order}
+
+
+def plan_eq(body):
+    """Équilibre de luminosité d'une zone de synchro : {lampe: facteur 0,1-1}, appliqué en direct."""
+    aid = str(body.get("id", ""))[:64]
+    if not aid:
+        raise ValueError("Zone manquante.")
+    eq = {}
+    for k, v in (body.get("eq") or {}).items():
+        f = round(max(0.1, min(1.0, float(v))), 2)
+        if f < 1.0:
+            eq[str(k)[:64]] = f
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    p = plans.get(aid) if isinstance(plans.get(aid), dict) else {}
+    p["eq"] = eq
+    plans[aid] = p
+    s["plans"] = plans
+    write_json(SETTINGS_PATH, s)
+    return {"ok": True, "eq": eq}
 
 
 # ---------------------------------------------------------------------------
@@ -2932,14 +3065,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, save_lights(body.get("ids", [])))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
-            if path in ("/api/light", "/api/room", "/api/room/palette"):
-                fn = {"/api/light": set_light, "/api/room": set_room, "/api/room/palette": room_palette}[path]
+            if path in ("/api/light", "/api/room", "/api/room/palette", "/api/room/effect", "/api/light/order"):
+                fn = {"/api/light": set_light, "/api/room": set_room, "/api/room/palette": room_palette,
+                      "/api/room/effect": room_effect, "/api/light/order": light_order}[path]
                 try:
                     return self._send(200, fn(body))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
             if path == "/api/plan":
                 return self._send(200, save_plan(body))
+            if path == "/api/plan/eq":
+                return self._send(200, plan_eq(body))
             if path == "/api/plan/test":
                 return self._send(200, plan_test(body))
             if path == "/api/plan/identify":
@@ -3683,7 +3819,7 @@ async function renderPlan() {
     $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
-    PED = { rubans: {}, spots: {} };
+    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) } };
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
     single.forEach(([, cs]) => cs.forEach(c => PED.spots[c.id] = (pl.spots || {})[c.id] || [clamp((c.x + 1) / 2), clamp((1 - c.y) / 2)]));
@@ -3698,7 +3834,13 @@ async function renderPlan() {
     <p class="hint" style="margin:6px 2px 0">${PLAN.type === "room" ? "Le ruban s'allume du <b style=\"color:#ff5a4a\">rouge</b> (début) au <b style=\"color:#4b8dff\">bleu</b> (fin) pendant 10 s : place la flèche du plan là où tu vois le rouge." : "« Montrer le début » : rouge au début, bleu à la fin (synchro arrêtée). « Tester l'ordre » : avec la synchro en marche, un point blanc parcourt les segments dans l'ordre des effets, du rouge au bleu."}</p>
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
-    <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}</div>`; }).join("");
+    <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}
+    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? "" : eqCard());
+  $$("[data-ord]").forEach(b => b.onclick = async () => {
+    try { await api("/api/light/order", { light: b.dataset.ol, order: b.dataset.ord }); PLAN.channels.forEach(c => { if (c.light === b.dataset.ol) c.order = b.dataset.ord; }); renderPlan(); toast("Sens changé : refais « Montrer le début »"); }
+    catch (e) { toast(e.message); }
+  });
+  $$("[data-eq]").forEach(el => slider(el, t => { const v = Math.round((0.1 + t * 0.9) * 100) / 100; setSl(el, t); PED.eq[el.dataset.eq] = v; el.parentElement.querySelector("[data-eqv]").textContent = Math.round(v * 100) + " %"; clearTimeout(eqTimer); eqTimer = setTimeout(sendEq, 250); }, sendEq));
   $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); });
   $$("[data-ident]").forEach(b => b.onclick = async () => {
     if (!b.dataset.ident) return toast("Lampe introuvable sur le pont.");
@@ -3713,6 +3855,19 @@ async function renderPlan() {
       toast("Un point blanc parcourt les segments pendant 15 s");
     } catch (e) { toast(e.message); }
   });
+}
+let eqTimer = null;
+function eqCard() {      // équilibre de luminosité de chaque lampe de la zone de synchro
+  const by = {}; PLAN.channels.forEach(c => { if (!by[c.dev]) by[c.dev] = c; });
+  const devs = Object.entries(by);
+  if (devs.length < 2) return "";
+  return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon("sliders", 22)}</span><span><b>Équilibre de luminosité</b><br><small>Pendant la synchro</small></span></div>
+    ${devs.map(([d, c]) => { const v = PED.eq[d] ?? 1; return `<div class="srow"><div class="h"><span>${esc(c.name)}</span><span data-eqv>${Math.round(v * 100)} %</span></div><div class="sl" data-eq="${esc(d)}"><div class="tr"></div><div class="fi" style="width:${(v - .1) / .9 * 100}%"></div><div class="kn" style="left:${(v - .1) / .9 * 100}%"></div></div></div>`; }).join("")}
+    <p class="hint" style="margin:8px 2px 0">Baisse une lampe qui éblouit par rapport aux autres. Se règle en direct, pendant que la musique joue.</p></div>`;
+}
+async function sendEq() {
+  clearTimeout(eqTimer);
+  try { await api("/api/plan/eq", { id: PLAN.id, eq: PED.eq }); const p = { ...(S.settings.plans || {}) }; p[PLAN.id] = { ...(p[PLAN.id] || {}), eq: { ...PED.eq } }; S.settings.plans = p; } catch (e) { toast(e.message); }
 }
 function drawPlan() {
   const pos = planLayout(), pal = palColors(S.settings.palette), W = 100, H = 75, X = p => p[0] * W, Y = p => p[1] * H;
@@ -3738,14 +3893,14 @@ async function savePlanQuiet() {   // enregistre le plan de la zone de synchro (
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
   await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots });
-  S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } };
+  S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } };
 }
 $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
   try {
     if (PLAN.type === "room") { await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots }); roomsLock = 0; loadRooms(); }
-    else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } }; }
+    else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } }; }
     toast("Plan enregistré"); PLAN = null; back();
   }
   catch (e) { toast("Échec : " + e.message); }
@@ -4050,6 +4205,34 @@ async function roomPower(id) {
 let spread = load("spread") || "lr", scenePick = {};
 let ANIM = {}; try { ANIM = JSON.parse(load("anim") || "{}"); } catch (e) {}
 const ANIMS = [[0, "Fixe"], [0.25, "Lente"], [0.5, "Moyenne"], [0.85, "Rapide"]];
+// Rendu d'un dégradé sur un ruban (gradient.mode du pont)
+const GMODES = [["interpolated_palette", "Fondu"], ["segmented_palette", "Blocs"], ["interpolated_palette_mirrored", "Miroir"], ["random_pixelated", "Mélange"]];
+const GMODE_D = { interpolated_palette: "Les couleurs se fondent les unes dans les autres le long du ruban.", segmented_palette: "Des blocs de couleur nets, côte à côte.",
+  interpolated_palette_mirrored: "Le dégradé part du milieu et se reflète vers les deux bouts.", random_pixelated: "Les couleurs de la scène dispersées en petits points." };
+let GMODE = {}; try { GMODE = JSON.parse(load("gmode") || "{}"); } catch (e) {}
+const gmodeOf = r => GMODE[r.id] || "interpolated_palette";
+// Effets intégrés au pont (effects_v2) : nom et description maison
+const FX_N = { candle: ["Bougie", "Flamme douce qui vacille"], fire: ["Âtre", "Feu de cheminée, plus vif"], sparkle: ["Pétillement", "Petits éclats au hasard"],
+  glisten: ["Miroitement", "Reflets qui brillent par instants"], prism: ["Prisme", "Les teintes tournent lentement"], opal: ["Opale", "Reflets nacrés qui ondulent"],
+  underwater: ["Sous l'eau", "Lumière mouvante, comme au fond d'une piscine"], cosmos: ["Cosmos", "Lueurs lointaines qui dérivent"], sunbeam: ["Rayon", "Un rayon de soleil qui passe"],
+  enchant: ["Féerie", "Lueurs qui dansent doucement"] };
+const FX_P = { candle: IC.candle, fire: "M12 3c3 4 5 6.5 5 10a5 5 0 0 1-10 0c0-2 1-3.5 2-4.5 0 2 1 3 2 3-1-3 0-6 1-8.5z", sparkle: "M12 3v4M12 17v4M3 12h4M17 12h4M6.5 6.5l2 2M15.5 15.5l2 2M6.5 17.5l2-2M15.5 8.5l2-2",
+  glisten: "M12 3c.6 4.4 2.6 6.4 7 7-4.4.6-6.4 2.6-7 7-.6-4.4-2.6-6.4-7-7 4.4-.6 6.4-2.6 7-7zM19 16v4M17 18h4", prism: "M12 4l8 15H4zM12 4v15M4 19l8-6 8 6",
+  opal: "M12 3.5a8.5 8.5 0 1 1 0 17 8.5 8.5 0 0 1 0-17zM5 13c2.5-2 4.5 2 7 0s4.5 2 7 0", underwater: "M3 9c2-2 4 2 6 0s4 2 6 0 4 2 6 0M3 14c2-2 4 2 6 0s4 2 6 0 4 2 6 0M7 19h10",
+  cosmos: "M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zM3.5 15c-1-2 3.5-5 8.5-6.5s9-1.5 8.5.5-3.5 5-8.5 6.5-9 1.5-8.5-.5z", sunbeam: "M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2",
+  enchant: "M4 20L15 9M14 4v3M17.5 5.5l-2 2M20 9h-3M17.5 12.5l-2-2" };
+const fxIcon = k => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${FX_P[k] || IC.sliders}"/></svg>`;
+async function applyEffect(r, k) {
+  const sp = ANIM[r.id] || 0.5;
+  roomsLock = Date.now() + 2000 + 120 * r.lights.length;
+  try {
+    const res = await api("/api/room/effect", { id: r.id, effect: k, speed: sp });
+    r.lights.forEach(l => { if (k === "no_effect") l.effect = "no_effect"; else if ((res.lights || {})[l.id]) { l.effect = k; l.on = true; } });
+    if (k !== "no_effect") { r.on = true; scenePick[r.id] = null; }
+    toast(k === "no_effect" ? "Effet arrêté" : `${FX_N[k][0]} : ${res.count} lampe${res.count > 1 ? "s" : ""}`);
+    roomsLock = Date.now() + 1500 + 110 * (res.count || 0); render();
+  } catch (e) { toast(e.message); }
+}
 function gradAt(gr, u) {   // couleur le long d'un dégradé (fondu entre ses points, comme le ruban)
   if (gr.length < 2) return gr[0];
   const x = Math.max(0, Math.min(1, u)) * (gr.length - 1), k = Math.min(Math.floor(x), gr.length - 2), f = x - k;
@@ -4091,6 +4274,8 @@ function renderPiece() {
   const rb = roomBg(r, 160), c1 = boost(rb.colors[rb.colors.length - 1], 190), dark = rb.colors.reduce((a, c) => a + lum(boost(c, 190)), 0) / rb.colors.length > .5;
   const fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
   const scenes = allPalettes().filter(p => p.scenes);
+  const effs = Object.keys(FX_N).filter(k => r.lights.some(l => (l.effects || []).includes(k)));
+  const gsup = new Set(r.lights.flatMap(l => l.grad_modes || [])), gmodes = GMODES.filter(([k]) => gsup.has(k));
   $("#piece").innerHTML = `<div class="rhead" style="background:${r.on ? rb.css : "#232326"};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
     <div style="display:flex;align-items:center;gap:16px"><button class="rb" data-back aria-label="Retour" style="background:${r.on ? (dark ? "rgba(0,0,0,.12)" : "rgba(255,255,255,.18)") : "#3a3b40"};color:inherit">${icon("plus", 22, "currentColor", 2.6).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button>
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
@@ -4099,7 +4284,9 @@ function renderPiece() {
     <div class="plan" style="position:relative">${planSvg(r)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
     <div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Animation des scènes</span><div class="seg wide">${ANIMS.map(([v, n]) => `<button data-anim="${v}" class="${(ANIM[r.id] || 0) === v ? "on" : ""}">${n}</button>`).join("")}</div></div>
+    ${gmodes.length > 1 ? `<div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Rendu du ruban</span><div class="seg wide">${gmodes.map(([k, n]) => `<button data-gmode="${k}" class="${gmodeOf(r) === k ? "on" : ""}">${n}</button>`).join("")}</div><span style="font-size:12px;color:var(--t3)">${GMODE_D[gmodeOf(r)] || ""}</span></div>` : ""}
     <div class="pad"><div class="label in">Scènes</div><div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>
+    ${effs.length ? `<div class="label in">Effets</div><div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>` : ""}
     <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
   if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 2500; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
@@ -4108,6 +4295,8 @@ function renderPiece() {
   $$("[data-editplan]").forEach(b => b.onclick = () => go("plan", "r:" + r.id));
   $$("[data-anim]").forEach(b => b.onclick = () => { ANIM[r.id] = +b.dataset.anim; store("anim", JSON.stringify(ANIM)); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else { renderPiece(); toast(ANIM[r.id] ? "Choisis une scène : elle sera animée" : "Scènes fixes"); } });
   $$("[data-newpal]").forEach(b => b.onclick = () => openCreer("scene"));
+  $$("[data-gmode]").forEach(b => b.onclick = () => { GMODE[r.id] = b.dataset.gmode; store("gmode", JSON.stringify(GMODE)); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else { renderPiece(); toast("Choisis une scène pour voir le rendu"); } });
+  $$("[data-fx]").forEach(b => b.onclick = () => applyEffect(r, b.dataset.fx));
   $$("[data-lpow]").forEach(b => b.onclick = e => { e.stopPropagation(); lightPower(r, b.dataset.lpow); });
   $$("[data-lamp]").forEach(b => b.onclick = () => go("lampe", r.id + "|" + b.dataset.lamp));
 }
@@ -4130,10 +4319,10 @@ async function lightPower(r, id) {
 async function applyScene(r, pid) {
   scenePick[r.id] = pid; const colors = palColors(pid), cyc = spread === "tour";
   r.on = true;
-  r.lights.forEach(l => { l.on = true; });
+  r.lights.forEach(l => { l.on = true; l.effect = "no_effect"; });
   roomsLock = Date.now() + 2000 + 120 * r.lights.length;
   try {
-    const res = await api("/api/room/palette", { id: r.id, colors, spread, speed: ANIM[r.id] || 0 });
+    const res = await api("/api/room/palette", { id: r.id, colors, spread, speed: ANIM[r.id] || 0, grad_mode: gmodeOf(r) });
     if (res.animated) toast("Scène animée lancée");
     Object.entries(res.lights || {}).forEach(([id, v]) => { const l = r.lights.find(x => x.id === id); if (l) Object.assign(l, v); });
     roomsLock = Date.now() + 1500 + (res.ms || 0); render();
