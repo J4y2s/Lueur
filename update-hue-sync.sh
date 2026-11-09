@@ -693,7 +693,8 @@ class Effects:
     def _on_beat(self, strength, bands, n):
         p = self.p
         self.beat_count += 1
-        if self.beat_count % p["every"] == 0:
+        every = max(16, p["every"] * 8) if self.mode == "spectrum" else p["every"]
+        if self.beat_count % every == 0:   # en Spectre, les couleurs ne tournent que lentement
             self.color_idx = (self.color_idx + 1) % len(self.palette)
         # Quelles lampes s'allument sur ce temps
         if p["pattern"] == "alt" and n > 1:
@@ -728,17 +729,23 @@ class Effects:
             pos = i / (n - 1) if n > 1 else 0.5
 
             if self.mode == "spectrum":
-                # Chaque lampe suit sa bande : graves à gauche, médiums au centre, aigus à droite
+                # Égaliseur : graves à gauche, médiums au centre, aigus à droite. Chaque lampe
+                # suit en continu le niveau de sa bande (et pas seulement les temps).
+                def band(k):
+                    return bands.get(k, 0.0)
                 if pos < 0.5:
-                    hit = bands["on_bass"] * (1 - 2 * pos) + bands["on_mid"] * 2 * pos
+                    lvl = band("bass") * (1 - 2 * pos) + band("mid") * 2 * pos
+                    hit = band("on_bass") * (1 - 2 * pos) + band("on_mid") * 2 * pos
                 else:
-                    hit = bands["on_mid"] * (2 - 2 * pos) + bands["on_high"] * (2 * pos - 1)
-                hit = max(0.0, (hit - 0.25) / 0.75)
-                if beat and pos < 0.34:
-                    hit = max(hit, 0.6 + 0.4 * strength)
-                # couleurs fixes par position, qui glissent au fil des changements
-                target = self.palette[(self.color_idx + int(pos * (len(self.palette) - 1) + 0.5))
-                                      % len(self.palette)]
+                    lvl = band("mid") * (2 - 2 * pos) + band("high") * (2 * pos - 1)
+                    hit = band("on_mid") * (2 - 2 * pos) + band("on_high") * (2 * pos - 1)
+                lvl = max(0.0, min(1.0, (lvl - 0.18) / 0.82)) ** 1.6
+                hit = max(lvl, max(0.0, (hit - 0.25) / 0.75))
+                # couleur liée à la position (palette étalée sur les lampes, foncée → claire),
+                # qui monte vers la couleur suivante quand la bande est forte
+                npal = len(self.palette)
+                k = (self.color_idx + int(pos * (npal - 1) + 0.5)) % npal
+                target = self.palette[k] + (self.palette[(k + 1) % npal] - self.palette[k]) * min(1.0, self.env[i])
             else:
                 hit = (0.55 + 0.45 * strength) if (beat and self.active[i]) else 0.0
                 if beat and p["pattern"] == "wave" and n > 1:
@@ -749,11 +756,15 @@ class Effects:
                 offset = i if p["pattern"] != "all" else (i % 2)
                 target = self.palette[(self.color_idx + offset) % len(self.palette)]
 
-            self.env[i] = max(hit, self.env[i] * decay)
-            self.current[i] += (target - self.current[i]) * fade
+            if self.mode == "spectrum":       # réponse rapide, sans attendre les temps
+                self.env[i] = max(hit, self.env[i] * np.exp(-self.DT / min(p["tau"], 0.22)))
+                self.current[i] += (target - self.current[i]) * max(fade, 0.35)
+            else:
+                self.env[i] = max(hit, self.env[i] * decay)
+                self.current[i] += (target - self.current[i]) * fade
 
             if self.mode == "spectrum":   # en Spectre, chaque lampe dépend surtout de sa bande
-                b = 0.6 * p["base"] + 0.5 * p["energy"] * energy + max(p["beat"], 0.55) * self.env[i]
+                b = 0.04 + 0.35 * p["base"] + (0.96 - 0.35 * p["base"]) * self.env[i]
             else:
                 b = p["base"] + p["energy"] * energy + p["beat"] * self.env[i]
             if p["pattern"] == "chase" and not self.active[i] and self.mode != "spectrum":
@@ -1693,47 +1704,67 @@ def _hex4(h):
 
 
 def cover_colors(data, n=4):
-    """Couleurs marquantes d'une pochette : vives, distinctes, triées du plus foncé au plus clair."""
+    """Couleurs d'une pochette pour les lampes : les teintes marquantes (même petites, si elles
+    sont vives), complétées par des nuances si la pochette en a peu ; du plus foncé au plus clair."""
     try:
         from PIL import Image
+        import numpy as np
     except ImportError:
         return []
     try:
         im = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:  # image illisible
         return []
-    im.thumbnail((96, 96))
-    q = im.quantize(colors=12, method=Image.Quantize.MEDIANCUT)
-    pal = q.getpalette()
-    cands = []
-    for count, idx in q.getcolors() or []:
-        r, g, b = pal[idx * 3:idx * 3 + 3]
-        h, l, sat = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
-        chroma = sat * (1 - abs(2 * l - 1))          # ni gris, ni noir, ni blanc
-        cands.append({"rgb": (r, g, b), "h": h, "l": l, "c": chroma,
-                      "score": count * (0.15 + chroma) ** 1.5})
-    cands.sort(key=lambda c: -c["score"])
-    colourful = sum(1 for c in cands if c["c"] >= 0.12) >= 2
-    picked = []
-    for c in cands:
-        if colourful and c["c"] < 0.12:
-            continue                                  # écarte les gris s'il y a assez de couleur
-        if all(min(abs(c["h"] - p["h"]), 1 - abs(c["h"] - p["h"])) > 0.06 or abs(c["l"] - p["l"]) > 0.25
-               for p in picked):
-            picked.append(c)
-        if len(picked) == n:
+    im.thumbnail((128, 128))
+    px = np.asarray(im, dtype=np.float32).reshape(-1, 3) / 255
+    mx, mn = px.max(1), px.min(1)
+    chroma = mx - mn
+    l = (mx + mn) / 2
+    keep = (chroma > 0.16) & (l > 0.07) & (l < 0.93)
+    if keep.sum() < 0.01 * len(px):              # pochette (presque) sans couleur : blancs
+        return ["#ffb46b", "#ffd9a8", "#fff1de", "#dfe9ff"][:n]
+    p, c = px[keep], chroma[keep]
+    r, g, b = p[:, 0], p[:, 1], p[:, 2]
+    m = p.max(1)
+    d = np.maximum(c[...], 1e-6)
+    h = np.where(m == r, ((g - b) / d) % 6, np.where(m == g, (b - r) / d + 2, (r - g) / d + 4)) / 6
+    BINS = 36
+    idx = (h * BINS).astype(int) % BINS
+    w = c ** 2                                   # les couleurs vives pèsent plus que les ternes
+    hist = np.bincount(idx, weights=w, minlength=BINS)
+    smooth = hist + 0.6 * (np.roll(hist, 1) + np.roll(hist, -1)) + 0.25 * (np.roll(hist, 2) + np.roll(hist, -2))
+    peaks, top = [], smooth.max()
+    for k in np.argsort(-smooth):
+        if smooth[k] < 0.03 * top:
             break
-    out = []
-    for c in picked:                                  # couleurs rendues par des lampes :
-        h, l, sat = colorsys.rgb_to_hls(*(v / 255 for v in c["rgb"]))
-        l = min(max(l, 0.35), 0.62)                   # ni trop sombres, ni délavées
-        if c["c"] >= 0.12:
-            sat = max(sat, 0.55)
-        r, g, b = colorsys.hls_to_rgb(h, l, sat)
-        out.append((l, "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))))
-    if len(out) == 1:
-        out.append(out[0])
-    return [hx for _, hx in sorted(out)]
+        if all(min(abs(k - q), BINS - abs(k - q)) >= 3 for q in peaks):   # ≥ 30° d'écart
+            peaks.append(int(k))
+        if len(peaks) == n:
+            break
+
+    def mean_rgb(k):
+        sel = np.isin(idx, [(k - 1) % BINS, k, (k + 1) % BINS])
+        ww = w[sel][:, None]
+        return (p[sel] * ww).sum(0) / max(ww.sum(), 1e-6)
+
+    def tune(rgb, light):                        # couleur nette, à la luminosité voulue
+        hh, _, ss = colorsys.rgb_to_hls(*(float(v) for v in rgb))
+        return colorsys.hls_to_rgb(hh, light, max(ss, 0.6))
+
+    base = [mean_rgb(k) for k in peaks]
+    lights = [min(max(colorsys.rgb_to_hls(*(float(v) for v in c_))[1], 0.36), 0.6) for c_ in base]
+    cols = [tune(c_, li) for c_, li in zip(base, lights)]
+    # Trop peu de teintes : on ajoute des nuances (plus profonde, plus claire) des teintes dominantes
+    shades = [(0.27, -0.015), (0.68, 0.025), (0.46, 0.04), (0.33, -0.03)]
+    i = 0
+    while len(cols) < n and i < 8:
+        src = base[i % len(base)]
+        li, dh = shades[i % len(shades)]
+        hh, _, ss = colorsys.rgb_to_hls(*(float(v) for v in src))
+        cols.append(colorsys.hls_to_rgb((hh + dh) % 1, li, max(ss, 0.6)))
+        i += 1
+    out = sorted(cols, key=lambda c_: 0.3 * c_[0] + 0.59 * c_[1] + 0.11 * c_[2])
+    return ["#%02x%02x%02x" % tuple(round(min(1, max(0, v)) * 255) for v in c_) for c_ in out]
 
 
 def _set_cover(data):
@@ -2308,17 +2339,17 @@ a{color:var(--blue);text-decoration:none}
 .zonebtn b{display:flex;align-items:center;gap:6px;font-size:18px}
 .zonebtn small{color:var(--t2);font-size:12px;display:flex;align-items:center;gap:5px}
 .stage{display:flex;flex-direction:column;align-items:center;margin-top:22px}
-.cover{position:relative;width:min(62vw,240px);aspect-ratio:1;border-radius:22px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.6)}
+.cover{position:relative;width:min(62vw,240px);aspect-ratio:1;border-radius:22px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.6);isolation:isolate;-webkit-mask-image:-webkit-radial-gradient(white,black);transform:translateZ(0)}
 .cover .glow{position:absolute;inset:-20%;filter:blur(30px);transition:background .25s}
 .cover .lights{position:absolute;inset:0}
 .cover .lights i{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;transition:background .12s,box-shadow .12s,transform .12s}
 .coverwrap{position:relative;width:min(62vw,240px);aspect-ratio:1}
 .stage>*:not(.coverwrap){position:relative;z-index:1}
-.coverwrap .halo{position:absolute;inset:-20%;border-radius:50%;filter:blur(38px);opacity:0;transition:opacity .4s,background .25s;pointer-events:none}
+.coverwrap .halo{position:absolute;inset:-22%;opacity:0;transition:opacity .4s;pointer-events:none}
 .coverwrap.art .halo{opacity:.85}
-.cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .5s}
+.cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .5s;border-radius:inherit}
 .coverwrap.art .cover img{opacity:1}
-.coverwrap.art .cover .lights{display:none}
+.coverwrap.art .cover .lights,.coverwrap.art .cover .glow{display:none}
 .pbar{width:min(78vw,300px);margin-top:16px}
 .pbar .tr{height:4px;border-radius:2px;background:#393a3f;overflow:hidden}
 .pbar .tr i{display:block;height:100%;width:0;background:#fff;border-radius:2px}
@@ -2830,7 +2861,8 @@ function renderCover() {
   const g = cols.slice(0, 4).map(c => boost(c, 160));
   $("#coverGlow").style.background = `radial-gradient(circle at 30% 30%, ${g[0]} 0%, transparent 55%), radial-gradient(circle at 75% 70%, ${g[1] || g[0]} 0%, transparent 55%), radial-gradient(circle at 70% 25%, ${g[2] || g[0]} 0%, transparent 50%), #111`;
   $("#coverGlow").style.opacity = syncing ? 1 : .55;
-  $("#coverHalo").style.background = `radial-gradient(circle at 30% 35%, ${g[0]} 0%, transparent 60%), radial-gradient(circle at 72% 65%, ${g[1] || g[0]} 0%, transparent 60%), radial-gradient(circle at 65% 25%, ${g[2] || g[0]} 0%, transparent 55%)`;
+  const ha = c => c + "99";      // halo doux, sans bord : chaque dégradé s'éteint à l'intérieur de sa boîte
+  $("#coverHalo").style.background = `radial-gradient(closest-side at 38% 40%, ${ha(g[0])}, transparent), radial-gradient(closest-side at 62% 62%, ${ha(g[1] || g[0])}, transparent), radial-gradient(closest-side at 62% 36%, ${ha(g[2] || g[0])}, transparent), radial-gradient(closest-side at 40% 64%, ${ha(g[3] || g[1] || g[0])}, transparent)`;
 }
 let nowAt = 0;
 const mmss = t => { t = Math.max(0, Math.floor(t)); return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0"); };
