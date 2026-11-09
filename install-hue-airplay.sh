@@ -1886,6 +1886,7 @@ Aucune dépendance hors Python standard. À utiliser sur le réseau local unique
 
 import base64
 import colorsys
+import copy
 import hashlib
 import io
 import json
@@ -1898,6 +1899,7 @@ import select
 import stat
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONF_DIR = os.environ.get("HUE_SYNC_DIR", "/etc/hue-music-sync")
@@ -2434,29 +2436,119 @@ GRAD_POINTS = 5
 rooms_cache = {"t": 0.0, "data": None}
 
 
+# ---------------------------------------------------------------------------
+# État du pont tenu à jour en direct : on écoute le flux d'événements du pont
+# (/eventstream/clip/v2) au lieu de tout relire à chaque affichage.
+# Sans flux (pont injoignable, vieux firmware), on relit tout toutes les 2 s.
+# ---------------------------------------------------------------------------
+LIVE_KINDS = ("light", "grouped_light", "room", "zone", "entertainment", "entertainment_configuration")
+
+
+def open_events(cfg):
+    """Flux d'événements du pont : renvoie d'abord [] (connecté), puis chaque lot d'événements."""
+    req = urllib.request.Request(f"https://{cfg['bridge']}/eventstream/clip/v2",
+                                 headers={"hue-application-key": cfg["username"], "Accept": "text/event-stream"})
+    with urllib.request.urlopen(req, context=hms._SSL_CTX, timeout=90) as r:
+        yield []
+        for raw in r:
+            line = raw.decode("utf-8", "ignore").strip()
+            if line.startswith("data:"):
+                try:
+                    yield json.loads(line[5:])
+                except ValueError:
+                    pass
+
+
+def _merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _merge(dst[k], v)
+        else:
+            dst[k] = v
+
+
+class LiveBridge:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.res, self.t, self.stream, self.started = {}, 0.0, False, False
+
+    def dirty(self):
+        self.t = 0.0
+
+    def _full(self, cfg):
+        res = {k: {d["id"]: d for d in hms.bridge_get(cfg, k) if "id" in d} for k in LIVE_KINDS}
+        with self.lock:
+            self.res, self.t = res, time.time()
+
+    def get(self, cfg, kind):
+        if not self.started:
+            self.started = True
+            threading.Thread(target=self._run, daemon=True).start()
+        # avec le flux, une relecture complète toutes les 60 s suffit (filet de sécurité)
+        if not self.res or time.time() - self.t > (60 if self.stream else 2):
+            self._full(cfg)
+        with self.lock:
+            return copy.deepcopy(list(self.res.get(kind, {}).values()))
+
+    def apply(self, events):
+        with self.lock:
+            for ev in events if isinstance(events, list) else []:
+                for d in ev.get("data") or []:
+                    kind, rid = d.get("type"), d.get("id")
+                    if kind not in self.res or not rid:
+                        continue
+                    if ev.get("type") == "delete":
+                        self.res[kind].pop(rid, None)
+                    elif ev.get("type") == "add" or rid not in self.res[kind]:
+                        self.res[kind][rid] = d
+                    else:
+                        _merge(self.res[kind][rid], d)
+
+    def _run(self):
+        while True:
+            cfg = hms.load_config_or_none()
+            if cfg:
+                try:
+                    for evs in open_events(cfg):
+                        if not evs:            # (re)connecté : on a pu rater des événements
+                            self.dirty()
+                            self.stream = True
+                        else:
+                            self.apply(evs)
+                except Exception:
+                    pass
+            self.stream = False
+            time.sleep(5)
+
+
+LIVE = LiveBridge()
+
+
 def rooms_state(force=True):
-    if not force and rooms_cache["data"] is not None and time.time() - rooms_cache["t"] < 5:
+    if not force and rooms_cache["data"] is not None and time.time() - rooms_cache["t"] < 1:
         return rooms_cache["data"]
     cfg = _cfg()
-    lights = {l["id"]: l for l in hms.bridge_get(cfg, "light")}
+    if rooms_cache["t"] == 0:
+        LIVE.dirty()                      # une action vient de changer le pont : on relit tout
+    lights = {l["id"]: l for l in LIVE.get(cfg, "light")}
     owner_lights = {}
     for l in lights.values():
         owner_lights.setdefault(l.get("owner", {}).get("rid"), []).append(l["id"])
     # positions des lampes dans les zones de divertissement (pour colorer selon le placement)
-    ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in hms.bridge_get(cfg, "entertainment")}
+    ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in LIVE.get(cfg, "entertainment")}
     positions = {}
-    for a in hms.get_areas(cfg):
+    for a in LIVE.get(cfg, "entertainment_configuration"):
         for loc in a.get("locations", {}).get("service_locations", []):
             dev = ent_owner.get(loc.get("service", {}).get("rid"))
             pts = loc.get("positions") or []
             for lid in owner_lights.get(dev, []):
                 if pts and lid not in positions:
                     positions[lid] = {"x": pts[0].get("x", 0), "y": pts[0].get("y", 0)}
-    groups = {g["id"]: g for g in hms.bridge_get(cfg, "grouped_light")}
+    groups = {g["id"]: g for g in LIVE.get(cfg, "grouped_light")}
     plans = get_settings().get("room_plans") or {}
     rooms = []
     for rtype in ("room", "zone"):
-        for r in hms.bridge_get(cfg, rtype):
+        for r in LIVE.get(cfg, rtype):
             ids = []
             for c in r.get("children", []):
                 if c.get("rtype") == "device":
@@ -4237,7 +4329,9 @@ const TAB_OF = { sync: "sync", avances: "sync", lumieres: "lumieres", piece: "lu
 let route = { v: "sync", arg: "" }, backTo = [];
 function go(v, arg = "", push = true) {
   if (push && route.v !== v) backTo.push({ ...route });
+  const LV = ["lumieres", "piece", "lampe", "plans"], was = route.v;
   route = { v, arg };
+  if (LV.includes(v) && !LV.includes(was)) loadRooms();   // on arrive sur les lumières : état frais tout de suite
   $$(".view").forEach(x => x.classList.toggle("on", x.dataset.view === v));
   $$(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB_OF[v]));
   if (["sync", "lumieres", "reglages"].includes(v)) store("tab", v);
@@ -4744,14 +4838,24 @@ function renderPrev() {
 $("#advReset").onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: S.settings.intensity }, true); renderAdv(); toast("Préréglage rétabli"); };
 
 /* =================== LUMIÈRES =================== */
-let roomsTimer = null, roomsLock = 0;
+let roomsTimer = null, roomsLock = 0, roomsSeq = 0;
+let held = false;   // doigt posé (curseur, roue des couleurs…) : on ne redessine pas sous le doigt
+document.addEventListener("pointerdown", () => held = true, true);
+["pointerup", "pointercancel"].forEach(t => document.addEventListener(t, () => { held = false; }, true));
 async function loadRooms() {
   clearTimeout(roomsTimer);
   if (Date.now() > roomsLock) {
-    try { ROOMS = await api("/api/rooms"); } catch (e) { ROOMS = { error: e.message }; }
-    if (["lumieres", "piece", "lampe", "plans"].includes(route.v)) render();
+    // une réponse partie avant un geste (ou doublée par une lecture plus récente) est ignorée :
+    // sinon elle remettrait à l'écran les anciennes couleurs
+    const my = ++roomsSeq, lk = roomsLock;
+    let r; try { r = await api("/api/rooms"); } catch (e) { r = { error: e.message }; }
+    if (my === roomsSeq && lk === roomsLock && Date.now() > roomsLock && !held) {
+      ROOMS = r;
+      if (["lumieres", "piece", "lampe", "plans"].includes(route.v)) render();
+    }
   }
-  roomsTimer = setTimeout(loadRooms, ["lumieres", "piece", "lampe"].includes(route.v) && !document.hidden ? 4000 : 15000);
+  const near = ["lumieres", "piece", "lampe", "plans"].includes(route.v) && !document.hidden;
+  roomsTimer = setTimeout(loadRooms, Date.now() < roomsLock ? Math.max(200, roomsLock - Date.now() + 50) : near ? 1500 : 10000);
 }
 const roomColors = r => { const on = r.lights.filter(l => l.on); return (on.length ? on : r.lights).map(l => l.color); };
 function renderRooms() {
@@ -4772,11 +4876,11 @@ function renderRooms() {
 function bindRoomControls() {
   $$("[data-room]").forEach(b => b.onclick = () => go("piece", b.dataset.room));
   $$("[data-rpow]").forEach(b => b.onclick = () => roomPower(b.dataset.rpow));
-  $$("[data-rbri]").forEach(el => { const r = ROOMS.find(x => x.id === el.dataset.rbri); slider(el, t => { setSl(el, t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 2500; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); }); });
+  $$("[data-rbri]").forEach(el => { const r = ROOMS.find(x => x.id === el.dataset.rbri); slider(el, t => { setSl(el, t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 1200; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); }); });
 }
 async function roomPower(id) {
   const r = ROOMS.find(x => x.id === id); if (!r) return;
-  r.on = !r.on; r.lights.forEach(l => l.on = r.on); roomsLock = Date.now() + 2500; render();
+  r.on = !r.on; r.lights.forEach(l => l.on = r.on); roomsLock = Date.now() + 1200; render();
   try { await api("/api/room", { group: r.group, on: r.on }); } catch (e) { toast(e.message); }
 }
 
@@ -4868,7 +4972,7 @@ function renderPiece() {
     ${effs.length ? `<div class="label in">Effets</div><div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>` : ""}
     <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
-  if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 2500; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
+  if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 1200; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
   $$("[data-spr]").forEach(b => b.onclick = () => { spread = b.dataset.spr; store("spread", spread); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else renderPiece(); });
   $$("[data-scene]").forEach(b => b.onclick = () => applyScene(r, b.dataset.scene));
   $$("[data-editplan]").forEach(b => b.onclick = () => go("plan", "r:" + r.id));
@@ -4892,7 +4996,7 @@ function lampTile(l) {
     <div class="pw"><button class="pwbtn" data-lpow="${l.id}" aria-label="${l.on ? "Éteindre" : "Allumer"} ${esc(l.name)}" style="background:${l.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${l.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div></div>`;
 }
 async function lightPower(r, id) {
-  const l = r.lights.find(x => x.id === id); l.on = !l.on; r.on = r.lights.some(x => x.on); roomsLock = Date.now() + 2500; render();
+  const l = r.lights.find(x => x.id === id); l.on = !l.on; r.on = r.lights.some(x => x.on); roomsLock = Date.now() + 1200; render();
   try { await api("/api/light", { id, on: l.on }); } catch (e) { toast(e.message); }
 }
 async function applyScene(r, pid) {
@@ -4940,13 +5044,13 @@ function renderLampe() {
     if (wheelMode === "white" || !l.has_color) { const t = y + .5, mirek = Math.round(500 - t * 347); body = { id: l.id, mirek }; col = mix(["#ff9a4d", "#ffd9a0", "#fff6e6", "#ffffff", "#cfe8ff"], t); }
     else { const ang = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360, hue = (ang + 0) % 360, sat = Math.min(1, Math.hypot(x, y) * 2); col = hsv(hue, sat, 1); body = { id: l.id, color: col }; }
     pin.style.background = col; l.color = col; l.on = true;
-    clearTimeout(sendT); sendT = setTimeout(() => { roomsLock = Date.now() + 2500; api("/api/light", body).catch(er => toast(er.message)); }, 120);
+    clearTimeout(sendT); sendT = setTimeout(() => { roomsLock = Date.now() + 1200; api("/api/light", body).catch(er => toast(er.message)); }, 120);
   };
   let drag = false;
   wheel.addEventListener("pointerdown", e => { drag = true; wheel.setPointerCapture(e.pointerId); pick(e); });
   wheel.addEventListener("pointermove", e => drag && pick(e));
   wheel.addEventListener("pointerup", () => drag = false);
-  slider($("#lBri"), t => { setSl($("#lBri"), t); l.bri = Math.max(1, Math.round(t * 100)); $("#lBriPct").textContent = l.bri + " %"; }, () => { roomsLock = Date.now() + 2500; api("/api/light", { id: l.id, bri: l.bri }).catch(e => toast(e.message)); });
+  slider($("#lBri"), t => { setSl($("#lBri"), t); l.bri = Math.max(1, Math.round(t * 100)); $("#lBriPct").textContent = l.bri + " %"; }, () => { roomsLock = Date.now() + 1200; api("/api/light", { id: l.id, bri: l.bri }).catch(e => toast(e.message)); });
 }
 function hsv(h, s, v) { const f = n => { const k = (n + h / 60) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); }; return rgbHex([f(5) * 255, f(3) * 255, f(1) * 255]); }
 
