@@ -2546,12 +2546,19 @@ def room_palette(body):
         if not l.get("has_gradient"):
             continue
         if l.get("path"):                   # palette étalée le long du ruban (en boucle s'il fait le tour)
-            pth, n, G = l["path"], len(rgb), len(l["path"])
+            pth, n = l["path"], len(rgb)
             loop = abs(pth[0]["x"] - pth[-1]["x"]) < 1e-3 and abs(pth[0]["y"] - pth[-1]["y"]) < 1e-3
+            # Points de couleur envoyés au ruban (5 au plus, répartis à égale distance par le pont).
+            # En boucle, le dernier point reprend le premier pour refermer le tour sans cassure :
+            # on garde donc au plus 4 couleurs distinctes, réparties régulièrement dans la palette.
             if loop:
-                grad = [rgb[(k * n // (G - 1)) % n] for k in range(G)]
+                idx = list(range(n)) if n <= GRAD_POINTS - 1 else [round(i * n / (GRAD_POINTS - 1)) % n for i in range(GRAD_POINTS - 1)]
+                idx = idx + [idx[0]]
             else:
-                grad = [rgb[round(k * (n - 1) / (G - 1))] for k in range(G)]
+                idx = list(range(n)) if n <= GRAD_POINTS else [round(i * (n - 1) / (GRAD_POINTS - 1)) for i in range(GRAD_POINTS)]
+            if len(idx) < 2:
+                idx = idx * 2
+            grad = [rgb[i] for i in idx]
             if l.get("line"):
                 strips.append((l["line"], grad))
         else:                               # pas de plan : du plus foncé au plus clair
@@ -2565,13 +2572,26 @@ def room_palette(body):
         APPLIED[l["id"]] = {"grad": gh, "gxy": gxy}
         result[l["id"]] = {"gradient": gh, "color": gh[len(gh) // 2]}
 
-    def near_strip(p):                      # spot : la couleur du ruban juste à côté de lui
+    gm = gmode or "interpolated_palette"
+
+    def grad_at(grad, u):                   # couleur affichée par le ruban à la fraction u de sa longueur
+        m, u = len(grad), max(0.0, min(1.0, u))
+        if gm == "segmented_palette":       # blocs nets
+            return grad[min(m - 1, int(u * m))]
+        if gm == "interpolated_palette_mirrored":
+            u = abs(2 * u - 1)              # le dégradé part du milieu et se reflète vers les deux bouts
+        x = u * (m - 1)
+        k = min(int(x), m - 2)
+        f = x - k
+        return tuple(a + (b - a) * f for a, b in zip(grad[k], grad[k + 1]))
+
+    def near_strip(p):                      # spot : la couleur du ruban juste à côté de lui (avec l'entre-deux)
         best = None
         for line, grad in strips:
             for k, q in enumerate(line):
                 d = (q["x"] - p["x"]) ** 2 + (q["y"] - p["y"]) ** 2
                 if best is None or d < best[0]:
-                    best = (d, along(grad, k / (len(line) - 1)))
+                    best = (d, grad_at(grad, k / (len(line) - 1)))
         return best[1] if best else None
 
     for i, l in enumerate(ls):
