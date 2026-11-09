@@ -357,6 +357,21 @@ def plan_channels(area, plans):
             except (KeyError, TypeError, ValueError):
                 pass
         out.append(c)
+    if not pts:
+        # Pas de plan : les segments d'un ruban suivent leur VRAI ordre (numéro du segment),
+        # pas leur position gauche-droite (un ruban qui fait le tour de la pièce serait mélangé).
+        by = {}
+        for c in out:
+            m = (c.get("members") or [{}])[0]
+            by.setdefault(m.get("service", {}).get("rid"), []).append(c)
+        for rid, cs in by.items():
+            if not rid or len(cs) < 2:
+                continue
+            xs = sorted(c["position"].get("x", 0) for c in cs)
+            for c, x in zip(sorted(cs, key=lambda c: (c.get("members") or [{}])[0].get("index", 0) or 0), xs):
+                p = dict(c["position"])
+                p["sx"], p["x"] = p.get("x", 0), x
+                c["position"] = p
     return out
 
 
@@ -885,37 +900,37 @@ class Effects:
         mode = self.mode
 
         if mode == "comete":
+            # Une seule comète qui tourne en continu le long du ruban (toujours dans le même sens),
+            # avec une longue traînée qui s'éteint en fondu. Chaque temps lui donne un élan et la
+            # fait briller ; la couleur de la tête change avec la palette (tous les N temps).
             if beat:
-                d = 1 if (self.beat_count % 2 or n == 1) else -1
-                s0 = 0.5 / max(n - 1, 1)                  # part juste avant le premier segment : entrée en fondu
-                self.comets.append([-s0 if d > 0 else 1.0 + s0, d, self.palette[self.color_idx % len(self.palette)],
-                                    0.6 + 0.4 * strength])
-            v = 1.4 * sp                                   # longueur du ruban par seconde
-            for c in self.comets:
-                c[0] += c[1] * v * dt
-            self.comets = [c for c in self.comets if -0.4 < c[0] < 1.4][-6:]
-            seg = 1.0 / max(n - 1, 1)                      # écart entre deux segments
-            tail = max(0.22 + 0.12 * (1 - p["base"]), 2.5 * seg)
-            front = 0.9 * seg                              # la tête arrive en fondu dans le bloc suivant
-            for x in pos:
-                col, b = self.palette[self.color_idx % len(self.palette)] * 1.0, 0.04 + 0.25 * p["base"]
-                for c in self.comets:
-                    behind = (c[0] - x) * c[1]                # distance derrière la tête
-                    if -front <= behind <= tail:
-                        k = c[3] * ((1 - behind / tail) ** 1.6 if behind >= 0 else 1 + behind / front)
-                        if n == 1:
-                            k = c[3] * max(0.0, 1 - abs(c[0] - 0.5) * 2)
-                        if k > b:
-                            b, col = k, c[2]
-                res.append((col, b, True))
-            # luminosité lissée par segment : montée rapide, descente douce (glisse sans saut)
-            if getattr(self, "bsm", None) is None or len(self.bsm) != n:
-                self.bsm = np.zeros(n)
-            for i, (col, b, q) in enumerate(res):
-                a = 0.45 if b > self.bsm[i] else 0.18
-                self.bsm[i] += (b - self.bsm[i]) * a
-                res[i] = (col, self.bsm[i], q)
-
+                self.push = min(2.5, self.push + 0.5 + 0.8 * strength)
+                self.env[:] = np.maximum(self.env, 0.5 + 0.5 * strength)
+            self.push *= np.exp(-dt / 0.5)
+            self.env *= np.exp(-dt / 0.35)
+            self.head = (getattr(self, "head", 0.0) + dt * sp * (0.16 + 0.10 * energy + 0.30 * self.push)) % 1.0
+            npal = len(self.palette)
+            c0 = self.palette[self.color_idx % npal]
+            c1 = self.palette[(self.color_idx + 1) % npal]
+            if n == 1:                                        # une seule lampe : elle « respire » au passage
+                k = 0.5 + 0.5 * np.cos(2 * np.pi * self.head)
+                res.append((c0, 0.06 + 0.8 * k * (0.7 + 0.3 * self.env[0]), True))
+            else:
+                tail = 0.55                                   # un peu plus d'un demi-tour de traînée
+                front = 0.7 / n                               # la tête entre en fondu dans le segment suivant
+                glow = 0.7 + 0.3 * min(1.0, self.push)
+                for i in range(n):
+                    u = i / n                                 # position sur la boucle (le ruban fait le tour)
+                    d = (self.head - u) % 1.0                 # distance derrière la tête
+                    if d <= tail:
+                        k = (1 - d / tail) ** 1.8
+                    elif 1 - d < front:                       # juste devant la tête
+                        k = 1 - (1 - d) / front
+                    else:
+                        k = 0.0
+                    col = c0 + (c1 - c0) * min(1.0, d / tail)     # la queue glisse vers la couleur suivante
+                    b = 0.03 + 0.15 * p["base"] + 0.85 * k * glow + 0.15 * k * self.env[i]
+                    res.append((col, b, True))
         elif mode == "glisse":
             # La palette glisse en continu le long des lampes ; chaque grosse caisse donne un élan
             # qui accélère puis s'amortit. Couleurs interpolées : passage en fondu d'un segment à l'autre.
@@ -929,7 +944,7 @@ class Effects:
                 res.append((self.palette_at(self.phase - x * span), b, True))
 
         elif mode == "vague":
-            self.phase += dt * 0.07 * sp * (0.6 + 0.8 * energy)
+            self.phase += dt * 0.22 * sp * (0.6 + 0.8 * energy)     # ~1 tour de palette en 4-6 s
             if beat:
                 self.env[:] = np.maximum(self.env, 0.35 * strength)
             self.env *= np.exp(-dt / 0.4)
@@ -938,7 +953,8 @@ class Effects:
                 res.append((self.palette_at(x * 0.85 + self.phase), b, True))
 
         elif mode == "vumetre":
-            target = lvl ** 0.8
+            # niveau réel du moment (sans le coup de pouce des temps, qui le collait en haut)
+            target = min(1.0, max(dyn["all"], 0.85 * dyn["bass"], 0.7 * dyn["mid"]) ** 0.9)
             rise = 1 - np.exp(-dt / 0.04)
             fall = 1 - np.exp(-dt / (0.35 / sp))
             self.vu += (target - self.vu) * (rise if target > self.vu else fall)
@@ -1144,6 +1160,19 @@ class Layered:
                 groups.setdefault(k, (ov["mode"], ov.get("speed", speed), []))[2].append(ch)
             else:
                 groups.setdefault("_", (mode, speed, []))[2].append(ch)
+        # Effets « le long du ruban » : le ruban joue l'effet, et chaque autre lampe du même groupe
+        # (spot, Play…) reprend la couleur du point du ruban le plus proche d'elle dans la pièce.
+        self.follow = {}
+        pos2 = lambda c: (c["position"].get("sx", c["position"]["x"]), c["position"].get("y", 0))
+        for name, (m, sp, chs) in list(groups.items()):
+            strip = [c for c in chs if kinds.get(c["channel_id"]) == "ruban"]
+            others = [c for c in chs if kinds.get(c["channel_id"]) != "ruban"]
+            if m in ALONG and len(strip) > 1 and others:
+                for o in others:
+                    ox, oy = pos2(o)
+                    near = min(strip, key=lambda c: (pos2(c)[0] - ox) ** 2 + (pos2(c)[1] - oy) ** 2)
+                    self.follow[o["channel_id"]] = near["channel_id"]
+                groups[name] = (m, sp, strip)
         fx = {}
         for name, (m, sp, chs) in groups.items():
             e = self.fx.get(name)
@@ -1164,6 +1193,9 @@ class Layered:
         out = []
         for e in self.fx.values():
             out += e.update(rms, bands, beat, strength)
+        if self.follow:
+            by = {o[0]: o for o in out}
+            out += [(cid, *by[src][1:]) for cid, src in self.follow.items() if src in by]
         self.last_out = out
         return out
 
@@ -1333,6 +1365,7 @@ class Session:
 # ---------------------------------------------------------------------------
 MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
 SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
+ALONG = ("glisse", "comete", "vague", "vumetre", "etincelles", "respiration")   # effets qui suivent le ruban
 
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
                      "layers": {}, "plans": {}, "test": {},
@@ -1655,6 +1688,7 @@ Sert la page index.html et une petite API JSON :
   POST /api/room/effect  {"id", "effect", "speed"?}       effet intégré au pont (bougie, étincelles…)
   POST /api/light/order  {"light", "order"}               sens du contenu sur un ruban (forward / reversed)
   POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
+  POST /api/area/from_room {"id", "rubans"?, "spots"?}    crée la zone de divertissement d'une pièce d'après son plan
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -2514,6 +2548,108 @@ def plan_eq(body):
     return {"ok": True, "eq": eq}
 
 
+ZONE_PREFIX = "Lueur · "
+
+
+def area_from_room(body):
+    """Crée (ou met à jour) sur le pont la zone de divertissement « Lueur · <pièce> » à partir du plan
+    Lueur de la pièce : chaque lampe à sa place, le ruban de son début à sa fin. Le plan est recopié
+    dans la zone de synchro (ordre des segments, spots), et la zone est choisie pour la musique."""
+    cfg = _cfg()
+    rid = str(body.get("id", ""))[:64]
+    if "rubans" in body or "spots" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
+        save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {}})
+    room = next((r for r in rooms_state() if r["id"] == rid), None)
+    if not room:
+        raise ValueError("Pièce introuvable.")
+    plan = (get_settings().get("room_plans") or {}).get(rid) or {}
+    lights = {l["id"]: l for l in hms.bridge_get(cfg, "light")}
+    ent_of_dev = {e.get("owner", {}).get("rid"): e["id"] for e in hms.bridge_get(cfg, "entertainment") if e.get("renderer")}
+    n = len(room["lights"])
+    locs, used, strips = [], {}, {}
+    for i, l in enumerate(room["lights"]):
+        eid = ent_of_dev.get(lights.get(l["id"], {}).get("owner", {}).get("rid"))
+        if not eid or eid in used.values():
+            continue                                  # lampe sans couleur (pas de divertissement possible)
+        a = (l.get("archetype") or "").lower()
+        z = 1.0 if any(k in a for k in ("ceiling", "recessed", "spot")) else 0.8 if l.get("has_gradient") else 0.0
+        pt = lambda q: {"x": round(q[0] * 2 - 1, 3), "y": round(1 - q[1] * 2, 3), "z": z}
+        if l.get("has_gradient"):
+            rb = dict({"walls": 1, "corner": 0, "dir": 1}, **((plan.get("rubans") or {}).get(l["id"]) or {}))
+            # 2 points : début et fin du ruban. S'il fait tout le tour, la fin serait sur le début :
+            # on donne le point opposé, pour que les autres applis étalent quand même les segments.
+            span = 0.5 if rb["walls"] >= 4 else 1.0
+            pos = [pt(perim(rb["corner"])), pt(perim(rb["corner"] + rb["dir"] * rb["walls"] * span))]
+            strips[l["id"]] = rb
+        else:
+            q = (plan.get("spots") or {}).get(l["id"])
+            if not q:
+                p = l.get("pos") or {"x": round(-0.7 + 1.4 * i / max(1, n - 1), 3) if n > 1 else 0.0, "y": 0.0}
+                q = [(p["x"] + 1) / 2, (1 - p["y"]) / 2]
+            pos = [pt(q)]
+        locs.append({"service": {"rid": eid, "rtype": "entertainment"}, "positions": pos})
+        used[l["id"]] = eid
+    if not locs:
+        raise ValueError("Aucune lampe couleur dans cette pièce.")
+    if len(locs) > hms.MAX_AREA_LIGHTS:
+        raise ValueError(f"Une zone de divertissement accepte {hms.MAX_AREA_LIGHTS} lampes au plus "
+                         f"(cette pièce en a {len(locs)}).")
+    name = (ZONE_PREFIX + room["name"])[:32]
+    path = "/clip/v2/resource/entertainment_configuration"
+    req = lambda method, p, b: hms.bridge_request(cfg["bridge"], method, p, key=cfg["username"], body=b)
+    existing = next((a for a in hms.get_areas(cfg) if a.get("metadata", {}).get("name") == name), None)
+    if existing:
+        if existing.get("status") == "active":       # le pont refuse de modifier une zone en cours de flux
+            req("PUT", f"{path}/{existing['id']}", {"action": "stop"})
+        req("PUT", f"{path}/{existing['id']}", {"metadata": {"name": name}, "configuration_type": "music",
+                                               "locations": {"service_locations": locs}})
+        aid = existing["id"]
+    else:
+        res = req("POST", path, {"type": "entertainment_configuration", "metadata": {"name": name},
+                                 "configuration_type": "music", "locations": {"service_locations": locs}})
+        errs = res.get("errors") if isinstance(res, dict) else None
+        if errs:
+            raise hms.HueError("Le pont a refusé la zone : " + "; ".join(e.get("description", "?") for e in errs))
+        aid = _rid(res)
+    area = next((a for a in hms.get_areas(cfg) if a["id"] == aid), None)
+    if not area:
+        raise hms.HueError("Zone créée, mais introuvable sur le pont.")
+    # Plan de la zone de synchro, recopié du plan de la pièce (mêmes conventions que l'éditeur)
+    rows = hms.channel_info(cfg, area)
+    light_of_dev = {lights.get(lid, {}).get("owner", {}).get("rid"): lid for lid in used}
+    ch, rubans, spots = {}, {}, {}
+    by_dev = {}
+    for r in rows:
+        by_dev.setdefault(r["dev"], []).append(r)
+    for dev, rs in by_dev.items():
+        lid = light_of_dev.get(dev)
+        rb = strips.get(lid)
+        if rb and len(rs) > 1:
+            rubans[dev] = rb
+            rs.sort(key=lambda r: r["idx"])
+            for k, r in enumerate(rs):
+                u = (k + 0.5) / len(rs)
+                px, py = perim(rb["corner"] + rb["dir"] * u * rb["walls"])
+                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
+        else:
+            for r in rs:
+                q = (plan.get("spots") or {}).get(lid) or [(r["x"] + 1) / 2, (1 - r["y"]) / 2]
+                q = [max(PM, min(1 - PM, float(q[0]))), max(PM, min(1 - PM, float(q[1])))]
+                spots[str(r["id"])] = q
+                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4)}
+    update_settings({"area": aid})                   # la zone devient celle de la musique
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    eq = (plans.get(aid) or {}).get("eq") if isinstance(plans.get(aid), dict) else None
+    plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots, **({"eq": eq} if eq else {})}
+    s.update(plans=plans, area_rev=int(s.get("area_rev", 0)) + 1)
+    write_json(SETTINGS_PATH, s)
+    areas_cache["data"] = None
+    segs = max((len(rs) for dev, rs in by_dev.items() if light_of_dev.get(dev) in strips), default=0)
+    return {"ok": True, "area_id": aid, "name": name, "created": not existing,
+            "lights": len(locs), "channels": len(rows), "segments": segs}
+
+
 # ---------------------------------------------------------------------------
 # Palettes personnalisées
 # ---------------------------------------------------------------------------
@@ -3074,6 +3210,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(502, {"error": str(e)})
             if path == "/api/plan":
                 return self._send(200, save_plan(body))
+            if path == "/api/area/from_room":
+                try:
+                    return self._send(200, area_from_room(body))
+                except hms.HueError as e:
+                    return self._send(502, {"error": str(e)})
             if path == "/api/plan/eq":
                 return self._send(200, plan_eq(body))
             if path == "/api/plan/test":
@@ -3565,7 +3706,8 @@ button:active{transform:scale(.96);opacity:.82}
   <div class="sl" id="lumSl" style="margin:12px 4px 4px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>
   <p class="note" style="padding:8px 4px 0">Plafond de luminosité pendant la synchro. Les flashs ne dépassent jamais cette valeur.</p></div>
 <div class="sheet" id="shZone"><div class="grab"></div><div class="sh"><b>Synchroniser</b><button class="txtbtn" data-close>OK</button></div><div class="list" id="zoneList" style="border-radius:18px;background:var(--card2)"></div>
-  <button class="cta ghost" id="zoneLamps" style="margin-top:14px">Choisir mes lampes…</button>
+  <button class="cta ghost" id="zoneFromRoom" style="margin-top:14px">Créer la zone d'une pièce…</button>
+  <button class="cta ghost" id="zoneLamps" style="margin-top:10px">Choisir mes lampes…</button>
   <p class="note" style="padding:12px 4px 0">Les zones viennent de ton pont. « Choisir mes lampes » crée ou modifie la zone « Hue Sync ».</p></div>
 <div class="sheet" id="shLampes"><div class="grab"></div><div class="sh"><b>Lampes de la synchro</b><button class="txtbtn" data-close>Annuler</button></div><div id="lightList"></div>
   <div style="display:flex;align-items:center;gap:12px;margin-top:16px"><span id="lightCount" style="flex:1;color:var(--t2)"></span><button class="cta" id="lightSave" style="width:auto;padding:0 26px">Enregistrer</button></div></div>
@@ -3670,7 +3812,7 @@ const EFFECTS = [
   ["pulse", "Pulsation", "Tout bat ensemble sur le rythme", true],
   ["spectrum", "Spectre étalé", "Graves d'un côté, aigus de l'autre", true],
   ["glisse", "Glissé", "La palette coule le long du ruban, poussée par le rythme", true],
-  ["comete", "Comète", "Une traînée court le long du ruban", true],
+  ["comete", "Comète", "Une traînée tourne sur le ruban, poussée par le rythme", true],
   ["vague", "Vague", "La palette défile, sans flash", true],
   ["vumetre", "Vu-mètre", "Se remplit avec le volume", true],
   ["stereo", "Stéréo", "Gauche et droite séparées", true],
@@ -3680,7 +3822,7 @@ const EFFECTS = [
 
 const SPEEDS = [[0.5, "Demi-temps"], [1, "Normale"], [2, "Double"]];
 const SPEED_D = { pulse: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.", spectrum: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.",
-  comete: "Vitesse de la traînée et nombre de départs.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
+  comete: "Vitesse à laquelle la comète fait le tour du ruban.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
   stereo: "Durée des éclats sur les temps.", etincelles: "Durée des éclats.", respiration: "Demi-temps : 16 s par souffle. Double : 4 s." };
 const KIND_N = { ruban: "Ruban", spots: "Spots", play: "Play", lampes: "Lampes" };
 let effTarget = "all";
@@ -3835,11 +3977,19 @@ async function renderPlan() {
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
     <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}
-    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? "" : eqCard());
+    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? areaCard() : eqCard());
   $$("[data-ord]").forEach(b => b.onclick = async () => {
     try { await api("/api/light/order", { light: b.dataset.ol, order: b.dataset.ord }); PLAN.channels.forEach(c => { if (c.light === b.dataset.ol) c.order = b.dataset.ord; }); renderPlan(); toast("Sens changé : refais « Montrer le début »"); }
     catch (e) { toast(e.message); }
   });
+  if ($("#planArea")) $("#planArea").onclick = async () => {
+    const b = $("#planArea"); b.disabled = true; b.textContent = "Création sur le pont…";
+    try {
+      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots });
+      toast(`« ${r.name} » ${r.created ? "créée" : "mise à jour"} : ${r.channels} canaux${r.segments ? `, ruban en ${r.segments} segments` : ""}`);
+      zones = null; roomsLock = 0; loadRooms(); await refresh(true); PLAN = null; renderPlan();
+    } catch (e) { toast("Échec : " + e.message); b.disabled = false; b.textContent = "Réessayer"; }
+  };
   $$("[data-eq]").forEach(el => slider(el, t => { const v = Math.round((0.1 + t * 0.9) * 100) / 100; setSl(el, t); PED.eq[el.dataset.eq] = v; el.parentElement.querySelector("[data-eqv]").textContent = Math.round(v * 100) + " %"; clearTimeout(eqTimer); eqTimer = setTimeout(sendEq, 250); }, sendEq));
   $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); });
   $$("[data-ident]").forEach(b => b.onclick = async () => {
@@ -3855,6 +4005,12 @@ async function renderPlan() {
       toast("Un point blanc parcourt les segments pendant 15 s");
     } catch (e) { toast(e.message); }
   });
+}
+function areaCard() {    // zone de divertissement de la pièce, créée d'après ce plan
+  const name = ("Lueur · " + PLAN.name).slice(0, 32), z = zones && !zones.error ? zones.find(x => x.name === name) : null;
+  return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon("zones", 22)}</span><span><b>Zone de synchro</b><br><small>${z ? `« ${esc(name)} » · ${z.lights} canaux` : "Pas encore créée"}</small></span></div>
+    <button class="cta" id="planArea" style="margin-top:4px">${z ? "Mettre à jour la zone de synchro" : "Créer la zone de synchro"}</button>
+    <p class="hint" style="margin:8px 2px 0">${z ? "Remet" : "Crée"} sur le pont la zone de divertissement « ${esc(name)} » avec les lampes de la pièce placées comme sur ce plan, recopie le plan pour la synchro et la choisit pour la musique. Le nombre de segments du ruban reste celui réglé dans l'app Hue.</p></div>`;
 }
 let eqTimer = null;
 function eqCard() {      // équilibre de luminosité de chaque lampe de la zone de synchro
@@ -3949,7 +4105,7 @@ function orbTile(name, colors, on, attrs, badge) {
 function effAnim(fx, i, n, sp) {
   const rnd = [0, .62, .21, .9, .4, .75, .12, .55, .33, .82, .05, .68], k = 1 / (sp || 1), f = v => (v * k).toFixed(2);
   if (fx === "spectrum") return `bar ${(.45 + rnd[i % 12] * .5).toFixed(2)}s ${(-rnd[(i + 3) % 12]).toFixed(2)}s ease-in-out infinite alternate`;
-  if (fx === "comete") return `fl ${f(1.4)}s ${f(i * .07)}s infinite`;
+  if (fx === "comete") return `fl ${f(1.6)}s ${f(i * 1.6 / n)}s infinite`;
   if (fx === "glisse") return `br ${f(1.6)}s ease-in-out ${f(-i * .16)}s infinite`;
   if (fx === "vague") return `br ${f(2.4)}s ease-in-out ${f(-i * .22)}s infinite`;
   if (fx === "vumetre") return `fl ${f(1.6)}s ${f(i * .06)}s infinite`;
@@ -4057,6 +4213,7 @@ function renderZoneMenu() {
   g.innerHTML = zones.map(z => `<button class="row" data-zone="${z.id}" style="min-height:60px"><span style="width:44px;text-align:center;color:var(--blue);font-weight:700">${cz && cz.id === z.id ? "✓" : ""}</span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">${esc(z.name)}</span><span class="t2" style="font-size:13px">${z.lights} lampe${z.lights > 1 ? "s" : ""}</span></span></span></button>`).join("");
   $$("[data-zone]").forEach(b => b.onclick = () => { save({ area: b.dataset.zone }, true); renderZoneMenu(); renderSync(); });
 }
+$("#zoneFromRoom").onclick = () => { closeSheets(); backTo = []; go("plans"); toast("Choisis la pièce, puis « Créer la zone de synchro »"); };
 $("#zoneLamps").onclick = () => { closeSheets(); setTimeout(openLights, 260); };
 $("#lampsRow").onclick = () => openLights();
 
