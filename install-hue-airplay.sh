@@ -755,14 +755,18 @@ class Analyzer:
         self.rms_slow = 0.0
         self.prev_log = None
         self.last_beat = 0.0
+        self.last_low = False
         self.t = 0.0
 
     def set_params(self, beat_k, min_beat, source="full"):
         self.beat_k, self.min_beat = beat_k, min_beat
         if source != self.source:
-            lo, hi = self.SOURCES.get(source, self.SOURCES["full"])
-            self.flux_mask = (self.freqs >= lo) & (self.freqs < hi)
-            self.flux_hist = collections.deque(maxlen=50)   # ~1 s d'historique
+            # Deux détecteurs séparés : graves (grosse caisse) et médiums-aigus (caisse claire,
+            # attaques). Séparés, les graves ne sont plus noyés sous les centaines de fréquences aiguës.
+            self.flux_masks = {"low": (self.freqs >= 30) & (self.freqs < 160),
+                               "high": (self.freqs >= 160) & (self.freqs < 6000)}
+            self.flux_mask = self.flux_masks["low"] | self.flux_masks["high"]
+            self.flux_hist = {k: collections.deque(maxlen=50) for k in self.flux_masks}   # ~1 s
             self.prev_log = None
             self.source = source
 
@@ -796,21 +800,39 @@ class Analyzer:
         ratio = self.rms_fast / max(self.rms_slow, 1e-4)
         bands["energy"] = max(0.0, min(1.0, (ratio - 0.75) / 0.6))
 
-        # Flux spectral : détecte les attaques (kick, caisse claire...)
-        log_mag = np.log1p(mag[self.flux_mask])
-        flux = 0.0 if self.prev_log is None else float(np.sum(np.maximum(0, log_mag - self.prev_log)))
+        # Flux spectral par région : hausse d'énergie moyenne par fréquence (attaques)
+        log_mag = np.log1p(mag)
+        z, ok = {}, False
+        for k, m in self.flux_masks.items():
+            cur = log_mag[m]
+            prev = None if self.prev_log is None else self.prev_log[m]
+            flux = 0.0 if prev is None else float(np.mean(np.maximum(0, cur - prev)))
+            hist = self.flux_hist[k]
+            if len(hist) >= 6:
+                mean = float(np.mean(hist))
+                std = float(np.std(hist)) + 1e-6
+                z[k] = (flux - mean) / std
+                ok = ok or flux > 0.0054                  # seuil absolu : pas de temps dans le souffle
+            hist.append(flux)
         self.prev_log = log_mag
         beat, strength = False, 0.0
-        if len(self.flux_hist) >= 6 and sound:
-            mean = float(np.mean(self.flux_hist))
-            std = float(np.std(self.flux_hist)) + 1e-6
-            thresh = mean + self.beat_k * std
-            floor = 0.0054 * int(self.flux_mask.sum())    # seuil absolu, proportionnel à la bande
-            if flux > thresh and flux > floor and (self.t - self.last_beat) > self.min_beat:
+        if z and sound and ok:
+            if self.source == "kick":
+                nov = z.get("low", 0.0)
+            elif self.source == "snare":
+                nov = z.get("high", 0.0)
+            else:
+                nov = max(z.get("low", 0.0), 0.85 * z.get("high", 0.0))
+            low = z.get("low", 0.0) > self.beat_k and self.source != "snare"
+            free = (self.t - self.last_beat) > self.min_beat
+            # une grosse caisse peut passer devant un temps aigu récent (sinon un charley détecté
+            # juste avant bloquerait tous les kicks et les lampes tomberaient à contretemps)
+            steal = low and not self.last_low and (self.t - self.last_beat) > 0.09
+            if nov > self.beat_k and (free or steal):
                 beat = True
-                strength = min(1.0, (flux - mean) / (4 * std))
+                strength = min(1.0, max(0.3, nov / 4))
                 self.last_beat = self.t
-        self.flux_hist.append(flux)
+                self.last_low = low
         return rms, bands, beat, strength
 
 
@@ -839,6 +861,8 @@ class Effects:
         self.vu_peak = 0.0
         self.phase = 0.0
         self.lr_ref = 1e-3
+        self.bavg = {}                   # niveau moyen récent de chaque bande (~1 s)
+        self.dyn = {"bass": 0.0, "mid": 0.0, "high": 0.0, "all": 0.0}
         self.configure(channels, palette, intensity, brightness, mode)
 
     def configure(self, channels, palette, params, brightness, mode):
@@ -910,12 +934,13 @@ class Effects:
         k = int(x) % npal
         return self.palette[k] + (self.palette[(k + 1) % npal] - self.palette[k]) * (x - int(x))
 
-    def _render_extra(self, bands, beat, strength, n):
+    def _render_extra(self, bands, beat, strength, n, dyn):
         """Effets supplémentaires : renvoie [(couleur cible, luminosité 0-1, fondu rapide ?)]."""
         p, sp, dt = self.p, self.speed, self.DT
         energy = bands.get("energy", 0.5)
-        lvl = max(bands.get("bass", 0.0), bands.get("mid", 0.0) * 0.9, bands.get("high", 0.0) * 0.7)
-        lvl = max(0.0, min(1.0, (lvl - 0.2) / 0.8))
+        lvl = max(dyn["all"], dyn["bass"] * 0.9, dyn["mid"] * 0.8)
+        if beat:
+            lvl = max(lvl, 0.6 + 0.4 * strength)
         res = []
         pos = [i / (n - 1) if n > 1 else 0.5 for i in range(n)]
         mode = self.mode
@@ -969,8 +994,11 @@ class Effects:
 
         elif mode == "stereo":
             l, r = bands.get("lr", (0.0, 0.0))
-            self.lr_ref = max(l, r, self.lr_ref * 0.998, 1e-3)
-            sides = [min(1.0, l / self.lr_ref), min(1.0, r / self.lr_ref)]
+            avg = self.bavg.setdefault("lr", [l or 1e-3, r or 1e-3])
+            sides = []
+            for j, v in enumerate((l, r)):
+                avg[j] += (v - avg[j]) * 0.02
+                sides.append(max(0.0, min(1.0, (v / max(avg[j], 1e-5) - 0.7) / 0.8)))
             if l + r < 1e-4:                               # pas de stéréo (source mono) : milieu
                 sides = [lvl, lvl]
             if beat:
@@ -1027,11 +1055,26 @@ class Effects:
         beat, strength = self._apply_speed(beat, strength)
         if beat:
             self._on_beat(strength, bands, n)
+        # Niveaux « dynamiques » : chaque bande comparée à sa moyenne récente. Une musique
+        # compressée reste toujours forte ; seule la variation fait bouger les lampes.
+        if not silent:
+            for k in ("bass", "mid", "high"):
+                v = bands.get(k, 0.0)
+                avg = self.bavg.get(k, v)
+                avg += (v - avg) * 0.025
+                self.bavg[k] = avg
+                self.dyn[k] = max(0.0, min(1.0, (v / max(avg, 1e-3) - 0.8) / 0.75))
+            a = rms / max(self.bavg.get("rms", rms), 1e-5)
+            self.bavg["rms"] = self.bavg.get("rms", rms) + (rms - self.bavg.get("rms", rms)) * 0.02
+            self.dyn["all"] = max(0.0, min(1.0, (a - 0.75) / 0.9))
+        else:
+            self.dyn = {k: v * 0.9 for k, v in self.dyn.items()}
+        dyn = self.dyn
 
         if self.mode not in ("pulse", "spectrum"):
             out = []
             fade = 1.0 if p["fade"] <= 0 else 1 - np.exp(-self.DT / p["fade"])
-            for i, (ch, (target, b, quick)) in enumerate(zip(self.channels, self._render_extra(bands, beat, strength, n))):
+            for i, (ch, (target, b, quick)) in enumerate(zip(self.channels, self._render_extra(bands, beat, strength, n, dyn))):
                 self.current[i] += (target - self.current[i]) * (max(fade, 0.5) if quick else max(fade, 0.03))
                 b = max(0.0, min(1.0, b))
                 if self.silent_frames > 50:
@@ -1054,10 +1097,12 @@ class Effects:
             if self.mode == "spectrum" and n == 1:
                 # Une seule lampe : la couleur suit le registre (graves = couleur foncée de la
                 # palette, aigus = couleur claire) et la luminosité suit le niveau, en continu.
-                bb, mm, hh = bands.get("bass", 0.0), bands.get("mid", 0.0), bands.get("high", 0.0)
+                bb, mm, hh = dyn["bass"], dyn["mid"], dyn["high"]
                 tot = bb + mm + hh
                 bright = (0.5 * mm + hh) / tot / 1.5 if tot > 1e-3 else 0.0
-                lvl = max(0.0, min(1.0, (max(bb, mm, hh) - 0.18) / 0.82)) ** 1.4
+                lvl = max(bb, mm, hh) ** 1.2
+                if beat:
+                    lvl = max(lvl, 0.7 + 0.3 * strength)
                 hit = max(lvl, max(0.0, (max(bands.get("on_bass", 0), bands.get("on_high", 0)) - 0.25) / 0.75))
                 npal = len(self.palette)
                 x = min(0.999, max(0.0, bright * 1.6)) * (npal - 1)
@@ -1069,12 +1114,14 @@ class Effects:
                 def band(k):
                     return bands.get(k, 0.0)
                 if pos < 0.5:
-                    lvl = band("bass") * (1 - 2 * pos) + band("mid") * 2 * pos
+                    lvl = dyn["bass"] * (1 - 2 * pos) + dyn["mid"] * 2 * pos
                     hit = band("on_bass") * (1 - 2 * pos) + band("on_mid") * 2 * pos
                 else:
-                    lvl = band("mid") * (2 - 2 * pos) + band("high") * (2 * pos - 1)
+                    lvl = dyn["mid"] * (2 - 2 * pos) + dyn["high"] * (2 * pos - 1)
                     hit = band("on_mid") * (2 - 2 * pos) + band("on_high") * (2 * pos - 1)
-                lvl = max(0.0, min(1.0, (lvl - 0.18) / 0.82)) ** 1.6
+                lvl = lvl ** 1.3
+                if beat and pos < 0.4:            # la grosse caisse frappe côté graves
+                    lvl = max(lvl, 0.7 + 0.3 * strength)
                 hit = max(lvl, max(0.0, (hit - 0.25) / 0.75))
                 # couleur liée à la position (palette étalée sur les lampes, foncée → claire),
                 # qui monte vers la couleur suivante quand la bande est forte
@@ -1383,7 +1430,7 @@ class StatusWriter:
         self.last = 0.0
 
     def write(self, force=False, **data):
-        if not self.path or (not force and time.time() - self.last < 0.2):
+        if not self.path or (not force and time.time() - self.last < 0.05):
             return
         self.last = time.time()
         data["updated"] = self.last
@@ -1468,7 +1515,7 @@ def cmd_run(args):
             now = time.time()
 
             # Réglages modifiés depuis l'interface web : on les applique à chaud
-            if args.settings and now - last_check > 1.0:
+            if args.settings and now - last_check > 0.2:     # réglages appliqués en ~0,2 s
                 last_check = now
                 try:
                     m = os.path.getmtime(args.settings)
@@ -1788,12 +1835,43 @@ def plan_info(area_id):
             "channels": hms.channel_info(cfg, area), "plan": plans.get(area_id) or {}}
 
 
+def room_plan_info(rid):
+    room = next((r for r in rooms_state() if r["id"] == rid), None)
+    if not room:
+        raise hms.HueError("Pièce introuvable.")
+    chs, n = [], len(room["lights"])
+    for i, l in enumerate(room["lights"]):
+        p = l.get("pos") or {"x": round(-0.7 + 1.4 * i / max(1, n - 1), 3) if n > 1 else 0, "y": 0}
+        base = {"dev": l["id"], "name": l["name"], "archetype": l["archetype"], "x": p["x"], "y": p["y"]}
+        if l.get("has_gradient"):                   # un ruban : on le trace le long des murs
+            chs += [dict(base, id=f"{l['id']}#{k}", idx=k) for k in range(GRAD_POINTS)]
+        else:
+            chs.append(dict(base, id=l["id"], idx=0))
+    plan = (get_settings().get("room_plans") or {}).get(rid) or {}
+    return {"id": rid, "type": "room", "name": room["name"], "channels": chs, "plan": plan}
+
+
 def save_plan(body):
     """Plan d'une pièce : réglages de l'éditeur + position calculée de chaque canal."""
     aid = str(body.get("id", ""))[:64]
     if not aid:
         raise ValueError("Zone manquante.")
     num = lambda v, lo, hi: max(lo, min(hi, round(float(v), 4)))
+    if body.get("type") == "room":                  # pièce ou zone de l'app (hors synchro)
+        s = get_settings()
+        plans = s.get("room_plans") if isinstance(s.get("room_plans"), dict) else {}
+        if body.get("reset"):
+            plans.pop(aid, None)
+        else:
+            plans[aid] = {
+                "spots": {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()},
+                "rubans": {str(d)[:64]: {"walls": int(num(r.get("walls", 1), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
+                                         "dir": 1 if r.get("dir", 1) >= 0 else -1}
+                           for d, r in (body.get("rubans") or {}).items()}}
+        s["room_plans"] = plans
+        write_json(SETTINGS_PATH, s)
+        rooms_cache["t"] = 0
+        return {"ok": True}
     ch = {}
     for k, q in (body.get("ch") or {}).items():
         ch[str(int(k))] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1)}
@@ -1801,7 +1879,7 @@ def save_plan(body):
     for dev, r in (body.get("rubans") or {}).items():
         rubans[str(dev)[:64]] = {"walls": int(num(r.get("walls", 4), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                  "dir": 1 if r.get("dir", 1) >= 0 else -1}
-    spots = {str(int(k)): [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
+    spots = {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
     s = get_settings()
     plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
     if body.get("reset"):
@@ -1962,16 +2040,29 @@ def _cfg():
     return cfg
 
 
+APPLIED = {}          # dernière couleur envoyée à chaque lampe : {id: {"xy", "hex", "grad"}}
+
+
+def _near(a, b, tol=0.012):
+    return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+
+
 def _light_view(l, positions):
     color = None
+    ap = APPLIED.get(l["id"], {})
     if l.get("color", {}).get("xy"):
         xy = l["color"]["xy"]
         color = xy_to_hex(xy.get("x", 0.3227), xy.get("y", 0.329))
+        if ap.get("xy") and _near(ap["xy"], (xy.get("x", 0), xy.get("y", 0))):
+            color = ap["hex"]               # la couleur choisie, pas son arrondi par le pont
     if l.get("color_temperature", {}).get("mirek_valid") and not l.get("color", {}).get("xy"):
         color = mirek_to_hex(l["color_temperature"].get("mirek"))
     if l.get("gradient", {}).get("points"):
-        grad = [xy_to_hex(p["color"]["xy"]["x"], p["color"]["xy"]["y"]) for p in l["gradient"]["points"]
-                if p.get("color", {}).get("xy")]
+        gxy = [(p["color"]["xy"]["x"], p["color"]["xy"]["y"]) for p in l["gradient"]["points"]
+               if p.get("color", {}).get("xy")]
+        grad = [xy_to_hex(x, y) for x, y in gxy]
+        if ap.get("gxy") and len(ap["gxy"]) == len(gxy) and all(_near(a, b) for a, b in zip(ap["gxy"], gxy)):
+            grad = list(ap["grad"])
     else:
         grad = []
     mode = l.get("color_temperature", {}).get("mirek_valid")
@@ -1984,11 +2075,34 @@ def _light_view(l, positions):
         "bri": round(l.get("dimming", {}).get("brightness", 100)),
         "color": color or "#fff1dc", "gradient": grad,
         "has_color": "color" in l, "has_gradient": bool(l.get("gradient", {}).get("points_capable")),
-        "pos": positions.get(l["id"]),
+        "pos": (positions.get(l["id"]) or {}).get("pos") if "pos" in (positions.get(l["id"]) or {}) else positions.get(l["id"]),
+        "path": (positions.get(l["id"]) or {}).get("path"),
     }
 
 
-def rooms_state():
+PM = 0.07
+PCORNERS = [(PM, PM), (1 - PM, PM), (1 - PM, 1 - PM), (PM, 1 - PM)]
+
+
+def perim(sv):
+    """Point du tour de la pièce (coordonnées écran 0-1), comme dans l'éditeur de plan."""
+    sv %= 4
+    e, f = int(sv) % 4, sv - int(sv)
+    a, b = PCORNERS[e], PCORNERS[(e + 1) % 4]
+    return a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f
+
+
+def to_hue(px, py):
+    return {"x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
+
+
+GRAD_POINTS = 5
+rooms_cache = {"t": 0.0, "data": None}
+
+
+def rooms_state(force=True):
+    if not force and rooms_cache["data"] is not None and time.time() - rooms_cache["t"] < 5:
+        return rooms_cache["data"]
     cfg = _cfg()
     lights = {l["id"]: l for l in hms.bridge_get(cfg, "light")}
     owner_lights = {}
@@ -2005,25 +2119,37 @@ def rooms_state():
                 if pts and lid not in positions:
                     positions[lid] = {"x": pts[0].get("x", 0), "y": pts[0].get("y", 0)}
     groups = {g["id"]: g for g in hms.bridge_get(cfg, "grouped_light")}
+    plans = get_settings().get("room_plans") or {}
     rooms = []
-    for r in hms.bridge_get(cfg, "room"):
-        ids = []
-        for c in r.get("children", []):
-            if c.get("rtype") == "device":
-                ids += owner_lights.get(c["rid"], [])
-            elif c.get("rtype") == "light":
-                ids.append(c["rid"])
-        ls = [_light_view(lights[i], positions) for i in dict.fromkeys(ids) if i in lights]
-        if not ls:
-            continue
-        gl = next((s["rid"] for s in r.get("services", []) if s.get("rtype") == "grouped_light"), None)
-        g = groups.get(gl, {})
-        rooms.append({
-            "id": r["id"], "name": r.get("metadata", {}).get("name", "Pièce"),
-            "archetype": r.get("metadata", {}).get("archetype", ""), "group": gl,
-            "on": bool(g.get("on", {}).get("on", any(l["on"] for l in ls))),
-            "bri": round(g.get("dimming", {}).get("brightness", 100)), "lights": ls})
-    rooms.sort(key=lambda r: r["name"].lower())
+    for rtype in ("room", "zone"):
+        for r in hms.bridge_get(cfg, rtype):
+            ids = []
+            for c in r.get("children", []):
+                if c.get("rtype") == "device":
+                    ids += owner_lights.get(c["rid"], [])
+                elif c.get("rtype") == "light":
+                    ids.append(c["rid"])
+            pl = plans.get(r["id"]) or {}
+            pos_r = dict(positions)
+            for lid, q in (pl.get("spots") or {}).items():
+                pos_r[lid] = to_hue(q[0], q[1])
+            for lid, rb in (pl.get("rubans") or {}).items():
+                pts = [to_hue(*perim(rb["corner"] + rb["dir"] * (k + .5) / GRAD_POINTS * rb["walls"]))
+                       for k in range(GRAD_POINTS)]
+                pos_r[lid] = {"pos": pts[GRAD_POINTS // 2], "path": pts}
+            ls = [_light_view(lights[i], pos_r) for i in dict.fromkeys(ids) if i in lights]
+            if not ls:
+                continue
+            gl = next((s["rid"] for s in r.get("services", []) if s.get("rtype") == "grouped_light"), None)
+            g = groups.get(gl, {})
+            rooms.append({
+                "id": r["id"], "name": r.get("metadata", {}).get("name", "Pièce"), "type": rtype,
+                "planned": r["id"] in plans,
+                "archetype": r.get("metadata", {}).get("archetype", ""), "group": gl,
+                "on": bool(g.get("on", {}).get("on", any(l["on"] for l in ls))),
+                "bri": round(g.get("dimming", {}).get("brightness", 100)), "lights": ls})
+    rooms.sort(key=lambda r: (r["type"] != "room", r["name"].lower()))
+    rooms_cache.update(t=time.time(), data=rooms)
     return rooms
 
 
@@ -2042,6 +2168,7 @@ def set_light(body):
     if body.get("color") and HEX_RE.match(body["color"]):
         x, y = hex_to_xy(body["color"])
         b["color"] = {"xy": {"x": x, "y": y}}
+        APPLIED[body.get("id")] = {"xy": (x, y), "hex": body["color"]}
         b.setdefault("on", {"on": True})
     if body.get("mirek"):
         b["color_temperature"] = {"mirek": max(153, min(500, int(body["mirek"])))}
@@ -2060,20 +2187,30 @@ def set_room(body):
     return {"ok": True}
 
 
+def _lum(h):
+    r, g, b = (int(h[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.3 * r + 0.59 * g + 0.11 * b
+
+
+room_jobs = {}        # pièce -> numéro du dernier envoi (un nouveau choix annule l'ancien)
+
+
 def room_palette(body):
-    """Applique une palette à une pièce : chaque lampe prend la couleur de sa position."""
+    """Applique une palette à une pièce : chaque lampe prend la couleur de sa position ; un ruban
+    à dégradé suit son tracé sur le plan (sinon du plus foncé au plus clair). La réponse donne
+    tout de suite les couleurs choisies ; l'envoi aux lampes se fait en arrière-plan."""
     cfg = _cfg()
     colors = [c for c in body.get("colors", []) if isinstance(c, str) and HEX_RE.match(c)][:8]
     if not colors:
         raise ValueError("Palette vide.")
-    room = next((r for r in rooms_state() if r["id"] == body.get("id")), None)
+    room = next((r for r in rooms_state(force=False) if r["id"] == body.get("id")), None)
     if not room:
         raise ValueError("Pièce introuvable.")
     spread = body.get("spread", "lr")
     ls = room["lights"]
+    import math
 
-    def t_of(i, l):
-        p = l.get("pos")
+    def t_of(i, p):
         if not p:
             return i / max(1, len(ls) - 1)
         x, y = p["x"], p["y"]
@@ -2082,29 +2219,49 @@ def room_palette(body):
         if spread == "centre":
             return min(1.0, (x * x + y * y) ** 0.5 / 1.42)
         if spread == "tour":
-            import math
             return ((math.atan2(-y, x) + math.pi * 1.5) % (2 * math.pi)) / (2 * math.pi)
         return (x + 1) / 2
 
     def pick(t):
-        t = max(0.0, min(0.999, t))
-        return colors[int(t * len(colors))]
+        return colors[int(max(0.0, min(0.999, t)) * len(colors))]
 
+    result, jobs = {}, []
+    by_lum = sorted(colors, key=_lum)
     for i, l in enumerate(ls):
         if l.get("has_gradient"):
-            pts = [{"color": {"xy": dict(zip("xy", hex_to_xy(c)))}} for c in colors[:5]]
-            body_l = {"on": {"on": True}, "gradient": {"points": pts}}
+            if l.get("path"):
+                grad = [pick(t_of(i, p)) for p in l["path"]]
+            else:                           # du plus foncé au plus clair le long du ruban
+                n = min(GRAD_POINTS, max(2, len(by_lum)))
+                grad = [by_lum[round(k * (len(by_lum) - 1) / (n - 1))] for k in range(n)]
+            gxy = [hex_to_xy(c) for c in grad]
+            body_l = {"on": {"on": True}, "gradient": {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}}
+            APPLIED[l["id"]] = {"grad": grad, "gxy": gxy}
+            result[l["id"]] = {"gradient": grad, "color": grad[len(grad) // 2]}
         elif l.get("has_color"):
-            x, y = hex_to_xy(pick(t_of(i, l)))
+            c = pick(t_of(i, l.get("pos")))
+            x, y = hex_to_xy(c)
             body_l = {"on": {"on": True}, "color": {"xy": {"x": x, "y": y}}}
+            APPLIED[l["id"]] = {"xy": (x, y), "hex": c}
+            result[l["id"]] = {"color": c}
         else:
             body_l = {"on": {"on": True}}
-        try:
-            _put(cfg, "light", l["id"], body_l)
-        except hms.HueError:
-            pass
-        time.sleep(0.08)               # le pont accepte ~10 commandes par seconde
-    return {"ok": True}
+        jobs.append((l["id"], body_l))
+    gen = room_jobs.get(room["id"], 0) + 1
+    room_jobs[room["id"]] = gen
+
+    def send():
+        for lid, b in jobs:
+            if room_jobs.get(room["id"]) != gen:
+                return                      # une autre scène a été choisie entre-temps
+            try:
+                _put(cfg, "light", lid, b)
+            except hms.HueError:
+                pass
+            time.sleep(0.1)                 # le pont accepte ~10 commandes par seconde
+        rooms_cache["t"] = 0
+    threading.Thread(target=send, daemon=True).start()
+    return {"ok": True, "lights": result, "ms": len(jobs) * 110}
 
 
 # ---------------------------------------------------------------------------
@@ -2517,6 +2674,15 @@ def bt_watchdog():
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     server_version = "HueSyncWeb/1.0"
+    protocol_version = "HTTP/1.1"      # connexion gardée ouverte : réponses plus rapides
+
+    def setup(self):
+        super().setup()
+        import socket
+        try:                                 # pas d'attente TCP entre en-têtes et contenu
+            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def log_message(self, fmt, *args):
         pass  # pas de log par requête (le polling est fréquent)
@@ -2534,6 +2700,8 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         limit = 4_500_000 if self.path.startswith("/api/palettes") else 20000
         if n > limit:
+            while n > 0:                     # on vide la requête pour garder la connexion saine
+                n -= len(self.rfile.read(min(n, 65536)) or b"x" * n)
             return {}
         try:
             return json.loads(self.rfile.read(n) or b"{}")
@@ -2598,9 +2766,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"error": str(e)})
         if path == "/api/plan":
             try:
-                aid = (self.path.split("area=", 1) + [""])[1].split("&")[0]
-                from urllib.parse import unquote
-                return self._send(200, plan_info(unquote(aid)))
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(self.path).query)
+                if q.get("room"):
+                    return self._send(200, room_plan_info(q["room"][0]))
+                return self._send(200, plan_info(q.get("area", [""])[0]))
             except hms.HueError as e:
                 return self._send(502, {"error": str(e)})
         if path == "/api/rooms":
@@ -2820,10 +2990,12 @@ a{color:var(--blue);text-decoration:none}
 /* ---- feuilles ---- */
 .bg{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .25s;z-index:40}
 .bg.open{opacity:1;pointer-events:auto}
-.sheet{position:fixed;left:0;right:0;bottom:0;z-index:50;max-width:520px;margin:0 auto;background:var(--card);border-radius:22px 22px 0 0;transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);max-height:92vh;overflow:auto;padding:8px 16px calc(24px + var(--safe-b))}
+.sheet{position:fixed;left:0;right:0;bottom:0;z-index:50;max-width:520px;margin:0 auto;background:var(--card);border-radius:22px 22px 0 0;transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);max-height:82vh;max-height:86dvh;overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:0 16px calc(24px + var(--safe-b))}
 .sheet.open{transform:none}
-.sheet .grab{width:38px;height:5px;border-radius:3px;background:#5c5d63;margin:0 auto 10px}
-.sheet .sh{display:flex;align-items:center;justify-content:space-between;margin:4px 4px 16px}
+.sheet .grab{width:38px;height:5px;border-radius:3px;background:#5c5d63;margin:0 auto;position:sticky;top:0;z-index:3;box-shadow:0 0 0 8px var(--card);transform:translateY(8px)}
+.sheet .sh{display:flex;align-items:center;justify-content:space-between;margin:0 -16px 12px;padding:16px 20px 10px;position:sticky;top:0;z-index:2;background:var(--card)}
+.sheet .sh .txtbtn{padding:8px 4px;min-width:44px;text-align:right}
+body.locked{overflow:hidden}
 .sheet .sh b{font-size:20px}
 .sheet .tile,.sheet .orb{background:var(--card2)}
 
@@ -2837,19 +3009,19 @@ a{color:var(--blue);text-decoration:none}
 .zonebtn b{display:flex;align-items:center;gap:6px;font-size:18px}
 .zonebtn small{color:var(--t2);font-size:12px;display:flex;align-items:center;gap:5px}
 .stage{display:flex;flex-direction:column;align-items:center;margin-top:22px}
-.cover{position:relative;width:min(62vw,240px);aspect-ratio:1;border-radius:22px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.6);isolation:isolate;-webkit-mask-image:-webkit-radial-gradient(white,black);transform:translateZ(0)}
+.cover{position:relative;width:100%;aspect-ratio:1;border-radius:22px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.6);isolation:isolate;-webkit-mask-image:-webkit-radial-gradient(white,black);transform:translateZ(0)}
 .cover .glow{position:absolute;inset:-20%;filter:blur(30px);transition:background .25s}
 .cover .lights{position:absolute;inset:0}
 .cover .lights i{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;transition:background .12s,box-shadow .12s,transform .12s}
-.room{position:relative;background:#141518;border-radius:20px;padding:26px 10px 10px;border:1px solid #2c2d32}
-.room .front{position:absolute;top:8px;left:0;right:0;text-align:center;font-size:10px;letter-spacing:2px;color:var(--t3);font-weight:700}
-.room svg{display:block;width:100%;height:auto;touch-action:none;user-select:none}
-.room .spot{cursor:grab}
+.proom{position:relative;background:#141518;border-radius:20px;padding:26px 10px 10px;border:1px solid #2c2d32}
+.proom .front{position:absolute;top:8px;left:0;right:0;text-align:center;font-size:10px;letter-spacing:2px;color:var(--t3);font-weight:700}
+.proom svg{display:block;width:100%;height:auto;touch-action:none;user-select:none;-webkit-user-select:none}
+.proom .spot{cursor:grab}
 .rcard{background:var(--card);border-radius:18px;padding:14px 14px 16px;margin-top:14px}
 .rcard .h{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .rcard .h b{font-size:17px}.rcard .h small{color:var(--t2);font-size:13px}
 .rcard .lb{color:var(--t2);font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin:12px 2px 6px}
-.coverwrap{position:relative;width:min(62vw,240px);aspect-ratio:1}
+.coverwrap{position:relative;width:min(62vw,240px,32vh);aspect-ratio:1}
 .stage>*:not(.coverwrap){position:relative;z-index:1}
 .coverwrap .halo{position:absolute;inset:-22%;opacity:0;transition:opacity .4s;pointer-events:none}
 .coverwrap.art .halo{opacity:.85}
@@ -2887,6 +3059,7 @@ a{color:var(--blue);text-decoration:none}
 .stagebox .h{display:flex;justify-content:space-between;align-items:center;margin:0 2px 10px}
 .prev{display:flex;justify-content:space-between;align-items:center;height:64px;padding:0 6px}
 .prev i{width:30px;height:30px;border-radius:50%}
+.prev.live{gap:4px;justify-content:center}.prev.live i{width:auto;flex:1;max-width:30px;height:auto;aspect-ratio:1;transition:opacity .06s,transform .06s,box-shadow .06s}
 @keyframes f1{0%{opacity:var(--hi);transform:scale(1.14)}12%,100%{opacity:var(--lo);transform:scale(.9)}}
 @keyframes f2{0%{opacity:var(--hi);transform:scale(1.14)}28%,100%{opacity:var(--lo);transform:scale(.9)}}
 @keyframes f3{0%{opacity:var(--hi);transform:scale(1.14)}50%,100%{opacity:var(--lo);transform:scale(.9)}}
@@ -2957,6 +3130,18 @@ a{color:var(--blue);text-decoration:none}
 .spin{width:18px;height:18px;border-radius:50%;border:2px solid #555;border-top-color:#fff;animation:sp .8s linear infinite;flex:none}
 @keyframes sp{to{transform:rotate(360deg)}}
 pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;background:#141518;border-radius:14px;padding:12px;max-height:60vh;overflow:auto;margin:0}
+button,a,label,.sl,[data-sheet]{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+button{transition:transform .08s,opacity .08s}
+button:active{transform:scale(.96);opacity:.82}
+.sl:active,.tabs button:active{transform:none}
+.leds{display:flex;gap:4px;justify-content:center;margin-top:12px;height:10px;width:min(78vw,300px)}
+.leds i{flex:1;max-width:26px;border-radius:5px;background:#2a2b30;transition:background .06s,box-shadow .06s}
+.leds.off{opacity:.25}
+@media (max-height:760px){
+  .coverwrap{width:min(62vw,240px,27vh)}.syhead{padding-top:calc(10px + var(--safe-t))}.leds{margin-top:8px}
+  .stage{margin-top:10px}.stitle{margin-top:12px;font-size:20px}.pbar{margin-top:10px}.pchip{margin-top:8px}
+  .ctrls{margin-top:16px}.ctrl .ci{width:52px;height:52px}.dock{margin-top:16px}.power{width:78px!important;height:78px!important}
+}
 </style>
 </head>
 <body>
@@ -3003,6 +3188,7 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
         <div class="cover" id="cover"><div class="glow" id="coverGlow"></div><div class="lights" id="coverLights"></div><img id="coverImg" alt=""></div></div>
       <div class="stitle" id="sTitle">En attente de musique</div>
       <div class="ssub"><i class="dot" id="sDot"></i><span id="sSub">Choisis « Lueur » dans AirPlay</span></div>
+      <div class="leds" id="leds" title="Ce que reçoivent les lampes en ce moment"></div>
       <div class="pbar hidden" id="pBar"><div class="tr"><i id="pFill"></i></div><div class="tm"><span id="pCur">0:00</span><span id="pDur">0:00</span></div></div>
       <button class="pchip hidden" id="pChip" data-sheet="shCouleur"><span class="sw4" id="pChipSw"></span>Couleurs tirées de la pochette</button>
     </div>
@@ -3022,13 +3208,13 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
   <!-- PLANS DES PIÈCES -->
   <section class="view" data-view="plans">
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Plans des pièces</span></div>
-    <p class="note" style="padding:16px 20px 4px">Place tes lampes comme dans la vraie pièce : les effets (Comète, Vague, Stéréo…) suivent ce plan.</p>
-    <div class="list" id="plansList" style="margin-top:10px"></div>
+    <p class="note" style="padding:16px 20px 0">Place tes lampes comme dans la vraie pièce. La synchro (Comète, Vague, Stéréo…) et les couleurs des scènes suivent ce plan.</p>
+    <div id="plansList"></div>
   </section>
   <section class="view" data-view="plan">
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t" id="planTitle">Plan</span><button class="txtbtn" id="planSave">OK</button></div>
     <div class="pad" style="padding-top:14px">
-      <div class="room"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg></div>
+      <div class="proom"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg></div>
       <p class="hint" id="planHint" style="margin:10px 4px 0">Fais glisser les lampes sur le plan.</p>
       <div id="planRubans"></div>
       <button class="row" id="planReset" style="margin-top:18px;background:var(--card);border-radius:16px;min-height:56px;justify-content:center;color:var(--blue);font-weight:600">Reprendre les positions de l'app Hue</button>
@@ -3343,8 +3529,11 @@ function renderPlans() {
   const el = $("#plansList");
   if (!zones) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">Chargement…</span></span></div>`; return; }
   if (zones.error || !zones.length) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">${esc(zones.error || "Aucune zone de divertissement")}</span></span></div>`; return; }
-  const plans = S.settings.plans || {};
-  el.innerHTML = zones.map(z => `<button class="row" data-plan="${esc(z.id)}"><span class="ic">${icon("zones")}</span><span class="bd"><span class="tx"><span class="t1">${esc(z.name)}</span><span class="t2">${Object.entries(z.kinds || {}).map(([k, n]) => `${KIND_N[k] || k} ${n}`).join(" · ") || z.lights + " lampes"}${plans[z.id] ? " · plan personnalisé" : ""}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`).join("");
+  const plans = S.settings.plans || {}, RM = ROOMS && !ROOMS.error ? ROOMS : [];
+  const row = (id, ic, name, sub) => `<button class="row" data-plan="${esc(id)}"><span class="ic">${ic}</span><span class="bd"><span class="tx"><span class="t1">${esc(name)}</span><span class="t2">${sub}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`;
+  const rooms = RM.filter(r => r.type !== "zone"), hz = RM.filter(r => r.type === "zone");
+  const grp = (t, list) => list.length ? `<div class="label">${t}</div><div class="list">${list.map(r => row("r:" + r.id, icon(roomKind(r.archetype, r.name)), r.name, `${r.lights.length} lampe${r.lights.length > 1 ? "s" : ""}${r.planned ? " · plan personnalisé" : ""}`)).join("")}</div>` : "";
+  el.innerHTML = `<div class="label">Zones de divertissement · musique</div><div class="list">` + zones.map(z => `<button class="row" data-plan="${esc(z.id)}"><span class="ic">${icon("zones")}</span><span class="bd"><span class="tx"><span class="t1">${esc(z.name)}</span><span class="t2">${Object.entries(z.kinds || {}).map(([k, n]) => `${KIND_N[k] || k} ${n}`).join(" · ") || z.lights + " lampes"}${plans[z.id] ? " · plan personnalisé" : ""}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`).join("") + `</div>` + grp("Pièces · scènes et couleurs", rooms) + grp("Zones de l'app · scènes et couleurs", hz);
   $$("[data-plan]").forEach(b => b.onclick = () => go("plan", b.dataset.plan));
 }
 const PM = 0.07, PC = [[PM, PM], [1 - PM, PM], [1 - PM, 1 - PM], [PM, 1 - PM]];
@@ -3363,13 +3552,13 @@ function planLayout() {  // positions à l'écran (0-1) et ordre de parcours de 
 }
 async function renderPlan() {
   const id = route.arg;
-  if (!PLAN || PLAN.id !== id) {
+  if (!PLAN || PLAN.key !== id) {
     $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
-    try { PLAN = await api("/api/plan?area=" + encodeURIComponent(id)); } catch (e) { toast(e.message); return; }
+    try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
     PED = { rubans: {}, spots: {} };
     const { rub, single } = planDevs();
-    rub.forEach(([d]) => PED.rubans[d] = { walls: 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
+    rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
     single.forEach(([, cs]) => cs.forEach(c => PED.spots[c.id] = (pl.spots || {})[c.id] || [clamp((c.x + 1) / 2), clamp((1 - c.y) / 2)]));
   }
   $("#planTitle").textContent = "Plan · " + PLAN.name;
@@ -3398,24 +3587,35 @@ function drawPlan() {
   single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, col = boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
     h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
   const svg = $("#planSvg"); svg.innerHTML = h;
-  svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = +g.dataset.spot; svg.setPointerCapture(e.pointerId); });
+  svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
   svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
   svg.onpointerup = svg.onpointercancel = () => { planDrag = null; };
 }
 $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
-  try { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } }; toast("Plan enregistré"); back(); }
+  try {
+    if (PLAN.type === "room") { await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots }); roomsLock = 0; loadRooms(); }
+    else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } }; }
+    toast("Plan enregistré"); PLAN = null; back();
+  }
   catch (e) { toast("Échec : " + e.message); }
 };
 $("#planReset").onclick = async () => {
-  try { await api("/api/plan", { id: PLAN.id, reset: true }); const p = { ...(S.settings.plans || {}) }; delete p[PLAN.id]; S.settings.plans = p; PLAN = null; toast("Positions de l'app Hue reprises"); renderPlan(); }
+  try { const room = PLAN.type === "room"; await api("/api/plan", { id: PLAN.id, reset: true, type: room ? "room" : undefined }); if (room) { roomsLock = 0; await loadRooms(); } else { const p = { ...(S.settings.plans || {}) }; delete p[PLAN.id]; S.settings.plans = p; } PLAN = null; toast("Positions de l'app Hue reprises"); renderPlan(); }
   catch (e) { toast("Échec : " + e.message); }
 };
 
 /* =================== FEUILLES =================== */
-function openSheet(id) { $("#sheetBg").classList.add("open"); $("#" + id).classList.add("open"); renderSheets(); }
-function closeSheets() { $("#sheetBg").classList.remove("open"); $$(".sheet").forEach(s => s.classList.remove("open")); }
+function openSheet(id) { closeSheets(); $("#sheetBg").classList.add("open"); const el = $("#" + id); el.classList.add("open"); el.scrollTop = 0; document.body.classList.add("locked"); renderSheets(); }
+function closeSheets() { $("#sheetBg").classList.remove("open"); $$(".sheet").forEach(s => { s.classList.remove("open"); s.style.transform = ""; }); document.body.classList.remove("locked"); }
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheets(); });
+$$(".sheet").forEach(sh => {   // tirer la feuille vers le bas (depuis son en-tête) pour la fermer
+  let y0 = null, dy = 0;
+  sh.addEventListener("touchstart", e => { const t = e.target; y0 = (sh.scrollTop <= 0 && (t.closest(".sh") || t.closest(".grab"))) ? e.touches[0].clientY : null; dy = 0; }, { passive: true });
+  sh.addEventListener("touchmove", e => { if (y0 === null) return; dy = Math.max(0, e.touches[0].clientY - y0); sh.style.transition = "none"; sh.style.transform = `translateY(${dy}px)`; }, { passive: true });
+  sh.addEventListener("touchend", () => { if (y0 === null) return; sh.style.transition = ""; if (dy > 90) closeSheets(); else sh.style.transform = ""; y0 = null; });
+});
 $("#sheetBg").onclick = closeSheets;
 $$("[data-close]").forEach(b => b.onclick = closeSheets);
 $$("[data-sheet]").forEach(b => b.onclick = () => openSheet(b.dataset.sheet));
@@ -3496,6 +3696,7 @@ function renderSync() {
   if (auto) $("#pChipSw").innerHTML = np.colors.map(c => `<i style="background:${c}"></i>`).join("");
   renderProgress();
   renderCover();
+  renderLeds();
 }
 function renderCover() {
   const pal = palColors(S.settings.palette), syncing = live.state === "syncing";
@@ -3514,6 +3715,14 @@ function renderCover() {
   $("#coverGlow").style.opacity = syncing ? 1 : .55;
   const ha = c => c + "99";      // halo doux, sans bord : chaque dégradé s'éteint à l'intérieur de sa boîte
   $("#coverHalo").style.background = `radial-gradient(closest-side at 38% 40%, ${ha(g[0])}, transparent), radial-gradient(closest-side at 62% 62%, ${ha(g[1] || g[0])}, transparent), radial-gradient(closest-side at 62% 36%, ${ha(g[2] || g[0])}, transparent), radial-gradient(closest-side at 40% 64%, ${ha(g[3] || g[1] || g[0])}, transparent)`;
+}
+function renderLeds() {
+  const el = $("#leds"); if (!el) return;
+  const syncing = live.state === "syncing", cols = syncing && live.colors ? live.colors : [];
+  el.classList.toggle("off", !syncing);
+  const n = Math.min(cols.length || 8, 24);
+  if (el.children.length !== n) el.innerHTML = "<i></i>".repeat(n);
+  [...el.children].forEach((d, i) => { const c = cols[i]; if (!c) { d.style.background = ""; d.style.boxShadow = ""; return; } const l = Math.max(...hexRgb(c)) / 255, b = boost(c, 255); d.style.background = l < .03 ? "#1e1f23" : `color-mix(in srgb, ${b} ${Math.round(25 + l * 75)}%, #1e1f23)`; d.style.boxShadow = l > .35 ? `0 0 ${4 + l * 10}px ${b}` : "none"; });
 }
 let nowAt = 0;
 const mmss = t => { t = Math.max(0, Math.floor(t)); return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0"); };
@@ -3624,7 +3833,18 @@ function drawCStrip() {
   for (let i = 0; i < cells; i++) { const c = pal[Math.floor(i / every) % pal.length], s = i * w; if (i && i % every === 0) st.push(`${pal[Math.floor((i - 1) / every) % pal.length]} ${s}%`, `${c} ${Math.min(100, s + fw)}%`); else st.push(`${c} ${s}%`); st.push(`${c} ${s + w}%`); }
   el.style.background = `linear-gradient(90deg, ${st.join(",")})`;
 }
+function livePrev() {   // pendant la synchro, l'aperçu montre les vraies couleurs envoyées
+  const el = $("#prev"); if (!el) return;
+  const syncing = live.state === "syncing" && live.colors && live.colors.length;
+  el.classList.toggle("live", !!syncing);
+  if (!syncing) { if (el.dataset.live) { delete el.dataset.live; renderPrev(); } return; }
+  const cols = live.colors.slice(0, 16);
+  if (el.dataset.live !== String(cols.length)) { el.dataset.live = cols.length; el.innerHTML = cols.map(() => "<i></i>").join(""); }
+  [...el.children].forEach((d, i) => { const c = cols[i], l = Math.max(...hexRgb(c)) / 255, b = boost(c, 255); d.style.animation = "none"; d.style.opacity = .15 + .85 * l; d.style.transform = `scale(${.85 + .3 * l})`; d.style.background = `radial-gradient(circle at 35% 30%,#fff 0%,${b} 38%,${b} 100%)`; d.style.boxShadow = `0 0 ${6 + 18 * l}px ${b}`; });
+  $("#prevSub").textContent = "En direct · ce que reçoivent tes lampes";
+}
 function renderPrev() {
+  if ($("#prev") && $("#prev").dataset.live) return;
   const pal = palColors(S.settings.palette), cur = effCur(), mode = cur.mode, n = 8;
   const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3", per = .5 / sp;
   const dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
@@ -3654,10 +3874,11 @@ function renderRooms() {
   const g = $("#rooms");
   if (!ROOMS) return;
   if (ROOMS.error) { g.innerHTML = `<p class="note" style="padding:0 8px">${esc(ROOMS.error)}</p>`; return; }
-  g.innerHTML = ROOMS.map(r => {
+  g.innerHTML = ROOMS.map((r, i) => {
     const cs = roomColors(r).map(c => boost(c, 200)), c0 = cs[0] || "#ffe2b8", c1 = cs[1] || cs[0] || "#ffb066";
     const dark = lum(c1) > .5, fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
-    return `<div class="room" style="background:${r.on ? `linear-gradient(135deg, ${lighten(c0, .2)}, ${c1})` : "var(--card)"};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
+    const head = r.type === "zone" && (i === 0 || ROOMS[i - 1].type !== "zone") ? `<div class="label" style="padding-left:6px">Zones</div>` : "";
+    return head + `<div class="room" style="background:${r.on ? `linear-gradient(135deg, ${lighten(c0, .2)}, ${c1})` : "var(--card)"};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
       <div class="r1"><button class="rn" data-room="${r.id}" style="display:flex;align-items:center;gap:14px"><span class="ri" style="background:${r.on ? "rgba(255,255,255,.35)" : "var(--card2)"}">${icon(roomKind(r.archetype, r.name), 26)}</span>${esc(r.name)}</button>
       <button class="pwbtn" data-rpow="${r.id}" aria-label="${r.on ? "Éteindre" : "Allumer"} ${esc(r.name)}" style="background:${r.on ? "rgba(255,255,255,.75)" : "var(--card2)"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div>
       ${r.on ? `<div class="sl" data-rbri="${r.id}"><div class="tr" style="background:rgba(0,0,0,.15)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>`;
@@ -3681,6 +3902,11 @@ function planSvg(r) {
   const ls = r.lights, pos = ls.map((l, i) => l.pos ? [179 + l.pos.x * 140, 100 - l.pos.y * 64] : [60 + (ls.length > 1 ? i / (ls.length - 1) : .5) * 238, 100]);
   const shapes = ls.map((l, i) => {
     const [x, y] = pos[i], k = lampKind(l.archetype), c = l.on ? boost(l.color, 200) : "#3a3a3c", glow = l.on ? `filter:drop-shadow(0 0 8px ${c})` : "";
+    if (l.path && l.path.length > 1) {   // ruban placé sur le plan : on suit son tracé
+      const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c");
+      const P = l.path.map(q => [179 + q.x * 140, 100 - q.y * 64]), col = j => gr[Math.min(gr.length - 1, Math.round(j / (P.length - 1) * (gr.length - 1)))];
+      return P.slice(1).map((q, j) => `<defs><linearGradient id="g${i}_${j}" gradientUnits="userSpaceOnUse" x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}"><stop offset="0" stop-color="${col(j)}"/><stop offset="1" stop-color="${col(j + 1)}"/></linearGradient></defs><line x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}" stroke="url(#g${i}_${j})" stroke-width="8" stroke-linecap="round" style="${glow}"/>`).join("");
+    }
     if (k === "strip") { const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c"); return `<defs><linearGradient id="g${i}">${gr.map((x, j) => `<stop offset="${gr.length > 1 ? j / (gr.length - 1) : 0}" stop-color="${x}"/>`).join("")}</linearGradient></defs><rect x="${x - 50}" y="${y - 4}" width="100" height="8" rx="4" fill="url(#g${i})" style="${glow}"/>`; }
     if (k === "bar") return `<rect x="${x - 26}" y="${y - 6}" width="52" height="12" rx="6" fill="${c}" style="${glow}"/>`;
     return `<circle cx="${x}" cy="${y}" r="${k === "bloom" ? 13 : 10}" fill="${c}" style="${glow}"/>`;
@@ -3698,7 +3924,7 @@ function renderPiece() {
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
     <button class="pwbtn" id="pPow" aria-label="${r.on ? "Éteindre" : "Allumer"}" style="width:48px;height:48px;background:${r.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 22, "currentColor", 2.4)}</button></div>
     ${r.on ? `<div class="sl" id="pBri" style="margin:18px 4px 2px"><div class="tr" style="background:rgba(0,0,0,.12)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>
-    <div class="plan">${planSvg(r)}</div>
+    <div class="plan" style="position:relative">${planSvg(r)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
     <div class="pad"><div class="label in">Scènes</div><div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>
     <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div>`;
@@ -3706,14 +3932,21 @@ function renderPiece() {
   if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 2500; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
   $$("[data-spr]").forEach(b => b.onclick = () => { spread = b.dataset.spr; store("spread", spread); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else renderPiece(); });
   $$("[data-scene]").forEach(b => b.onclick = () => applyScene(r, b.dataset.scene));
+  $$("[data-editplan]").forEach(b => b.onclick = () => go("plan", "r:" + r.id));
   $$("[data-newpal]").forEach(b => b.onclick = () => openCreer("scene"));
   $$("[data-lpow]").forEach(b => b.onclick = e => { e.stopPropagation(); lightPower(r, b.dataset.lpow); });
   $$("[data-lamp]").forEach(b => b.onclick = () => go("lampe", r.id + "|" + b.dataset.lamp));
 }
 function lampTile(l) {
-  const k = lampKind(l.archetype), c = boost(l.color, 210), grad = k === "strip" && l.gradient && l.gradient.length > 1;
-  const bg = l.on ? (grad ? `linear-gradient(90deg, ${l.gradient.map(x => boost(x, 210)).sort((a, b) => lum(a) - lum(b)).join(", ")})` : `linear-gradient(160deg, ${lighten(c, .35)}, ${c})`) : "#2a2b30";
-  const light = l.on && (grad ? l.gradient.reduce((a, x) => a + lum(boost(x, 210)), 0) / l.gradient.length < .5 : lum(c) < .45);
+  const k = lampKind(l.archetype), c = boost(l.color, 210), grad = l.gradient && l.gradient.length > 1;
+  let bg = "#2a2b30";
+  if (l.on && grad) {        // 3 teintes adoucies, du plus foncé (en haut à gauche) au plus clair
+    const g = [...new Set(l.gradient)].map(x => boost(x, 200)).sort((a, b) => lum(a) - lum(b));
+    const pk = g.length >= 3 ? [g[0], g[Math.floor(g.length / 2)], g[g.length - 1]] : [g[0], g[0], g[g.length - 1]];
+    const [a, m, z] = pk.map((x, i) => lighten(x, .12 + i * .06));
+    bg = `radial-gradient(90% 80% at 100% 100%, ${z} 0%, transparent 70%), linear-gradient(140deg, ${a} 0%, ${m} 55%, ${z} 100%)`;
+  } else if (l.on) bg = `linear-gradient(160deg, ${lighten(c, .35)}, ${c})`;
+  const light = l.on && (grad ? l.gradient.reduce((a, x) => a + lum(boost(x, 200)), 0) / l.gradient.length < .5 : lum(c) < .45);
   const fg = l.on && !light ? "#1b1c20" : "#fff";
   return `<div class="lamp" style="background:${bg};color:${fg}"><button class="top" data-lamp="${l.id}">${icon(k, 30)}<span>${esc(l.name)}</span></button>
     <div class="pw"><button class="pwbtn" data-lpow="${l.id}" aria-label="${l.on ? "Éteindre" : "Allumer"} ${esc(l.name)}" style="background:${l.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${l.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div></div>`;
@@ -3729,10 +3962,14 @@ async function applyScene(r, pid) {
     l.on = true;
     const p = l.pos || { x: r.lights.length > 1 ? -1 + 2 * i / (r.lights.length - 1) : 0, y: 0 };
     const t = spread === "fb" ? (1 - p.y) / 2 : spread === "centre" ? Math.min(1, Math.hypot(p.x, p.y) / 1.42) : spread === "tour" ? ((Math.atan2(-p.y, p.x) + Math.PI * 1.5) % (2 * Math.PI)) / (2 * Math.PI) : (p.x + 1) / 2;
-    if (l.has_gradient) l.gradient = colors.slice(0, 5); else l.color = colors[Math.min(colors.length - 1, Math.floor(Math.max(0, Math.min(.999, t)) * colors.length))];
+    if (l.has_gradient) l.gradient = [...colors].sort((a, b) => lum(a) - lum(b)).slice(0, 5); else l.color = colors[Math.min(colors.length - 1, Math.floor(Math.max(0, Math.min(.999, t)) * colors.length))];
   });
-  roomsLock = Date.now() + 4000; render();
-  try { await api("/api/room/palette", { id: r.id, colors, spread }); } catch (e) { toast(e.message); }
+  roomsLock = Date.now() + 2000 + 120 * r.lights.length; render();
+  try {
+    const res = await api("/api/room/palette", { id: r.id, colors, spread });
+    Object.entries(res.lights || {}).forEach(([id, v]) => { const l = r.lights.find(x => x.id === id); if (l) Object.assign(l, v); });
+    roomsLock = Date.now() + 1500 + (res.ms || 0); render();
+  } catch (e) { toast(e.message); }
 }
 
 /* ----- couleur d'une lampe ----- */
@@ -3947,8 +4184,8 @@ async function refresh(forceZones) {
   if ($(".sheet.open")) renderSheets();
 }
 async function liveLoop() {
-  if (!document.hidden && S && S.service.active && route.v === "sync") { try { const l = await api("/api/live"); const n = l.now; delete l.now; live = l; if (n && (!S.now || n.cover !== S.now.cover || n.title !== S.now.title || n.playing !== S.now.playing)) { setNow(n); if ($(".sheet.open")) renderSheets(); } else if (n) setNow(n); renderSync(); } catch (e) {} }
-  setTimeout(liveLoop, 150);
+  if (!document.hidden && S && S.service.active && (route.v === "sync" || route.v === "avances")) { try { const l = await api("/api/live"); const n = l.now; delete l.now; live = l; if (n && (!S.now || n.cover !== S.now.cover || n.title !== S.now.title || n.playing !== S.now.playing)) { setNow(n); if ($(".sheet.open")) renderSheets(); } else if (n) setNow(n); if (route.v === "sync") renderSync(); else livePrev(); } catch (e) {} }
+  setTimeout(liveLoop, 100);
 }
 const Q = new URLSearchParams(location.search);
 go(Q.get("v") || load("tab") || "sync", Q.get("a") || "", false);
