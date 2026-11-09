@@ -378,6 +378,39 @@ def bridge_get(cfg, resource):
     return res.get("data", []) if isinstance(res, dict) else []
 
 
+KINDS = {"ruban": "Ruban", "spots": "Spots", "play": "Play", "lampes": "Lampes"}
+
+
+def kind_of(archetype, product="", channels_on_device=1):
+    """Famille d'une lampe pour les couches d'effet : ruban, spots, Play ou autres lampes."""
+    a, pr = (archetype or "").lower(), (product or "").lower()
+    if "play" in a or "play" in pr:
+        return "play"
+    if "strip" in a or "strip" in pr or "flux" in pr or channels_on_device > 1:
+        return "ruban"
+    if "spot" in a or "recessed" in a or "spot" in pr:
+        return "spots"
+    return "lampes"
+
+
+def channel_kinds(cfg, area):
+    """{channel_id: famille} et {channel_id: nom de la lampe} pour une zone de divertissement."""
+    ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in bridge_get(cfg, "entertainment")}
+    devices = {d["id"]: d for d in bridge_get(cfg, "device")}
+    dev_of = {}
+    for ch in area.get("channels", []):
+        mem = (ch.get("members") or [{}])[0]
+        dev_of[ch["channel_id"]] = ent_owner.get(mem.get("service", {}).get("rid"))
+    per_dev = collections.Counter(dev_of.values())
+    kinds, names = {}, {}
+    for cid, dev in dev_of.items():
+        d = devices.get(dev, {})
+        md, pd = d.get("metadata", {}), d.get("product_data", {})
+        kinds[cid] = kind_of(md.get("archetype", ""), pd.get("product_name", ""), per_dev[dev])
+        names[cid] = md.get("name", "Lampe")
+    return kinds, names
+
+
 MAX_AREA_LIGHTS = 10
 CUSTOM_AREA_NAME = "Hue Sync"
 
@@ -592,6 +625,7 @@ class AudioSource:
         self.q = queue.Queue(maxsize=100)
         self.eof = False
         self.raw_sink = None
+        self.lr = (0.0, 0.0)            # niveau gauche / droite du dernier bloc (effet Stéréo)
         if source == "stdin":
             self.stdin = sys.stdin.buffer
         elif shutil.which("parec"):
@@ -637,8 +671,12 @@ class AudioSource:
             if self.raw_sink is not None:
                 self.raw_sink(data)          # copie du son brut vers l'enceinte Bluetooth
             s = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+            lr = None
             if self.channels > 1:
-                s = s.reshape(-1, self.channels).mean(axis=1)   # stéréo -> mono
+                st = s.reshape(-1, self.channels)
+                lr = (float(np.sqrt(np.mean(st[:, 0] ** 2))), float(np.sqrt(np.mean(st[:, 1] ** 2))))
+                s = st.mean(axis=1)                             # stéréo -> mono
+            s = (s, lr)
             if self.q.full():
                 try:
                     self.q.get_nowait()
@@ -654,6 +692,8 @@ class AudioSource:
             return None
         while self.q.qsize() > 3:      # en retard : on saute pour rester en temps réel
             s = self.q.get_nowait()
+        s, lr = s
+        self.lr = lr if lr is not None else (0.0, 0.0)
         return s
 
     def close(self):
@@ -759,6 +799,17 @@ class Effects:
         self.silent_frames = 0
         self.last_out = []
         self.rng = np.random.default_rng()
+        self.speed = 1.0
+        self.t = 0.0
+        self.beat_t = []                 # instants des derniers temps (tempo pour la vitesse ×2)
+        self.half_done = True
+        self.raw_beats = 0
+        self.comets = []                 # [position, sens, couleur]
+        self.sparks = None
+        self.vu = 0.0
+        self.vu_peak = 0.0
+        self.phase = 0.0
+        self.lr_ref = 1e-3
         self.configure(channels, palette, intensity, brightness, mode)
 
     def configure(self, channels, palette, params, brightness, mode):
@@ -805,13 +856,162 @@ class Effects:
         if p["strobe"] and strength > 0.75 and bands.get("on_bass", 0) > 0.7 and bands["energy"] > 0.5:
             self.flash = 1.0
 
+    def _apply_speed(self, beat, strength):
+        """Vitesse : ×½ ne garde qu'un temps sur deux, ×2 ajoute un temps entre deux temps."""
+        self.t += self.DT
+        if beat:
+            self.beat_t = [t for t in self.beat_t if self.t - t < 4.0][-7:] + [self.t]
+            self.raw_beats += 1
+            self.half_done = False
+            if self.speed < 1 and self.raw_beats % 2 == 0:
+                return False, 0.0
+            return True, strength
+        if self.speed > 1 and not self.half_done and len(self.beat_t) >= 3:
+            gaps = np.diff(self.beat_t)
+            period = float(np.median(gaps))
+            if 0.2 < period < 1.6 and self.t - self.beat_t[-1] >= period / 2:
+                self.half_done = True
+                return True, 0.6
+        return False, 0.0
+
+    def palette_at(self, x):
+        """Couleur de la palette à la position x (0 → 1, bouclée), avec fondu entre couleurs."""
+        npal = len(self.palette)
+        x = (x % 1.0) * npal
+        k = int(x) % npal
+        return self.palette[k] + (self.palette[(k + 1) % npal] - self.palette[k]) * (x - int(x))
+
+    def _render_extra(self, bands, beat, strength, n):
+        """Effets supplémentaires : renvoie [(couleur cible, luminosité 0-1, fondu rapide ?)]."""
+        p, sp, dt = self.p, self.speed, self.DT
+        energy = bands.get("energy", 0.5)
+        lvl = max(bands.get("bass", 0.0), bands.get("mid", 0.0) * 0.9, bands.get("high", 0.0) * 0.7)
+        lvl = max(0.0, min(1.0, (lvl - 0.2) / 0.8))
+        res = []
+        pos = [i / (n - 1) if n > 1 else 0.5 for i in range(n)]
+        mode = self.mode
+
+        if mode == "comete":
+            if beat:
+                d = 1 if (self.beat_count % 2 or n == 1) else -1
+                self.comets.append([0.0 if d > 0 else 1.0, d, self.palette[self.color_idx % len(self.palette)],
+                                    0.6 + 0.4 * strength])
+            v = 1.4 * sp                                   # longueur du ruban par seconde
+            for c in self.comets:
+                c[0] += c[1] * v * dt
+            self.comets = [c for c in self.comets if -0.4 < c[0] < 1.4][-6:]
+            tail = 0.22 + 0.12 * (1 - p["base"])
+            for x in pos:
+                col, b = self.palette[self.color_idx % len(self.palette)] * 1.0, 0.04 + 0.25 * p["base"]
+                for c in self.comets:
+                    behind = (c[0] - x) * c[1]                # distance derrière la tête
+                    if -0.04 <= behind <= tail:
+                        k = c[3] * (1 - max(0.0, behind) / tail) ** 1.6
+                        if n == 1:
+                            k = c[3] * max(0.0, 1 - abs(c[0] - 0.5) * 2)
+                        if k > b:
+                            b, col = k, c[2]
+                res.append((col, b, True))
+
+        elif mode == "vague":
+            self.phase += dt * 0.07 * sp * (0.6 + 0.8 * energy)
+            if beat:
+                self.env[:] = np.maximum(self.env, 0.35 * strength)
+            self.env *= np.exp(-dt / 0.4)
+            for i, x in enumerate(pos):
+                b = 0.35 + 0.25 * p["base"] + 0.3 * lvl + 0.25 * self.env[i]
+                res.append((self.palette_at(x * 0.85 + self.phase), b, True))
+
+        elif mode == "vumetre":
+            target = lvl ** 0.8
+            rise = 1 - np.exp(-dt / 0.04)
+            fall = 1 - np.exp(-dt / (0.35 / sp))
+            self.vu += (target - self.vu) * (rise if target > self.vu else fall)
+            self.vu_peak = max(self.vu, self.vu_peak - dt * 0.35 * sp)
+            for x in pos:
+                if n == 1:
+                    res.append((self.palette_at(self.vu * 0.75), 0.05 + 0.95 * self.vu, True))
+                    continue
+                fill = max(0.0, min(1.0, (self.vu * 1.1 - x) * n))
+                b = 0.03 + 0.97 * fill
+                if abs(x - self.vu_peak) < 0.5 / n + 1e-6 and self.vu_peak > 0.08:
+                    b = max(b, 0.85)
+                res.append((self.palette_at(x * 0.75), b, True))
+
+        elif mode == "stereo":
+            l, r = bands.get("lr", (0.0, 0.0))
+            self.lr_ref = max(l, r, self.lr_ref * 0.998, 1e-3)
+            sides = [min(1.0, l / self.lr_ref), min(1.0, r / self.lr_ref)]
+            if l + r < 1e-4:                               # pas de stéréo (source mono) : milieu
+                sides = [lvl, lvl]
+            if beat:
+                self.env[:] = np.maximum(self.env, 0.5 + 0.5 * strength)
+            self.env *= np.exp(-dt / max(0.08, p["tau"] / sp))
+            npal = len(self.palette)
+            cl, cr = self.palette[0], self.palette[-1] if npal > 1 else self.palette[0]
+            for i, x in enumerate(pos):
+                if n == 1:
+                    bal = sides[1] / max(sides[0] + sides[1], 1e-3)
+                    col = cl + (cr - cl) * bal
+                    b = 0.08 + 0.6 * max(sides) ** 1.3 + 0.35 * self.env[i]
+                else:
+                    w = min(1.0, max(0.0, (x - 0.35) / 0.3))     # 0 = gauche, 1 = droite
+                    sv = sides[0] * (1 - w) + sides[1] * w
+                    col = cl + (cr - cl) * w
+                    b = 0.05 + 0.65 * max(0.0, (sv - 0.15) / 0.85) ** 1.3 + 0.3 * self.env[i] * sv
+                res.append((col, b, True))
+
+        elif mode == "etincelles":
+            if self.sparks is None or len(self.sparks) != n:
+                self.sparks = [[0.0, self.palette[0]] for _ in range(n)]
+            hi = bands.get("on_high", 0.0)
+            if hi > 0.45 or beat:
+                k = max(1, int(round(n * (0.12 + 0.2 * hi))))
+                for j in self.rng.choice(n, size=min(k, n), replace=False):
+                    c = self.palette[int(self.rng.integers(len(self.palette)))]
+                    self.sparks[j] = [0.7 + 0.3 * max(hi, strength), c * 0.6 + np.ones(3) * 0.4]
+            decay = np.exp(-dt / (0.14 / sp))
+            for i, x in enumerate(pos):
+                self.sparks[i][0] *= decay
+                glow = self.palette_at(x * 0.7 + self.phase)
+                k = self.sparks[i][0]
+                col = glow + (self.sparks[i][1] - glow) * min(1.0, k * 1.4)
+                res.append((col, 0.06 + 0.15 * p["base"] + 0.1 * energy + 0.9 * k, True))
+            self.phase += dt * 0.01
+
+        else:  # respiration
+            period = 8.0 / sp
+            self.phase += dt / period
+            for x in pos:
+                local = 0.5 - 0.5 * np.cos(2 * np.pi * (self.phase - 0.18 * x))
+                b = 0.12 + 0.7 * local * (0.75 + 0.25 * energy)
+                res.append((self.palette_at(self.phase * 0.25 + x * 0.3), b, False))
+        return res
+
     def update(self, rms, bands, beat, strength):
         n = len(self.channels)
         p = self.p
         silent = rms < 0.001
         self.silent_frames = self.silent_frames + 1 if silent else 0
+        beat, strength = self._apply_speed(beat, strength)
         if beat:
             self._on_beat(strength, bands, n)
+
+        if self.mode not in ("pulse", "spectrum"):
+            out = []
+            fade = 1.0 if p["fade"] <= 0 else 1 - np.exp(-self.DT / p["fade"])
+            for i, (ch, (target, b, quick)) in enumerate(zip(self.channels, self._render_extra(bands, beat, strength, n))):
+                self.current[i] += (target - self.current[i]) * (max(fade, 0.5) if quick else max(fade, 0.03))
+                b = max(0.0, min(1.0, b))
+                if self.silent_frames > 50:
+                    b = 0.2
+                rgb = self.current[i] * b * self.brightness
+                if self.flash > 0:
+                    rgb = rgb * (1 - self.flash) + np.ones(3) * self.flash * self.brightness
+                out.append((ch["channel_id"], *rgb))
+            self.flash = max(0.0, self.flash - 0.34)
+            self.last_out = out
+            return out
 
         decay = np.exp(-self.DT / p["tau"])
         fade = 1.0 if p["fade"] <= 0 else 1 - np.exp(-self.DT / p["fade"])
@@ -820,7 +1020,19 @@ class Effects:
         for i, ch in enumerate(self.channels):
             pos = i / (n - 1) if n > 1 else 0.5
 
-            if self.mode == "spectrum":
+            if self.mode == "spectrum" and n == 1:
+                # Une seule lampe : la couleur suit le registre (graves = couleur foncée de la
+                # palette, aigus = couleur claire) et la luminosité suit le niveau, en continu.
+                bb, mm, hh = bands.get("bass", 0.0), bands.get("mid", 0.0), bands.get("high", 0.0)
+                tot = bb + mm + hh
+                bright = (0.5 * mm + hh) / tot / 1.5 if tot > 1e-3 else 0.0
+                lvl = max(0.0, min(1.0, (max(bb, mm, hh) - 0.18) / 0.82)) ** 1.4
+                hit = max(lvl, max(0.0, (max(bands.get("on_bass", 0), bands.get("on_high", 0)) - 0.25) / 0.75))
+                npal = len(self.palette)
+                x = min(0.999, max(0.0, bright * 1.6)) * (npal - 1)
+                k = int(x)
+                target = self.palette[k] + (self.palette[min(k + 1, npal - 1)] - self.palette[k]) * (x - k)
+            elif self.mode == "spectrum":
                 # Égaliseur : graves à gauche, médiums au centre, aigus à droite. Chaque lampe
                 # suit en continu le niveau de sa bande (et pas seulement les temps).
                 def band(k):
@@ -871,6 +1083,55 @@ class Effects:
         self.flash = max(0.0, self.flash - 0.34)             # flash blanc ~60 ms
         self.last_out = out
         return out
+
+
+class Layered:
+    """Couches d'effet : chaque famille de lampes (ruban, spots...) peut avoir son propre effet
+    et sa vitesse ; les autres suivent l'effet principal. Même interface qu'Effects."""
+
+    def __init__(self, channels, palette, params, brightness, mode, speed=1.0, kinds=None, layers=None):
+        self.fx = {}
+        self.last_out = []
+        self.configure(channels, palette, params, brightness, mode, speed, kinds, layers)
+
+    def configure(self, channels, palette, params, brightness, mode, speed=1.0, kinds=None, layers=None):
+        kinds, layers = kinds or {}, layers or {}
+        self.order = [c["channel_id"] for c in sorted(channels, key=lambda c: c["position"]["x"])]
+        groups = {}
+        for ch in channels:
+            k = kinds.get(ch["channel_id"], "lampes")
+            ov = layers.get(k) if isinstance(layers.get(k), dict) else None
+            if ov and ov.get("mode") in MODES:
+                groups.setdefault(k, (ov["mode"], ov.get("speed", speed), []))[2].append(ch)
+            else:
+                groups.setdefault("_", (mode, speed, []))[2].append(ch)
+        fx = {}
+        for name, (m, sp, chs) in groups.items():
+            e = self.fx.get(name)
+            if e is None or {c["channel_id"] for c in e.channels} != {c["channel_id"] for c in chs}:
+                e = Effects(chs, palette, params, brightness, m)
+            else:
+                e.configure(chs, palette, params, brightness, m)
+            try:
+                e.speed = min(SPEEDS, key=lambda v: abs(v - float(sp)))
+            except (TypeError, ValueError):
+                e.speed = 1.0
+            fx[name] = e
+        self.fx = fx
+        self.desc = " + ".join(f"{KINDS.get(n, 'reste') if n != '_' else 'reste'} {e.mode}"
+                               for n, e in fx.items()) if len(fx) > 1 else ""
+
+    def update(self, rms, bands, beat, strength):
+        out = []
+        for e in self.fx.values():
+            out += e.update(rms, bands, beat, strength)
+        self.last_out = out
+        return out
+
+    def colors_hex(self):
+        by = {o[0]: o for o in self.last_out}
+        return ["#%02x%02x%02x" % tuple(int(max(0, min(1, v)) * 255) for v in by[c][1:])
+                for c in self.order if c in by]
 
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +1292,11 @@ class Session:
 # ---------------------------------------------------------------------------
 # Commande "run"
 # ---------------------------------------------------------------------------
-SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse",
+MODES = ("pulse", "spectrum", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
+SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
+
+SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
+                     "layers": {},
                      "brightness": 1.0, "idle_release": 15,
                      "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}}
 
@@ -1040,7 +1305,7 @@ def load_settings(path, args):
     """Réglages : fichier JSON (modifiable à chaud par l'interface web) sinon ligne de commande."""
     s = {"area": args.area or "", "palette": args.palette, "intensity": args.intensity,
          "mode": args.mode, "brightness": args.brightness, "idle_release": args.idle_release,
-         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}}
+         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}}
     if path and os.path.exists(path):
         try:
             with open(path) as f:
@@ -1053,8 +1318,14 @@ def load_settings(path, args):
         s["palette"], s["palette_colors"] = "sunset", PALETTES["sunset"]
     if s["intensity"] not in INTENSITY:
         s["intensity"] = "high"
-    if s["mode"] not in ("pulse", "spectrum"):
+    if s["mode"] not in MODES:
         s["mode"] = "pulse"
+    try:
+        s["speed"] = min(SPEEDS, key=lambda v: abs(v - float(s["speed"])))
+    except (TypeError, ValueError):
+        s["speed"] = 1.0
+    if not isinstance(s.get("layers"), dict):
+        s["layers"] = {}
     s["fx"] = clean_fx(s.get("fx"))
     s["fx_params"] = fx_params(s["intensity"], s["fx"])
     try:
@@ -1116,6 +1387,19 @@ def cmd_run(args):
     area_name = area.get("metadata", {}).get("name")
     log(f"Zone : {area_name} ({len(area['channels'])} canaux)")
 
+    def kinds_for(a):
+        if args.dry_run:
+            return {}
+        try:
+            k, _ = channel_kinds(cfg, a)
+            return k
+        except HueError as e:
+            log(f"Familles de lampes inconnues ({e}) : un seul effet pour toute la zone.")
+            return {}
+    kinds = kinds_for(area)
+    if kinds:
+        log("Lampes : " + ", ".join(f"{KINDS[k]} ×{n}" for k, n in collections.Counter(kinds.values()).items()))
+
     session = Session(cfg, area, args.dry_run)
     audio = AudioSource(args.source, args.channels)
     player = None
@@ -1126,8 +1410,8 @@ def cmd_run(args):
     delayed = collections.deque()
     p = settings["fx_params"]
     analyzer = Analyzer(p["beat_k"], p["min_beat"], p["source"])
-    fx = Effects(area["channels"], settings["palette_colors"], p,
-                 settings["brightness"], settings["mode"])
+    fx = Layered(area["channels"], settings["palette_colors"], p, settings["brightness"],
+                 settings["mode"], settings["speed"], kinds, settings["layers"])
     airplay_on, airplay_seen = False, 0.0   # signal « lecture en cours » d'AirPlay
     last_flag = 0.0
 
@@ -1149,6 +1433,7 @@ def cmd_run(args):
                     break
                 samples = silence           # rien ne joue : on continue à 50 Hz
             rms, bands, beat, strength = analyzer.process(samples)
+            bands["lr"] = audio.lr
             now = time.time()
 
             # Réglages modifiés depuis l'interface web : on les applique à chaud
@@ -1175,6 +1460,7 @@ def cmd_run(args):
                                 session.release("changement de zone")
                                 area = session.area = new_area
                                 area_name = area.get("metadata", {}).get("name")
+                                kinds = kinds_for(area)
                                 log(f"Nouvelle zone : {area_name}")
                         except HueError as e:
                             log(f"Changement de zone impossible : {e}")
@@ -1183,10 +1469,11 @@ def cmd_run(args):
                         player.set_device(settings["bt_device"])
                     q = settings["fx_params"]
                     analyzer.set_params(q["beat_k"], q["min_beat"], q["source"])
-                    fx.configure(area["channels"], settings["palette_colors"], q,
-                                 settings["brightness"], settings["mode"])
+                    fx.configure(area["channels"], settings["palette_colors"], q, settings["brightness"],
+                                 settings["mode"], settings["speed"], kinds, settings["layers"])
                     log(f"Réglages appliqués : {settings['palette']}, {settings['intensity']}, "
-                        f"{settings['mode']}, luminosité {settings['brightness']}")
+                        f"{settings['mode']} ×{settings['speed']:g}, luminosité {settings['brightness']}"
+                        + (f" — couches : {fx.desc}" if fx.desc else ""))
 
             # Signal AirPlay : le fichier existe tant qu'une lecture est en cours (shairport-sync).
             # On prépare les lampes dès l'appui sur Lecture, avant même l'arrivée du son.
@@ -1251,7 +1538,7 @@ def main():
     p_run.add_argument("--rate", type=int, default=48000, help="Fréquence d'échantillonnage")
     p_run.add_argument("--palette", default="sunset", choices=sorted(PALETTES))
     p_run.add_argument("--intensity", default="high", choices=list(INTENSITY))
-    p_run.add_argument("--mode", default="pulse", choices=["pulse", "spectrum"],
+    p_run.add_argument("--mode", default="pulse", choices=list(MODES),
                        help="pulse : toutes les lampes sur le rythme ; "
                             "spectrum : graves à gauche, aigus à droite")
     p_run.add_argument("--brightness", type=float, default=1.0, help="0.1 à 1.0")
@@ -1431,9 +1718,17 @@ def get_areas(force=False):
     cfg = hms.load_config_or_none()
     if not cfg:
         raise hms.HueError("Pont non appairé.")
-    data = [{"id": a["id"], "name": a.get("metadata", {}).get("name", "Zone"),
-             "lights": len(a.get("channels", [])), "status": a.get("status")}
-            for a in hms.get_areas(cfg)]
+    data = []
+    for a in hms.get_areas(cfg):
+        try:
+            kinds, _ = hms.channel_kinds(cfg, a)
+        except hms.HueError:
+            kinds = {}
+        counts = {}
+        for k in kinds.values():
+            counts[k] = counts.get(k, 0) + 1
+        data.append({"id": a["id"], "name": a.get("metadata", {}).get("name", "Zone"),
+                     "lights": len(a.get("channels", [])), "status": a.get("status"), "kinds": counts})
     areas_cache.update(t=time.time(), data=data)
     return data
 
@@ -1449,9 +1744,37 @@ def do_pair(bridge):
         pairing.update(state="error", message=str(e))
 
 
+ZONE_KEYS = ("palette", "intensity", "fx", "mode", "speed", "layers", "brightness")
+
+
+def clean_layers(d):
+    out = {}
+    for k, v in (d or {}).items() if isinstance(d, dict) else []:
+        if k in hms.KINDS and isinstance(v, dict) and v.get("mode") in hms.MODES:
+            try:
+                sp = min(hms.SPEEDS, key=lambda x: abs(x - float(v.get("speed", 1))))
+            except (TypeError, ValueError):
+                sp = 1.0
+            out[k] = {"mode": v["mode"], "speed": sp}
+    return out
+
+
 def update_settings(body):
     s = get_settings()
     restart = False
+    zones = s.get("zones") if isinstance(s.get("zones"), dict) else {}
+    # Changement de zone : chaque zone retrouve ses propres réglages (effet, couleurs, couches…)
+    if "area" in body and str(body["area"])[:64] != s.get("area", ""):
+        new = str(body["area"])[:64]
+        zones[s.get("area", "")] = {k: s.get(k) for k in ZONE_KEYS}
+        for k, v in (zones.get(new) or {}).items():
+            if k in ZONE_KEYS and k not in body:
+                s[k] = v
+        if new not in zones and "layers" not in body:
+            s["layers"] = {}             # zone jamais réglée : mêmes réglages, sans couches
+        s["area"] = new
+    if "layers" in body:
+        s["layers"] = clean_layers(body["layers"])
     if "palette" in body and hms.resolve_palette(body["palette"], CONF_DIR):
         s["palette"] = body["palette"]
     if "intensity" in body and body["intensity"] in hms.INTENSITY:
@@ -1466,16 +1789,21 @@ def update_settings(body):
             else:
                 merged[k] = v
         s["fx"] = hms.clean_fx(merged)
-    if "mode" in body and body["mode"] in ("pulse", "spectrum"):
+    if "mode" in body and body["mode"] in hms.MODES:
         s["mode"] = body["mode"]
+    if "speed" in body:
+        try:
+            s["speed"] = min(hms.SPEEDS, key=lambda v: abs(v - float(body["speed"])))
+        except (TypeError, ValueError):
+            pass
     if "brightness" in body:
         s["brightness"] = round(max(0.05, min(1.0, float(body["brightness"]))), 2)
     if "idle_release" in body:
         s["idle_release"] = max(0, min(3600, int(body["idle_release"])))
-    if "area" in body:
-        s["area"] = str(body["area"])[:64]
     if "bt_offset_ms" in body:
         s["bt_offset_ms"] = max(0, min(1500, int(body["bt_offset_ms"])))
+    zones[s.get("area", "")] = {k: s.get(k) for k in ZONE_KEYS}
+    s["zones"] = zones
     write_json(SETTINGS_PATH, s)
     if "airplay_name" in body and body["airplay_name"] != airplay_name():
         set_airplay_name(str(body["airplay_name"]))
@@ -2612,7 +2940,9 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
     <div class="stagebox" id="stage"><div class="h"><span class="label" style="padding:0">Aperçu</span><span style="color:var(--t2);font-size:12px;display:flex;align-items:center;gap:6px"><i class="dot on"></i><span id="prevSub"></span></span></div><div class="prev" id="prev"></div></div>
     <div class="pad">
       <div class="label in">Effet</div>
+      <div class="seg hidden" id="advTarget" style="margin-bottom:6px"></div><p class="hint hidden" id="advLayers" style="margin:2px 4px 12px"></p>
       <div class="grid2" id="advEffects"></div>
+      <div class="label in">Vitesse</div><div class="seg" id="advSpeed"></div><p class="hint" id="speedHint" style="margin:8px 4px 0"></p>
       <div id="advFolds"></div>
     </div>
   </section>
@@ -2673,7 +3003,8 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
 
 <!-- ============ FEUILLES ============ -->
 <div class="bg" id="sheetBg"></div>
-<div class="sheet" id="shEffet"><div class="grab"></div><div class="sh"><b>Effet</b><button class="txtbtn" data-close>OK</button></div><div class="grid2" id="effList"></div>
+<div class="sheet" id="shEffet"><div class="grab"></div><div class="sh"><b>Effet</b><button class="txtbtn" data-close>OK</button></div><div class="seg hidden" id="effTarget" style="background:var(--card2);margin-bottom:6px"></div><p class="note hidden" id="effLayers" style="padding:2px 4px 12px"></p><div class="grid2" id="effList"></div>
+  <div class="label" style="padding:18px 4px 8px">Vitesse</div><div class="seg" id="effSpeed" style="background:var(--card2)"></div>
   <button class="row" id="effAdv" style="margin-top:14px;background:var(--card2);border-radius:16px;min-height:62px"><span class="ic" style="width:60px" data-i="sliders"></span><span class="bd" style="border:0"><span class="tx"><span class="t1" style="font-size:16px">Réglages avancés</span><span class="t2" style="font-size:13px">Rythme, flashs, couleurs, motif</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button></div>
 <div class="sheet" id="shInt"><div class="grab"></div><div class="sh"><b>Intensité</b><button class="txtbtn" data-close>OK</button></div><div id="intList" class="list" style="border-radius:18px;background:var(--card2)"></div><p class="note" style="padding:12px 4px 0" id="intNote"></p></div>
 <div class="sheet" id="shCouleur"><div class="grab"></div><div class="sh"><b>Couleur</b><button class="txtbtn" data-close>OK</button></div><div class="grid3" id="palList"></div><p class="note" style="padding:12px 4px 0">« Créer » : depuis une photo ou en choisissant les couleurs. La palette peut aussi servir de scène dans tes pièces.</p></div>
@@ -2786,14 +3117,57 @@ const PAL_N = { sunset: "Coucher", ocean: "Océan", neon: "Néon", fire: "Feu", 
 const EFFECTS = [
   ["pulse", "Pulsation", "Tout bat ensemble sur le rythme", true],
   ["spectrum", "Spectre étalé", "Graves d'un côté, aigus de l'autre", true],
-  ["comete", "Comète", "Une traînée court le long du ruban", false],
-  ["vague", "Vague", "La palette défile, sans flash", false],
-  ["vumetre", "Vu-mètre", "Se remplit avec le volume", false],
-  ["stereo", "Stéréo", "Gauche et droite séparées", false],
-  ["etincelles", "Étincelles", "Éclats au hasard sur les aigus", false],
-  ["respiration", "Respiration", "Monte et descend doucement", false]
+  ["comete", "Comète", "Une traînée court le long du ruban", true],
+  ["vague", "Vague", "La palette défile, sans flash", true],
+  ["vumetre", "Vu-mètre", "Se remplit avec le volume", true],
+  ["stereo", "Stéréo", "Gauche et droite séparées", true],
+  ["etincelles", "Étincelles", "Éclats au hasard sur les aigus", true],
+  ["respiration", "Respiration", "Monte et descend doucement", true]
 ];
 
+const SPEEDS = [[0.5, "Demi-temps"], [1, "Normale"], [2, "Double"]];
+const SPEED_D = { pulse: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.", spectrum: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.",
+  comete: "Vitesse de la traînée et nombre de départs.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
+  stereo: "Durée des éclats sur les temps.", etincelles: "Durée des éclats.", respiration: "Demi-temps : 16 s par souffle. Double : 4 s." };
+const KIND_N = { ruban: "Ruban", spots: "Spots", play: "Play", lampes: "Lampes" };
+let effTarget = "all";
+const effName = m => (EFFECTS.find(e => e[0] === m) || EFFECTS[0])[1].replace(" étalé", "");
+const spTag = v => (v || 1) === 1 ? "" : v > 1 ? " ×2" : " ×½";
+function zoneKinds() { const z = currentZone(); return z && z.kinds ? Object.keys(z.kinds).filter(k => z.kinds[k]) : []; }
+function effCur() {
+  const st = S.settings, L = st.layers || {};
+  return effTarget !== "all" && L[effTarget] ? L[effTarget] : { mode: st.mode, speed: st.speed || 1 };
+}
+function effSet(patch) {          // patch : { mode } ou { speed }
+  const st = S.settings, c = { ...effCur(), ...patch };
+  if (effTarget === "all") return save(patch.mode ? { mode: c.mode, layers: {} } : { speed: c.speed }, true);
+  const L = { ...(st.layers || {}) };
+  if (c.mode === st.mode && c.speed === (st.speed || 1)) delete L[effTarget]; else L[effTarget] = c;
+  save({ layers: L }, true);
+}
+function effSummary() {
+  const st = S.settings, L = st.layers || {}, ks = Object.keys(L).filter(k => zoneKinds().includes(k));
+  if (!ks.length) return "";
+  return ks.map(k => `${KIND_N[k]} : ${effName(L[k].mode)}${spTag(L[k].speed)}`).join(" · ") + ` · le reste : ${effName(st.mode)}${spTag(st.speed)}`;
+}
+function effPicker(ids, after) {   // ids : [cible, résumé, grille, vitesse]
+  const [tId, sId, gId, vId] = ids, ks = zoneKinds(), pal = palColors(S.settings.palette);
+  if (!ks.includes(effTarget)) effTarget = "all";
+  const t = $(tId), multi = ks.length > 1;
+  t.classList.toggle("hidden", !multi);
+  if (multi) {
+    const z = currentZone();
+    t.innerHTML = [["all", "Toute la zone"]].concat(ks.map(k => [k, `${KIND_N[k]} (${z.kinds[k]})`])).map(([k, n]) => `<button data-tgt="${k}" class="${effTarget === k ? "on" : ""}">${n}</button>`).join("");
+    t.querySelectorAll("[data-tgt]").forEach(b => b.onclick = () => { effTarget = b.dataset.tgt; after(); });
+  }
+  const sm = effSummary(); $(sId).textContent = sm; $(sId).classList.toggle("hidden", !multi || !sm);
+  const cur = effCur();
+  $(gId).innerHTML = EFFECTS.map(([k, n, d, ok]) => `<button class="tile ${cur.mode === k ? "on" : ""}" data-effk="${k}" ${ok ? "" : "disabled"}>${effStrip(k, pal, 10)}<span class="n">${n}</span><span class="d ${ok ? "" : "soon"}">${ok ? d : "Bientôt"}</span></button>`).join("");
+  $(gId).querySelectorAll("[data-effk]").forEach(b => b.onclick = () => { effSet({ mode: b.dataset.effk }); after(); });
+  const v = $(vId);
+  v.innerHTML = SPEEDS.map(([x, n]) => `<button data-speed="${x}" class="${cur.speed === x ? "on" : ""}">${n}</button>`).join("");
+  v.querySelectorAll("[data-speed]").forEach(b => b.onclick = () => { effSet({ speed: +b.dataset.speed }); after(); });
+}
 async function api(path, body) {
   const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   const r = await fetch(path, opt);
@@ -2865,9 +3239,7 @@ $$("[data-sheet]").forEach(b => b.onclick = () => openSheet(b.dataset.sheet));
 function renderSheets() {
   if (!S) return;
   const st = S.settings;
-  $("#effList").innerHTML = EFFECTS.map(([k, n, d, ok]) => `<button class="tile ${st.mode === k ? "on" : ""}" data-eff="${k}" ${ok ? "" : "disabled"}>
-    ${effStrip(k, palColors(st.palette), 10)}<span class="n">${n}</span><span class="d ${ok ? "" : "soon"}">${ok ? d : "Bientôt"}</span></button>`).join("");
-  $$("[data-eff]").forEach(b => b.onclick = () => { save({ mode: b.dataset.eff }, true); renderSheets(); renderSync(); });
+  effPicker(["#effTarget", "#effLayers", "#effList", "#effSpeed"], () => { renderSheets(); renderSync(); });
   $("#intList").innerHTML = Object.keys(INT).map(k => `<button class="row" data-int="${k}" style="min-height:66px"><span class="bd" style="padding-left:16px"><span class="tx"><span class="t1" style="font-size:17px">${INT[k]}</span><span class="t2" style="font-size:13px">${INT_D[k]}</span></span><span style="width:22px;color:var(--blue);font-weight:700">${st.intensity === k ? "✓" : ""}</span></span></button>`).join("");
   $$("[data-int]").forEach(b => b.onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: b.dataset.int }, true); renderSheets(); renderSync(); });
   const nfx = Object.keys(st.fx || {}).length;
@@ -2887,20 +3259,23 @@ function orbTile(name, colors, on, attrs, badge) {
 }
 
 /* =================== APERÇU D'EFFET (bandeau) =================== */
+function effAnim(fx, i, n, sp) {
+  const rnd = [0, .62, .21, .9, .4, .75, .12, .55, .33, .82, .05, .68], k = 1 / (sp || 1), f = v => (v * k).toFixed(2);
+  if (fx === "spectrum") return `bar ${(.45 + rnd[i % 12] * .5).toFixed(2)}s ${(-rnd[(i + 3) % 12]).toFixed(2)}s ease-in-out infinite alternate`;
+  if (fx === "comete") return `fl ${f(1.4)}s ${f(i * .07)}s infinite`;
+  if (fx === "vague") return `br ${f(2.4)}s ease-in-out ${f(-i * .22)}s infinite`;
+  if (fx === "vumetre") return `fl ${f(1.6)}s ${f(i * .06)}s infinite`;
+  if (fx === "stereo") return `fl ${f(.9)}s ${i < n / 2 ? 0 : f(.45)}s infinite`;
+  if (fx === "etincelles") return `fl ${f(1.3)}s ${f(rnd[i % 12] * 1.3)}s infinite`;
+  if (fx === "respiration") return `br ${f(3.2)}s ease-in-out ${f(-i * .12)}s infinite`;
+  return `fl ${f(.6)}s infinite`;
+}
 function effStrip(fx, pal, n) {
   const rnd = [0, .62, .21, .9, .4, .75, .12, .55, .33, .82, .05, .68];
   let h = `<span style="display:flex;gap:3px;height:16px;width:100%">`;
   for (let i = 0; i < n; i++) {
     const c = boost(pal[Math.floor(i / n * pal.length) % pal.length], 180);
-    let a = "none";
-    if (fx === "pulse") a = "fl .6s infinite";
-    else if (fx === "spectrum") a = `bar ${(.45 + rnd[i % 12] * .5).toFixed(2)}s ${(-rnd[(i + 3) % 12]).toFixed(2)}s ease-in-out infinite alternate`;
-    else if (fx === "comete") a = `fl 1.4s ${(i * .07).toFixed(2)}s infinite`;
-    else if (fx === "vague") a = `hue 4s linear ${(-i * .35).toFixed(2)}s infinite`;
-    else if (fx === "vumetre") a = `fl 1.6s ${(i * .06).toFixed(2)}s infinite`;
-    else if (fx === "stereo") a = `fl .9s ${i < n / 2 ? 0 : .45}s infinite`;
-    else if (fx === "etincelles") a = `fl 1.3s ${(rnd[i % 12] * 1.3).toFixed(2)}s infinite`;
-    else if (fx === "respiration") a = "br 3.2s ease-in-out infinite";
+    const a = effAnim(fx, i, n, 1);
     h += `<i style="flex:1;border-radius:3px;background:${c};box-shadow:0 0 8px ${c}88;--hi:1;--lo:.25;animation:${a}"></i>`;
   }
   return h + "</span>";
@@ -2917,7 +3292,8 @@ function renderSync() {
   $("#zoneName").textContent = z ? z.name : (zones && zones.error ? "Aucune zone" : "Zone");
   $("#apNameSmall").textContent = S.airplay_name;
   $("#lampsCount").textContent = z ? `${z.lights} lampe${z.lights > 1 ? "s" : ""}` : "—";
-  $("#cEffet").textContent = st.mode === "spectrum" ? "Spectre" : "Pulsation";
+  const lk = Object.keys(st.layers || {}).filter(k => zoneKinds().includes(k));
+  $("#cEffet").textContent = lk.length ? [...new Set([st.mode, ...lk.map(k => st.layers[k].mode)])].map(effName).join(" + ") : effName(st.mode) + spTag(st.speed);
   $("#cInt").textContent = INT[st.intensity] + (Object.keys(st.fx || {}).length ? " *" : "");
   $("#cPal").textContent = palName(st.palette);
   $("#cPalOrb").style.background = orbBg(palColors(st.palette));
@@ -3027,8 +3403,8 @@ function renderAdv() {
   const st = S.settings, n = Object.keys(st.fx || {}).length, pal = palColors(st.palette);
   $("#advStatus").textContent = `Basé sur « ${INT[st.intensity]} »` + (n ? ` · ${n} modifié${n > 1 ? "s" : ""}` : "");
   $("#advReset").disabled = !n;
-  $("#advEffects").innerHTML = EFFECTS.map(([k, nm, d, ok]) => `<button class="tile ${st.mode === k ? "on" : ""}" data-aeff="${k}" ${ok ? "" : "disabled"}>${effStrip(k, pal, 10)}<span class="n">${nm}</span><span class="d ${ok ? "" : "soon"}">${ok ? d : "Bientôt"}</span></button>`).join("");
-  $$("[data-aeff]").forEach(b => b.onclick = () => { save({ mode: b.dataset.aeff }, true); renderAdv(); });
+  effPicker(["#advTarget", "#advLayers", "#advEffects", "#advSpeed"], renderAdv);
+  $("#speedHint").textContent = SPEED_D[effCur().mode] || "";
   const src = { full: "Tout", kick: "Grosse caisse", snare: "Caisse claire" }, pat = { all: "Ensemble", alt: "Alternance", chase: "Chenillard", wave: "Vague" };
   const folds = [
     ["rythme", "Rythme", `${src[fxv("source")]} · sensibilité ${ADV.beat_k.f(fxv("beat_k"))} · écart ${ADV.min_beat.f(fxv("min_beat"))}`,
@@ -3066,17 +3442,17 @@ function drawCStrip() {
   el.style.background = `linear-gradient(90deg, ${st.join(",")})`;
 }
 function renderPrev() {
-  const pal = palColors(S.settings.palette), mode = S.settings.mode, n = 8;
-  const tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3", per = .5;
+  const pal = palColors(S.settings.palette), cur = effCur(), mode = cur.mode, n = 8;
+  const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3", per = .5 / sp;
   const dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
   const hi = Math.max(fxv("beat"), fxv("base") + .1), lo = Math.max(fxv("base"), .03);
   $("#prev").innerHTML = Array.from({ length: n }, (_, i) => {
     const c = boost(pal[(i + 1) % pal.length], 200);
-    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : `${anim} ${per}s ${(dl[i] || 0) * per}s infinite`;
+    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : mode === "pulse" ? `${anim} ${per}s ${(dl[i] || 0) * per}s infinite` : effAnim(mode, i, n, sp);
     return `<i style="background:radial-gradient(circle at 35% 30%,#fff 0%,${c} 38%,${c} 100%);box-shadow:0 0 20px ${c};--hi:${hi};--lo:${lo};animation:${a}"></i>`;
   }).join("");
   $("#stage").style.setProperty("--glow", boost(pal[1] || pal[0], 160) + "33");
-  $("#prevSub").textContent = (mode === "spectrum" ? "Spectre étalé" : "Pulsation") + " · " + INT[S.settings.intensity];
+  $("#prevSub").textContent = (EFFECTS.find(e => e[0] === mode) || EFFECTS[0])[1] + " · " + INT[S.settings.intensity] + (sp !== 1 ? (sp > 1 ? " · ×2" : " · ×½") : "");
 }
 $("#advReset").onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: S.settings.intensity }, true); renderAdv(); toast("Préréglage rétabli"); };
 
