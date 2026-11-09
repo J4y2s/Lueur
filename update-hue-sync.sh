@@ -301,22 +301,51 @@ def kind_of(archetype, product="", channels_on_device=1):
     return "lampes"
 
 
-def channel_kinds(cfg, area):
-    """{channel_id: famille} et {channel_id: nom de la lampe} pour une zone de divertissement."""
+def channel_info(cfg, area):
+    """Canaux d'une zone avec leur lampe : [{id, kind, dev, name, archetype, idx, x, y}].
+    idx = numéro du segment le long d'un ruban (ordre réel des segments)."""
     ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in bridge_get(cfg, "entertainment")}
     devices = {d["id"]: d for d in bridge_get(cfg, "device")}
-    dev_of = {}
+    rows = []
     for ch in area.get("channels", []):
         mem = (ch.get("members") or [{}])[0]
-        dev_of[ch["channel_id"]] = ent_owner.get(mem.get("service", {}).get("rid"))
-    per_dev = collections.Counter(dev_of.values())
-    kinds, names = {}, {}
-    for cid, dev in dev_of.items():
-        d = devices.get(dev, {})
+        rows.append({"id": ch["channel_id"], "dev": ent_owner.get(mem.get("service", {}).get("rid")),
+                     "idx": mem.get("index", 0) or 0,
+                     "x": ch.get("position", {}).get("x", 0), "y": ch.get("position", {}).get("y", 0)})
+    per_dev = collections.Counter(r["dev"] for r in rows)
+    for r in rows:
+        d = devices.get(r["dev"], {})
         md, pd = d.get("metadata", {}), d.get("product_data", {})
-        kinds[cid] = kind_of(md.get("archetype", ""), pd.get("product_name", ""), per_dev[dev])
-        names[cid] = md.get("name", "Lampe")
-    return kinds, names
+        r["kind"] = kind_of(md.get("archetype", ""), pd.get("product_name", ""), per_dev[r["dev"]])
+        r["name"] = md.get("name", "Lampe")
+        r["archetype"] = md.get("archetype", "")
+        r["segments"] = per_dev[r["dev"]]
+    return rows
+
+
+def channel_kinds(cfg, area):
+    """{channel_id: famille} et {channel_id: nom de la lampe} pour une zone de divertissement."""
+    rows = channel_info(cfg, area)
+    return {r["id"]: r["kind"] for r in rows}, {r["id"]: r["name"] for r in rows}
+
+
+def plan_channels(area, plans):
+    """Applique le plan de la pièce (s'il existe) : chaque canal reçoit son ordre de parcours
+    (le long du ruban, ou de gauche à droite) et sa vraie position gauche / droite."""
+    plan = (plans or {}).get(area.get("id"), {}) if isinstance(plans, dict) else {}
+    pts = plan.get("ch", {}) if isinstance(plan, dict) else {}
+    out = []
+    for ch in area.get("channels", []):
+        c = dict(ch)
+        q = pts.get(str(ch["channel_id"]))
+        if isinstance(q, dict):
+            try:
+                t, x, y = (max(-1.0, min(1.0, float(q[k]))) for k in ("t", "x", "y"))
+                c["position"] = {"x": t * 2 - 1, "y": y, "z": 0, "sx": x}
+            except (KeyError, TypeError, ValueError):
+                pass
+        out.append(c)
+    return out
 
 
 MAX_AREA_LIGHTS = 10
@@ -863,7 +892,9 @@ class Effects:
                     col = cl + (cr - cl) * bal
                     b = 0.08 + 0.6 * max(sides) ** 1.3 + 0.35 * self.env[i]
                 else:
-                    w = min(1.0, max(0.0, (x - 0.35) / 0.3))     # 0 = gauche, 1 = droite
+                    px = self.channels[i]["position"]
+                    rx = (px.get("sx", px["x"]) + 1) / 2 if "sx" in px else x
+                    w = min(1.0, max(0.0, (rx - 0.35) / 0.3))    # 0 = gauche, 1 = droite
                     sv = sides[0] * (1 - w) + sides[1] * w
                     col = cl + (cr - cl) * w
                     b = 0.05 + 0.65 * max(0.0, (sv - 0.15) / 0.85) ** 1.3 + 0.3 * self.env[i] * sv
@@ -1204,7 +1235,7 @@ MODES = ("pulse", "spectrum", "comete", "vague", "vumetre", "stereo", "etincelle
 SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
 
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
-                     "layers": {},
+                     "layers": {}, "plans": {},
                      "brightness": 1.0, "idle_release": 15,
                      "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}}
 
@@ -1213,7 +1244,7 @@ def load_settings(path, args):
     """Réglages : fichier JSON (modifiable à chaud par l'interface web) sinon ligne de commande."""
     s = {"area": args.area or "", "palette": args.palette, "intensity": args.intensity,
          "mode": args.mode, "brightness": args.brightness, "idle_release": args.idle_release,
-         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}}
+         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}, "plans": {}}
     if path and os.path.exists(path):
         try:
             with open(path) as f:
@@ -1318,7 +1349,7 @@ def cmd_run(args):
     delayed = collections.deque()
     p = settings["fx_params"]
     analyzer = Analyzer(p["beat_k"], p["min_beat"], p["source"])
-    fx = Layered(area["channels"], settings["palette_colors"], p, settings["brightness"],
+    fx = Layered(plan_channels(area, settings["plans"]), settings["palette_colors"], p, settings["brightness"],
                  settings["mode"], settings["speed"], kinds, settings["layers"])
     airplay_on, airplay_seen = False, 0.0   # signal « lecture en cours » d'AirPlay
     last_flag = 0.0
@@ -1377,7 +1408,7 @@ def cmd_run(args):
                         player.set_device(settings["bt_device"])
                     q = settings["fx_params"]
                     analyzer.set_params(q["beat_k"], q["min_beat"], q["source"])
-                    fx.configure(area["channels"], settings["palette_colors"], q, settings["brightness"],
+                    fx.configure(plan_channels(area, settings["plans"]), settings["palette_colors"], q, settings["brightness"],
                                  settings["mode"], settings["speed"], kinds, settings["layers"])
                     log(f"Réglages appliqués : {settings['palette']}, {settings['intensity']}, "
                         f"{settings['mode']} ×{settings['speed']:g}, luminosité {settings['brightness']}"
@@ -1494,6 +1525,7 @@ Sert la page index.html et une petite API JSON :
   POST /api/light      {"id", "on"?, "bri"?, "color"?}  pilote une lampe hors synchro
   POST /api/room       {"id", "on"?, "bri"?}             pilote toute une pièce
   POST /api/room/palette {"id", "colors": [...]}         applique une scène / palette à la pièce
+  GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
 
@@ -1650,6 +1682,43 @@ def do_pair(bridge):
         systemctl("restart", SERVICE)
     except hms.HueError as e:
         pairing.update(state="error", message=str(e))
+
+
+def plan_info(area_id):
+    cfg = hms.load_config_or_none()
+    if not cfg:
+        raise hms.HueError("Pont non appairé.")
+    area = next((a for a in hms.get_areas(cfg) if a["id"] == area_id), None)
+    if not area:
+        raise hms.HueError("Zone introuvable.")
+    plans = get_settings().get("plans") or {}
+    return {"id": area_id, "name": area.get("metadata", {}).get("name", "Zone"),
+            "channels": hms.channel_info(cfg, area), "plan": plans.get(area_id) or {}}
+
+
+def save_plan(body):
+    """Plan d'une pièce : réglages de l'éditeur + position calculée de chaque canal."""
+    aid = str(body.get("id", ""))[:64]
+    if not aid:
+        raise ValueError("Zone manquante.")
+    num = lambda v, lo, hi: max(lo, min(hi, round(float(v), 4)))
+    ch = {}
+    for k, q in (body.get("ch") or {}).items():
+        ch[str(int(k))] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1)}
+    rubans = {}
+    for dev, r in (body.get("rubans") or {}).items():
+        rubans[str(dev)[:64]] = {"walls": int(num(r.get("walls", 4), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
+                                 "dir": 1 if r.get("dir", 1) >= 0 else -1}
+    spots = {str(int(k)): [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    if body.get("reset"):
+        plans.pop(aid, None)
+    else:
+        plans[aid] = {"ch": ch, "rubans": rubans, "spots": spots}
+    s["plans"] = plans
+    write_json(SETTINGS_PATH, s)
+    return {"ok": True}
 
 
 ZONE_KEYS = ("palette", "intensity", "fx", "mode", "speed", "layers", "brightness")
@@ -2435,6 +2504,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, lights_state())
             except hms.HueError as e:
                 return self._send(502, {"error": str(e)})
+        if path == "/api/plan":
+            try:
+                aid = (self.path.split("area=", 1) + [""])[1].split("&")[0]
+                from urllib.parse import unquote
+                return self._send(200, plan_info(unquote(aid)))
+            except hms.HueError as e:
+                return self._send(502, {"error": str(e)})
         if path == "/api/rooms":
             try:
                 return self._send(200, rooms_state())
@@ -2483,6 +2559,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, fn(body))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
+            if path == "/api/plan":
+                return self._send(200, save_plan(body))
             if path == "/api/palettes":
                 return self._send(200, save_palette(body))
             if path == "/api/palettes/delete":
@@ -2671,6 +2749,14 @@ a{color:var(--blue);text-decoration:none}
 .cover .glow{position:absolute;inset:-20%;filter:blur(30px);transition:background .25s}
 .cover .lights{position:absolute;inset:0}
 .cover .lights i{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;transition:background .12s,box-shadow .12s,transform .12s}
+.room{position:relative;background:#141518;border-radius:20px;padding:26px 10px 10px;border:1px solid #2c2d32}
+.room .front{position:absolute;top:8px;left:0;right:0;text-align:center;font-size:10px;letter-spacing:2px;color:var(--t3);font-weight:700}
+.room svg{display:block;width:100%;height:auto;touch-action:none;user-select:none}
+.room .spot{cursor:grab}
+.rcard{background:var(--card);border-radius:18px;padding:14px 14px 16px;margin-top:14px}
+.rcard .h{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.rcard .h b{font-size:17px}.rcard .h small{color:var(--t2);font-size:13px}
+.rcard .lb{color:var(--t2);font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin:12px 2px 6px}
 .coverwrap{position:relative;width:min(62vw,240px);aspect-ratio:1}
 .stage>*:not(.coverwrap){position:relative;z-index:1}
 .coverwrap .halo{position:absolute;inset:-22%;opacity:0;transition:opacity .4s;pointer-events:none}
@@ -2841,6 +2927,23 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
     </div>
   </section>
 
+  <!-- PLANS DES PIÈCES -->
+  <section class="view" data-view="plans">
+    <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Plans des pièces</span></div>
+    <p class="note" style="padding:16px 20px 4px">Place tes lampes comme dans la vraie pièce : les effets (Comète, Vague, Stéréo…) suivent ce plan.</p>
+    <div class="list" id="plansList" style="margin-top:10px"></div>
+  </section>
+  <section class="view" data-view="plan">
+    <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t" id="planTitle">Plan</span><button class="txtbtn" id="planSave">OK</button></div>
+    <div class="pad" style="padding-top:14px">
+      <div class="room"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg></div>
+      <p class="hint" id="planHint" style="margin:10px 4px 0">Fais glisser les lampes sur le plan.</p>
+      <div id="planRubans"></div>
+      <button class="row" id="planReset" style="margin-top:18px;background:var(--card);border-radius:16px;min-height:56px;justify-content:center;color:var(--blue);font-weight:600">Reprendre les positions de l'app Hue</button>
+      <div style="height:30px"></div>
+    </div>
+  </section>
+
   <!-- RÉGLAGES AVANCÉS -->
   <section class="view" data-view="avances">
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Réglages avancés</span><button class="txtbtn" id="advReset">Rétablir</button></div>
@@ -2877,6 +2980,7 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
     <div class="list">
       <button class="row" id="bridgeRow"><span class="ic" data-i="pont"></span><span class="bd"><span class="tx"><span class="t1">Pont d'éclairage</span><span class="t2" id="bridgeSub">—</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="lampsRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Lampes de la synchro</span><span class="t2" id="lampsSub">Zone utilisée pour la musique</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
+      <button class="row" id="plansRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Plans des pièces</span><span class="t2">Où sont tes lampes et ton ruban</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="syncRow" role="switch"><span class="ic" data-i="sync"></span><span class="bd"><span class="tx"><span class="t1">Synchro active</span><span class="t2" id="syncSub">—</span></span><span class="sw" id="syncSw"><i></i></span></span></button>
     </div>
     <div class="label">Son · AirPlay</div>
@@ -3112,7 +3216,7 @@ function slider(el, onValue, onEnd) {
 function setSl(el, t) { t = Math.max(0, Math.min(1, t)); el.querySelector(".fi").style.width = t * 100 + "%"; el.querySelector(".kn").style.left = t * 100 + "%"; }
 
 /* =================== NAVIGATION =================== */
-const TAB_OF = { sync: "sync", avances: "sync", lumieres: "lumieres", piece: "lumieres", lampe: "lumieres", creer: "lumieres", reglages: "reglages" };
+const TAB_OF = { sync: "sync", avances: "sync", lumieres: "lumieres", piece: "lumieres", lampe: "lumieres", creer: "lumieres", reglages: "reglages", plans: "reglages", plan: "reglages" };
 let route = { v: "sync", arg: "" }, backTo = [];
 function go(v, arg = "", push = true) {
   if (push && route.v !== v) backTo.push({ ...route });
@@ -3136,7 +3240,86 @@ function render() {
   if (v === "lampe") renderLampe();
   if (v === "creer") renderCreer();
   if (v === "reglages") renderReglages();
+  if (v === "plans") renderPlans();
+  if (v === "plan") renderPlan();
 }
+
+/* =================== PLANS DES PIÈCES =================== */
+let PLAN = null, PED = null, planDrag = null;
+$("#plansRow").onclick = () => go("plans");
+function renderPlans() {
+  const el = $("#plansList");
+  if (!zones) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">Chargement…</span></span></div>`; return; }
+  if (zones.error || !zones.length) { el.innerHTML = `<div class="row"><span class="bd" style="padding-left:16px"><span class="t2">${esc(zones.error || "Aucune zone de divertissement")}</span></span></div>`; return; }
+  const plans = S.settings.plans || {};
+  el.innerHTML = zones.map(z => `<button class="row" data-plan="${esc(z.id)}"><span class="ic">${icon("zones")}</span><span class="bd"><span class="tx"><span class="t1">${esc(z.name)}</span><span class="t2">${Object.entries(z.kinds || {}).map(([k, n]) => `${KIND_N[k] || k} ${n}`).join(" · ") || z.lights + " lampes"}${plans[z.id] ? " · plan personnalisé" : ""}</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>`).join("");
+  $$("[data-plan]").forEach(b => b.onclick = () => go("plan", b.dataset.plan));
+}
+const PM = 0.07, PC = [[PM, PM], [1 - PM, PM], [1 - PM, 1 - PM], [PM, 1 - PM]];
+function perim(sv) { sv = ((sv % 4) + 4) % 4; const e = Math.floor(sv) % 4, f = sv - Math.floor(sv), a = PC[e], b = PC[(e + 1) % 4]; return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]; }
+function planDevs() {   // lampes à plusieurs segments (rubans) et lampes simples
+  const by = {}; PLAN.channels.forEach(c => (by[c.dev] = by[c.dev] || []).push(c));
+  const rub = [], single = [];
+  Object.entries(by).forEach(([d, cs]) => (cs.length > 1 ? rub : single).push([d, cs.sort((a, b) => a.idx - b.idx || a.id - b.id)]));
+  return { rub, single };
+}
+function planLayout() {  // positions à l'écran (0-1) et ordre de parcours de chaque canal
+  const { rub, single } = planDevs(), pos = {};
+  rub.forEach(([d, cs]) => { const r = PED.rubans[d], n = cs.length; cs.forEach((c, i) => { const u = (i + .5) / n; pos[c.id] = { p: perim(r.corner + r.dir * u * r.walls), t: u, dev: d, i, n }; }); });
+  single.forEach(([d, cs]) => cs.forEach(c => { const q = PED.spots[c.id]; pos[c.id] = { p: q, t: q[0], dev: d }; }));
+  return pos;
+}
+async function renderPlan() {
+  const id = route.arg;
+  if (!PLAN || PLAN.id !== id) {
+    $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
+    try { PLAN = await api("/api/plan?area=" + encodeURIComponent(id)); } catch (e) { toast(e.message); return; }
+    const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
+    PED = { rubans: {}, spots: {} };
+    const { rub, single } = planDevs();
+    rub.forEach(([d]) => PED.rubans[d] = { walls: 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
+    single.forEach(([, cs]) => cs.forEach(c => PED.spots[c.id] = (pl.spots || {})[c.id] || [clamp((c.x + 1) / 2), clamp((1 - c.y) / 2)]));
+  }
+  $("#planTitle").textContent = "Plan · " + PLAN.name;
+  drawPlan();
+  const { rub, single } = planDevs();
+  $("#planHint").textContent = single.length ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
+  const seg = (k, d, opts, cur) => `<div class="seg">${opts.map(([v, n]) => `<button data-rk="${k}" data-rd="${esc(d)}" data-rv="${v}" class="${cur === v ? "on" : ""}">${n}</button>`).join("")}</div>`;
+  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${cs.length} segments</small></span></div>
+    <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
+    <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
+    <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}</div>`; }).join("");
+  $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); });
+}
+function drawPlan() {
+  const pos = planLayout(), pal = palColors(S.settings.palette), W = 100, H = 75, X = p => p[0] * W, Y = p => p[1] * H;
+  let h = `<rect x="${PM * W}" y="${PM * H}" width="${(1 - 2 * PM) * W}" height="${(1 - 2 * PM) * H}" rx="2" fill="none" stroke="#3a3b40" stroke-width=".5" stroke-dasharray="1.5 1.5"/>`;
+  h += `<rect x="38" y="1.2" width="24" height="1.6" rx=".8" fill="#4a4b52"/>`;
+  const { rub, single } = planDevs();
+  rub.forEach(([d, cs]) => {
+    const r = PED.rubans[d], pts = []; for (let k = 0; k <= 60; k++) pts.push(perim(r.corner + r.dir * k / 60 * r.walls));
+    h += `<polyline points="${pts.map(p => X(p).toFixed(1) + "," + Y(p).toFixed(1)).join(" ")}" fill="none" stroke="#2a2b30" stroke-width="3.2" stroke-linecap="round"/>`;
+    cs.forEach((c, i) => { const q = pos[c.id], col = boost(pal[Math.min(pal.length - 1, Math.floor(i / cs.length * pal.length))], 190); h += `<circle cx="${X(q.p)}" cy="${Y(q.p)}" r="1.9" fill="${col}"/>`; });
+    const a = perim(r.corner + r.dir * .02 * r.walls), b = perim(r.corner + r.dir * .12 * r.walls), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = perim(r.corner);
+    h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
+  });
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, col = boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
+    h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
+  const svg = $("#planSvg"); svg.innerHTML = h;
+  svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = +g.dataset.spot; svg.setPointerCapture(e.pointerId); });
+  svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
+  svg.onpointerup = svg.onpointercancel = () => { planDrag = null; };
+}
+$("#planSave").onclick = async () => {
+  const pos = planLayout(), ch = {};
+  PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
+  try { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } }; toast("Plan enregistré"); back(); }
+  catch (e) { toast("Échec : " + e.message); }
+};
+$("#planReset").onclick = async () => {
+  try { await api("/api/plan", { id: PLAN.id, reset: true }); const p = { ...(S.settings.plans || {}) }; delete p[PLAN.id]; S.settings.plans = p; PLAN = null; toast("Positions de l'app Hue reprises"); renderPlan(); }
+  catch (e) { toast("Échec : " + e.message); }
+};
 
 /* =================== FEUILLES =================== */
 function openSheet(id) { $("#sheetBg").classList.add("open"); $("#" + id).classList.add("open"); renderSheets(); }
