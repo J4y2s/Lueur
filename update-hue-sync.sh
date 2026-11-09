@@ -304,8 +304,12 @@ def kind_of(archetype, product="", channels_on_device=1):
 def channel_info(cfg, area):
     """Canaux d'une zone avec leur lampe : [{id, kind, dev, name, archetype, idx, x, y}].
     idx = numéro du segment le long d'un ruban (ordre réel des segments)."""
-    ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in bridge_get(cfg, "entertainment")}
+    ents = bridge_get(cfg, "entertainment")
+    ent_owner = {e["id"]: e.get("owner", {}).get("rid") for e in ents}
+    ent_seg = {e.get("owner", {}).get("rid"): e.get("segments") or {} for e in ents}
     devices = {d["id"]: d for d in bridge_get(cfg, "device")}
+    lights = bridge_get(cfg, "light")
+    dev_light = {l.get("owner", {}).get("rid"): l for l in lights}
     rows = []
     for ch in area.get("channels", []):
         mem = (ch.get("members") or [{}])[0]
@@ -320,6 +324,12 @@ def channel_info(cfg, area):
         r["name"] = md.get("name", "Lampe")
         r["archetype"] = md.get("archetype", "")
         r["segments"] = per_dev[r["dev"]]
+        lt = dev_light.get(r["dev"], {})
+        sg = ent_seg.get(r["dev"], {})
+        r["light"] = lt.get("id")
+        r["max_segments"] = sg.get("max_segments")
+        r["grad_points"] = (lt.get("gradient") or {}).get("points_capable")
+        r["pixels"] = (lt.get("gradient") or {}).get("pixel_count")
     return rows
 
 
@@ -506,7 +516,12 @@ class HueStream:
         msg = bytearray(b"HueStream")
         msg += bytes([0x02, 0x00, self.seq & 0xFF, 0x00, 0x00, 0x00, 0x00])  # v2.0, RVB
         msg += self.area_id
-        for ch, r, g, b in colors[:20]:
+        # Un message HueStream porte 20 canaux au plus. Au-delà, on envoie les paquets à tour
+        # de rôle, un par image (deux écritures d'affilée pourraient être fusionnées par openssl).
+        if len(colors) > 20:
+            chunks = [colors[i:i + 20] for i in range(0, len(colors), 20)]
+            colors = chunks[self.seq % len(chunks)]
+        for ch, r, g, b in colors:
             msg += struct.pack(">BHHH", ch,
                                int(max(0, min(1, r)) * 65535),
                                int(max(0, min(1, g)) * 65535),
@@ -768,6 +783,7 @@ class Effects:
         self.vu = 0.0
         self.vu_peak = 0.0
         self.phase = 0.0
+        self.push = 0.0                  # élan donné par la grosse caisse (effet Glissé)
         self.lr_ref = 1e-3
         self.bavg = {}                   # niveau moyen récent de chaque bande (~1 s)
         self.dyn = {"bass": 0.0, "mid": 0.0, "high": 0.0, "all": 0.0}
@@ -856,24 +872,46 @@ class Effects:
         if mode == "comete":
             if beat:
                 d = 1 if (self.beat_count % 2 or n == 1) else -1
-                self.comets.append([0.0 if d > 0 else 1.0, d, self.palette[self.color_idx % len(self.palette)],
+                s0 = 0.5 / max(n - 1, 1)                  # part juste avant le premier segment : entrée en fondu
+                self.comets.append([-s0 if d > 0 else 1.0 + s0, d, self.palette[self.color_idx % len(self.palette)],
                                     0.6 + 0.4 * strength])
             v = 1.4 * sp                                   # longueur du ruban par seconde
             for c in self.comets:
                 c[0] += c[1] * v * dt
             self.comets = [c for c in self.comets if -0.4 < c[0] < 1.4][-6:]
-            tail = 0.22 + 0.12 * (1 - p["base"])
+            seg = 1.0 / max(n - 1, 1)                      # écart entre deux segments
+            tail = max(0.22 + 0.12 * (1 - p["base"]), 2.5 * seg)
+            front = 0.9 * seg                              # la tête arrive en fondu dans le bloc suivant
             for x in pos:
                 col, b = self.palette[self.color_idx % len(self.palette)] * 1.0, 0.04 + 0.25 * p["base"]
                 for c in self.comets:
                     behind = (c[0] - x) * c[1]                # distance derrière la tête
-                    if -0.04 <= behind <= tail:
-                        k = c[3] * (1 - max(0.0, behind) / tail) ** 1.6
+                    if -front <= behind <= tail:
+                        k = c[3] * ((1 - behind / tail) ** 1.6 if behind >= 0 else 1 + behind / front)
                         if n == 1:
                             k = c[3] * max(0.0, 1 - abs(c[0] - 0.5) * 2)
                         if k > b:
                             b, col = k, c[2]
                 res.append((col, b, True))
+            # luminosité lissée par segment : montée rapide, descente douce (glisse sans saut)
+            if getattr(self, "bsm", None) is None or len(self.bsm) != n:
+                self.bsm = np.zeros(n)
+            for i, (col, b, q) in enumerate(res):
+                a = 0.45 if b > self.bsm[i] else 0.18
+                self.bsm[i] += (b - self.bsm[i]) * a
+                res[i] = (col, self.bsm[i], q)
+
+        elif mode == "glisse":
+            # La palette glisse en continu le long des lampes ; chaque grosse caisse donne un élan
+            # qui accélère puis s'amortit. Couleurs interpolées : passage en fondu d'un segment à l'autre.
+            if beat:
+                self.push = min(3.0, self.push + 0.9 + 1.2 * strength)
+            self.push *= np.exp(-dt / 0.45)
+            self.phase += dt * sp * (0.05 + 0.10 * energy + 0.22 * self.push)
+            span = 0.9 if n > 1 else 0.0
+            for i, x in enumerate(pos):
+                b = 0.45 + 0.2 * p["base"] + 0.25 * lvl + 0.15 * min(1.0, self.push)
+                res.append((self.palette_at(self.phase - x * span), b, True))
 
         elif mode == "vague":
             self.phase += dt * 0.07 * sp * (0.6 + 0.8 * energy)
@@ -1278,11 +1316,11 @@ class Session:
 # ---------------------------------------------------------------------------
 # Commande "run"
 # ---------------------------------------------------------------------------
-MODES = ("pulse", "spectrum", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
+MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
 SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
 
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
-                     "layers": {}, "plans": {},
+                     "layers": {}, "plans": {}, "test": {},
                      "brightness": 1.0, "idle_release": 15,
                      "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}}
 
@@ -1291,7 +1329,7 @@ def load_settings(path, args):
     """Réglages : fichier JSON (modifiable à chaud par l'interface web) sinon ligne de commande."""
     s = {"area": args.area or "", "palette": args.palette, "intensity": args.intensity,
          "mode": args.mode, "brightness": args.brightness, "idle_release": args.idle_release,
-         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}, "plans": {}}
+         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}, "plans": {}, "test": {}}
     if path and os.path.exists(path):
         try:
             with open(path) as f:
@@ -1485,6 +1523,24 @@ def cmd_run(args):
             limit = settings["idle_release"] if not airplay_on else max(settings["idle_release"], 600)
             if settings["idle_release"] > 0 and now - silent_since > limit:
                 session.release("silence")
+            test = settings.get("test") if isinstance(settings.get("test"), dict) else {}
+            if test.get("area") == area.get("id") and test.get("until", 0) > time.time():
+                # Test de l'ordre : un point blanc parcourt les lampes dans l'ordre que suivent les
+                # effets (début en rouge, fin en bleu), même sans musique.
+                session.acquire()
+                silent_since = now
+                order = [c["channel_id"] for c in sorted(plan_channels(area, settings["plans"]),
+                                                         key=lambda c: c["position"]["x"])]
+                n = len(order)
+                head = (now * 2.5) % max(n, 1)
+                colors = []
+                for k, cid in enumerate(order):
+                    d = (head - k) % n
+                    w = 1.0 if d < 1 else 0.35 if d < 2 else 0.0
+                    base = (0.5, 0.0, 0.0) if k == 0 else (0.0, 0.0, 0.5) if k == n - 1 else (0.02, 0.02, 0.03)
+                    colors.append((cid, *(max(b, w) for b in base)))
+                session.send(colors)
+                continue
             colors = fx.update(rms, bands, beat, strength)
             # Le Bluetooth joue le son en retard : on retarde les lumières d'autant
             delay = int(settings["bt_offset_ms"] / 20) if player and player.playing else 0
@@ -1750,7 +1806,8 @@ def room_plan_info(rid):
     chs, n = [], len(room["lights"])
     for i, l in enumerate(room["lights"]):
         p = l.get("pos") or {"x": round(-0.7 + 1.4 * i / max(1, n - 1), 3) if n > 1 else 0, "y": 0}
-        base = {"dev": l["id"], "name": l["name"], "archetype": l["archetype"], "x": p["x"], "y": p["y"]}
+        base = {"dev": l["id"], "light": l["id"], "name": l["name"], "archetype": l["archetype"], "x": p["x"], "y": p["y"],
+                "grad_points": GRAD_POINTS if l.get("has_gradient") else None}
         if l.get("has_gradient"):                   # un ruban : on le trace le long des murs
             chs += [dict(base, id=f"{l['id']}#{k}", idx=k) for k in range(GRAD_POINTS)]
         else:
@@ -1797,6 +1854,55 @@ def save_plan(body):
     s["plans"] = plans
     write_json(SETTINGS_PATH, s)
     return {"ok": True}
+
+
+def plan_test(body):
+    """Zone de synchro : un point blanc parcourt les lampes dans l'ordre des effets (15 s)."""
+    aid = str(body.get("id", ""))[:64]
+    s = get_settings()
+    s["test"] = {"area": aid, "until": time.time() + 15} if not body.get("stop") else {}
+    write_json(SETTINGS_PATH, s)
+    active = service_state()["active"]
+    return {"ok": True, "running": active, "area_selected": s.get("area") in ("", aid)}
+
+
+identify_jobs = {}
+
+
+def identify_light(body):
+    """Ruban : début en rouge, fin en bleu pendant 10 s, puis retour à l'état d'avant."""
+    cfg = _cfg()
+    lid = str(body.get("light", ""))
+    l = next((x for x in hms.bridge_get(cfg, "light") if x["id"] == lid), None)
+    if not l:
+        raise ValueError("Lampe introuvable.")
+    n = (l.get("gradient") or {}).get("points_capable") or 0
+    if n < 2:
+        raise ValueError("Cette lampe n'a pas de dégradé.")
+    marks = ["#ff0000", "#ff6a00", "#ffffff", "#00b4ff", "#0000ff"][:n] if n >= 5 else ["#ff0000", "#0000ff"]
+    before = {"on": {"on": l.get("on", {}).get("on", False)}}
+    if l.get("dimming"):
+        before["dimming"] = {"brightness": l["dimming"].get("brightness", 100)}
+    pts = (l.get("gradient") or {}).get("points") or []
+    if pts:
+        before["gradient"] = {"points": pts}
+    elif (l.get("color") or {}).get("xy"):
+        before["color"] = {"xy": l["color"]["xy"]}
+    _put(cfg, "light", lid, {"on": {"on": True}, "dimming": {"brightness": 100},
+                              "gradient": {"points": [{"color": {"xy": dict(zip("xy", hex_to_xy(c)))}} for c in marks]}})
+    gen = identify_jobs.get(lid, 0) + 1
+    identify_jobs[lid] = gen
+
+    def restore():
+        time.sleep(10)
+        if identify_jobs.get(lid) != gen:
+            return
+        try:
+            _put(cfg, "light", lid, before)
+        except hms.HueError:
+            pass
+    threading.Thread(target=restore, daemon=True).start()
+    return {"ok": True, "points": n}
 
 
 ZONE_KEYS = ("palette", "intensity", "fx", "mode", "speed", "layers", "brightness")
@@ -1985,6 +2091,7 @@ def _light_view(l, positions):
         "has_color": "color" in l, "has_gradient": bool(l.get("gradient", {}).get("points_capable")),
         "pos": (positions.get(l["id"]) or {}).get("pos") if "pos" in (positions.get(l["id"]) or {}) else positions.get(l["id"]),
         "path": (positions.get(l["id"]) or {}).get("path"),
+        "line": (positions.get(l["id"]) or {}).get("line"),
     }
 
 
@@ -2042,9 +2149,10 @@ def rooms_state(force=True):
             for lid, q in (pl.get("spots") or {}).items():
                 pos_r[lid] = to_hue(q[0], q[1])
             for lid, rb in (pl.get("rubans") or {}).items():
-                pts = [to_hue(*perim(rb["corner"] + rb["dir"] * (k + .5) / GRAD_POINTS * rb["walls"]))
-                       for k in range(GRAD_POINTS)]
-                pos_r[lid] = {"pos": pts[GRAD_POINTS // 2], "path": pts}
+                at = lambda u: to_hue(*perim(rb["corner"] + rb["dir"] * u * rb["walls"]))
+                pts = [at(k / (GRAD_POINTS - 1)) for k in range(GRAD_POINTS)]   # points du dégradé, du début à la fin
+                line = [at(k / 48) for k in range(49)]                          # tracé fin (coins compris)
+                pos_r[lid] = {"pos": pts[GRAD_POINTS // 2], "path": pts, "line": line}
             ls = [_light_view(lights[i], pos_r) for i in dict.fromkeys(ids) if i in lights]
             if not ls:
                 continue
@@ -2101,6 +2209,56 @@ def _lum(h):
 
 
 room_jobs = {}        # pièce -> numéro du dernier envoi (un nouveau choix annule l'ancien)
+SCENE_NAME = "Lueur"
+
+
+def _rid(res):
+    try:
+        return res["data"][0]["rid"]
+    except (KeyError, IndexError, TypeError):
+        raise hms.HueError(f"Réponse inattendue du pont : {str(res)[:200]}")
+
+
+def dynamic_scene(cfg, room, jobs, colors, speed):
+    """Crée (ou met à jour) la scène « Lueur » de la pièce avec la palette, puis la lance en mode
+    dynamique : le pont anime lui-même les couleurs à la vitesse demandée (0-1)."""
+    bri = {l["id"]: max(1.0, float(l.get("bri") or 100)) for l in room["lights"]}
+    actions = []
+    for lid, b in jobs:
+        a = {"on": {"on": True}, "dimming": {"brightness": bri.get(lid, 100.0)}}
+        for k in ("color", "gradient"):
+            if k in b:
+                a[k] = b[k]
+        actions.append({"target": {"rid": lid, "rtype": "light"}, "action": a})
+    palette = {"color": [{"color": {"xy": dict(zip("xy", hex_to_xy(c)))}, "dimming": {"brightness": 100.0}}
+                         for c in colors[:9]],
+               "dimming": [], "color_temperature": []}
+    group = {"rid": room["id"], "rtype": room.get("type", "room")}
+    existing = next((sc for sc in hms.bridge_get(cfg, "scene")
+                     if sc.get("metadata", {}).get("name") == SCENE_NAME and sc.get("group", {}).get("rid") == room["id"]), None)
+    body = {"actions": actions, "palette": palette, "speed": speed, "auto_dynamic": True}
+    req = lambda method, path, b: hms.bridge_request(cfg["bridge"], method, path, key=cfg["username"], body=b)
+    try:
+        if existing:
+            req("PUT", f"/clip/v2/resource/scene/{existing['id']}", body)
+            sid = existing["id"]
+        else:
+            res = req("POST", "/clip/v2/resource/scene",
+                      dict(body, type="scene", metadata={"name": SCENE_NAME}, group=group))
+            sid = _rid(res)
+    except hms.HueError as e:
+        if "effects" not in str(e):
+            raise
+        body["palette"]["effects"] = []          # certains ponts exigent aussi la liste des effets
+        if existing:
+            req("PUT", f"/clip/v2/resource/scene/{existing['id']}", body)
+            sid = existing["id"]
+        else:
+            res = req("POST", "/clip/v2/resource/scene",
+                      dict(body, type="scene", metadata={"name": SCENE_NAME}, group=group))
+            sid = _rid(res)
+    req("PUT", f"/clip/v2/resource/scene/{sid}", {"recall": {"action": "dynamic_palette"}})
+
 
 
 def room_palette(body):
@@ -2130,33 +2288,84 @@ def room_palette(body):
             return ((math.atan2(-y, x) + math.pi * 1.5) % (2 * math.pi)) / (2 * math.pi)
         return (x + 1) / 2
 
-    def pick(t):
-        return colors[int(max(0.0, min(0.999, t)) * len(colors))]
+    rgb = [tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in colors]
+    hexc = lambda v: "#%02x%02x%02x" % tuple(max(0, min(255, round(x))) for x in v)
+
+    def mix(a, b, f):                       # mélange par la teinte (le chemin le plus court) : reste vif
+        ha, la, sa = colorsys.rgb_to_hls(*(v / 255 for v in a))
+        hb, lb, sb = colorsys.rgb_to_hls(*(v / 255 for v in b))
+        if sa < 0.08:
+            ha = hb
+        if sb < 0.08:
+            hb = ha
+        dh = ((hb - ha + 0.5) % 1.0) - 0.5
+        r_, g_, b_ = colorsys.hls_to_rgb((ha + dh * f) % 1.0, la + (lb - la) * f, sa + (sb - sa) * f)
+        return (r_ * 255, g_ * 255, b_ * 255)
+
+    def pal_at(t):                          # une vraie couleur de la palette (jamais de mélange inventé)
+        t = max(0.0, min(1.0, t))
+        if spread == "tour":
+            return rgb[int(round(t * len(rgb))) % len(rgb)]
+        return rgb[min(len(rgb) - 1, int(round(t * (len(rgb) - 1))))]
+
+    def along(grad, u):                     # couleur du point du ruban le plus proche de la fraction u
+        return grad[int(round(max(0.0, min(1.0, u)) * (len(grad) - 1)))]
 
     result, jobs = {}, []
-    by_lum = sorted(colors, key=_lum)
+    by_lum = sorted(rgb, key=lambda v: 0.3 * v[0] + 0.59 * v[1] + 0.11 * v[2])
+    strips = []                             # (tracé, dégradé) des rubans placés, pour la continuité
+    for i, l in enumerate(ls):
+        if not l.get("has_gradient"):
+            continue
+        if l.get("path"):                   # palette étalée le long du ruban (en boucle s'il fait le tour)
+            pth, n, G = l["path"], len(rgb), len(l["path"])
+            loop = abs(pth[0]["x"] - pth[-1]["x"]) < 1e-3 and abs(pth[0]["y"] - pth[-1]["y"]) < 1e-3
+            if loop:
+                grad = [rgb[(k * n // (G - 1)) % n] for k in range(G)]
+            else:
+                grad = [rgb[round(k * (n - 1) / (G - 1))] for k in range(G)]
+            if l.get("line"):
+                strips.append((l["line"], grad))
+        else:                               # pas de plan : du plus foncé au plus clair
+            grad = [along(by_lum, k / (GRAD_POINTS - 1)) for k in range(GRAD_POINTS)]
+        gh = [hexc(c) for c in grad]
+        gxy = [hex_to_xy(c) for c in gh]
+        jobs.append((l["id"], {"on": {"on": True}, "gradient": {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}}))
+        APPLIED[l["id"]] = {"grad": gh, "gxy": gxy}
+        result[l["id"]] = {"gradient": gh, "color": gh[len(gh) // 2]}
+
+    def near_strip(p):                      # spot : la couleur du ruban juste à côté de lui
+        best = None
+        for line, grad in strips:
+            for k, q in enumerate(line):
+                d = (q["x"] - p["x"]) ** 2 + (q["y"] - p["y"]) ** 2
+                if best is None or d < best[0]:
+                    best = (d, along(grad, k / (len(line) - 1)))
+        return best[1] if best else None
+
     for i, l in enumerate(ls):
         if l.get("has_gradient"):
-            if l.get("path"):
-                grad = [pick(t_of(i, p)) for p in l["path"]]
-            else:                           # du plus foncé au plus clair le long du ruban
-                n = min(GRAD_POINTS, max(2, len(by_lum)))
-                grad = [by_lum[round(k * (len(by_lum) - 1) / (n - 1))] for k in range(n)]
-            gxy = [hex_to_xy(c) for c in grad]
-            body_l = {"on": {"on": True}, "gradient": {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}}
-            APPLIED[l["id"]] = {"grad": grad, "gxy": gxy}
-            result[l["id"]] = {"gradient": grad, "color": grad[len(grad) // 2]}
-        elif l.get("has_color"):
-            c = pick(t_of(i, l.get("pos")))
+            continue
+        if l.get("has_color"):
+            c = (near_strip(l["pos"]) if strips and l.get("pos") else None) or pal_at(t_of(i, l.get("pos")))
+            c = hexc(c)
             x, y = hex_to_xy(c)
-            body_l = {"on": {"on": True}, "color": {"xy": {"x": x, "y": y}}}
+            jobs.append((l["id"], {"on": {"on": True}, "color": {"xy": {"x": x, "y": y}}}))
             APPLIED[l["id"]] = {"xy": (x, y), "hex": c}
             result[l["id"]] = {"color": c}
         else:
-            body_l = {"on": {"on": True}}
-        jobs.append((l["id"], body_l))
+            jobs.append((l["id"], {"on": {"on": True}}))
     gen = room_jobs.get(room["id"], 0) + 1
     room_jobs[room["id"]] = gen
+    try:
+        speed = float(body.get("speed") or 0)
+    except (TypeError, ValueError):
+        speed = 0.0
+    if speed > 0:
+        # Scène animée : le pont fait lui-même glisser la palette, au niveau des LED du ruban
+        dynamic_scene(cfg, room, jobs, colors, max(0.05, min(1.0, speed)))
+        rooms_cache["t"] = 0
+        return {"ok": True, "lights": result, "ms": 0, "animated": True}
 
     def send():
         for lid, b in jobs:
@@ -2731,6 +2940,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(502, {"error": str(e)})
             if path == "/api/plan":
                 return self._send(200, save_plan(body))
+            if path == "/api/plan/test":
+                return self._send(200, plan_test(body))
+            if path == "/api/plan/identify":
+                try:
+                    return self._send(200, identify_light(body))
+                except hms.HueError as e:
+                    return self._send(502, {"error": str(e)})
             if path == "/api/palettes":
                 return self._send(200, save_palette(body))
             if path == "/api/palettes/delete":
@@ -2882,6 +3098,7 @@ a{color:var(--blue);text-decoration:none}
 
 /* tuile lampe */
 .lamp{border-radius:18px;border:2px solid transparent;overflow:hidden;display:flex;flex-direction:column;background:#2a2b30;transition:background .3s}
+.lamp,.room,.rhead{background-origin:border-box!important;background-clip:border-box!important}
 .lamp .top{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 6px 10px;color:inherit;text-align:center}
 .lamp .top span{font-size:15px;font-weight:600;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lamp .pw{display:flex;justify-content:center;padding:6px 0 14px}
@@ -3001,6 +3218,7 @@ body.locked{overflow:hidden}
 .spr span{color:var(--t2);font-size:13px}
 .spr .seg{background:var(--card);grid-auto-columns:40px}
 .spr .seg button{padding:5px 0;display:grid;place-items:center}
+.spr .seg.wide{grid-auto-columns:minmax(0,1fr)}.spr .seg.wide button{padding:8px 0;font-size:14px}
 
 /* ---- roue des couleurs ---- */
 .wheel{position:relative;width:min(76vw,290px);aspect-ratio:1;margin:18px auto 0;border-radius:50%;touch-action:none;background:conic-gradient(from 90deg,#f00,#ff8000,#ff0,#80ff00,#0f8,#0ff,#0080ff,#80f,#f0f,#ff0080,#f00);box-shadow:0 18px 50px rgba(0,0,0,.55)}
@@ -3315,6 +3533,7 @@ const PAL_N = { sunset: "Coucher", ocean: "Océan", neon: "Néon", fire: "Feu", 
 const EFFECTS = [
   ["pulse", "Pulsation", "Tout bat ensemble sur le rythme", true],
   ["spectrum", "Spectre étalé", "Graves d'un côté, aigus de l'autre", true],
+  ["glisse", "Glissé", "La palette coule le long du ruban, poussée par le rythme", true],
   ["comete", "Comète", "Une traînée court le long du ruban", true],
   ["vague", "Vague", "La palette défile, sans flash", true],
   ["vumetre", "Vu-mètre", "Se remplit avec le volume", true],
@@ -3325,7 +3544,7 @@ const EFFECTS = [
 
 const SPEEDS = [[0.5, "Demi-temps"], [1, "Normale"], [2, "Double"]];
 const SPEED_D = { pulse: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.", spectrum: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.",
-  comete: "Vitesse de la traînée et nombre de départs.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
+  comete: "Vitesse de la traînée et nombre de départs.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
   stereo: "Durée des éclats sur les temps.", etincelles: "Durée des éclats.", respiration: "Demi-temps : 16 s par souffle. Double : 4 s." };
 const KIND_N = { ruban: "Ruban", spots: "Spots", play: "Play", lampes: "Lampes" };
 let effTarget = "all";
@@ -3474,11 +3693,26 @@ async function renderPlan() {
   const { rub, single } = planDevs();
   $("#planHint").textContent = single.length ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   const seg = (k, d, opts, cur) => `<div class="seg">${opts.map(([v, n]) => `<button data-rk="${k}" data-rd="${esc(d)}" data-rv="${v}" class="${cur === v ? "on" : ""}">${n}</button>`).join("")}</div>`;
-  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${cs.length} segments</small></span></div>
+  $("#planRubans").innerHTML = rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? `Dégradé à ${cs[0].grad_points || cs.length} points de couleur` : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
+    <div class="seg" style="margin-bottom:4px;background:var(--card2)"><button data-ident="${esc(cs[0].light || "")}">Montrer le début</button>${PLAN.type === "room" ? "" : `<button data-ordre>Tester l'ordre</button>`}</div>
+    <p class="hint" style="margin:6px 2px 0">${PLAN.type === "room" ? "Le ruban s'allume du <b style=\"color:#ff5a4a\">rouge</b> (début) au <b style=\"color:#4b8dff\">bleu</b> (fin) pendant 10 s : place la flèche du plan là où tu vois le rouge." : "« Montrer le début » : rouge au début, bleu à la fin (synchro arrêtée). « Tester l'ordre » : avec la synchro en marche, un point blanc parcourt les segments dans l'ordre des effets, du rouge au bleu."}</p>
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
     <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}</div>`; }).join("");
   $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); });
+  $$("[data-ident]").forEach(b => b.onclick = async () => {
+    if (!b.dataset.ident) return toast("Lampe introuvable sur le pont.");
+    try { await api("/api/plan/identify", { light: b.dataset.ident }); toast("Regarde le ruban : rouge = début, bleu = fin (10 s)"); } catch (e) { toast(e.message); }
+  });
+  $$("[data-ordre]").forEach(b => b.onclick = async () => {
+    try {
+      await savePlanQuiet();
+      const r = await api("/api/plan/test", { id: PLAN.id });
+      if (!r.running) return toast("Démarre la synchro pour tester l'ordre.");
+      if (!r.area_selected) return toast("Choisis cette zone dans l'écran Synchro pour la tester.");
+      toast("Un point blanc parcourt les segments pendant 15 s");
+    } catch (e) { toast(e.message); }
+  });
 }
 function drawPlan() {
   const pos = planLayout(), pal = palColors(S.settings.palette), W = 100, H = 75, X = p => p[0] * W, Y = p => p[1] * H;
@@ -3488,7 +3722,8 @@ function drawPlan() {
   rub.forEach(([d, cs]) => {
     const r = PED.rubans[d], pts = []; for (let k = 0; k <= 60; k++) pts.push(perim(r.corner + r.dir * k / 60 * r.walls));
     h += `<polyline points="${pts.map(p => X(p).toFixed(1) + "," + Y(p).toFixed(1)).join(" ")}" fill="none" stroke="#2a2b30" stroke-width="3.2" stroke-linecap="round"/>`;
-    cs.forEach((c, i) => { const q = pos[c.id], col = boost(pal[Math.min(pal.length - 1, Math.floor(i / cs.length * pal.length))], 190); h += `<circle cx="${X(q.p)}" cy="${Y(q.p)}" r="1.9" fill="${col}"/>`; });
+    cs.forEach((c, i) => { const q = pos[c.id], col = i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade"; const nx = X(q.p), ny = Y(q.p), cx = 50 - nx, cy = 37.5 - ny, k = 4.2 / (Math.hypot(cx, cy) || 1);
+      h += `<circle cx="${nx}" cy="${ny}" r="1.9" fill="${col}"/><text x="${nx + cx * k}" y="${ny + cy * k + 1}" text-anchor="middle" font-size="2.8" font-weight="700" fill="${col}">${i + 1}</text>`; });
     const a = perim(r.corner + r.dir * .02 * r.walls), b = perim(r.corner + r.dir * .12 * r.walls), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = perim(r.corner);
     h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
   });
@@ -3498,6 +3733,12 @@ function drawPlan() {
   svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
   svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
   svg.onpointerup = svg.onpointercancel = () => { planDrag = null; };
+}
+async function savePlanQuiet() {   // enregistre le plan de la zone de synchro (pour tester l'ordre)
+  const pos = planLayout(), ch = {};
+  PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
+  await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots });
+  S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch } };
 }
 $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
@@ -3554,6 +3795,7 @@ function effAnim(fx, i, n, sp) {
   const rnd = [0, .62, .21, .9, .4, .75, .12, .55, .33, .82, .05, .68], k = 1 / (sp || 1), f = v => (v * k).toFixed(2);
   if (fx === "spectrum") return `bar ${(.45 + rnd[i % 12] * .5).toFixed(2)}s ${(-rnd[(i + 3) % 12]).toFixed(2)}s ease-in-out infinite alternate`;
   if (fx === "comete") return `fl ${f(1.4)}s ${f(i * .07)}s infinite`;
+  if (fx === "glisse") return `br ${f(1.6)}s ease-in-out ${f(-i * .16)}s infinite`;
   if (fx === "vague") return `br ${f(2.4)}s ease-in-out ${f(-i * .22)}s infinite`;
   if (fx === "vumetre") return `fl ${f(1.6)}s ${f(i * .06)}s infinite`;
   if (fx === "stereo") return `fl ${f(.9)}s ${i < n / 2 ? 0 : f(.45)}s infinite`;
@@ -3783,10 +4025,10 @@ function renderRooms() {
   if (!ROOMS) return;
   if (ROOMS.error) { g.innerHTML = `<p class="note" style="padding:0 8px">${esc(ROOMS.error)}</p>`; return; }
   g.innerHTML = ROOMS.map((r, i) => {
-    const cs = roomColors(r).map(c => boost(c, 200)), c0 = cs[0] || "#ffe2b8", c1 = cs[1] || cs[0] || "#ffb066";
-    const dark = lum(c1) > .5, fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
+    const rb = roomBg(r), c1 = boost(rb.colors[rb.colors.length - 1], 190);
+    const dark = rb.colors.reduce((a, c) => a + lum(boost(c, 190)), 0) / rb.colors.length > .5, fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
     const head = r.type === "zone" && (i === 0 || ROOMS[i - 1].type !== "zone") ? `<div class="label" style="padding-left:6px">Zones</div>` : "";
-    return head + `<div class="room" style="background:${r.on ? `linear-gradient(135deg, ${lighten(c0, .2)}, ${c1})` : "var(--card)"};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
+    return head + `<div class="room" style="background:${r.on ? rb.css : "var(--card)"};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
       <div class="r1"><button class="rn" data-room="${r.id}" style="display:flex;align-items:center;gap:14px"><span class="ri" style="background:${r.on ? "rgba(255,255,255,.35)" : "var(--card2)"}">${icon(roomKind(r.archetype, r.name), 26)}</span>${esc(r.name)}</button>
       <button class="pwbtn" data-rpow="${r.id}" aria-label="${r.on ? "Éteindre" : "Allumer"} ${esc(r.name)}" style="background:${r.on ? "rgba(255,255,255,.75)" : "var(--card2)"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div>
       ${r.on ? `<div class="sl" data-rbri="${r.id}"><div class="tr" style="background:rgba(0,0,0,.15)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>`;
@@ -3806,14 +4048,36 @@ async function roomPower(id) {
 
 /* ----- une pièce ----- */
 let spread = load("spread") || "lr", scenePick = {};
+let ANIM = {}; try { ANIM = JSON.parse(load("anim") || "{}"); } catch (e) {}
+const ANIMS = [[0, "Fixe"], [0.25, "Lente"], [0.5, "Moyenne"], [0.85, "Rapide"]];
+function gradAt(gr, u) {   // couleur le long d'un dégradé (fondu entre ses points, comme le ruban)
+  if (gr.length < 2) return gr[0];
+  const x = Math.max(0, Math.min(1, u)) * (gr.length - 1), k = Math.min(Math.floor(x), gr.length - 2), f = x - k;
+  const a = hexRgb(gr[k]), b = hexRgb(gr[k + 1]);
+  return rgbHex(a.map((v, i) => v + (b[i] - v) * f));
+}
+function roomBg(r, angle = 135) {   // dégradé d'une pièce : les couleurs réellement allumées, de gauche à droite
+  const on = r.lights.filter(l => l.on), src = on.length ? on : r.lights, items = [];
+  src.forEach((l, i) => {
+    const x = l.pos ? l.pos.x : -1 + 2 * i / Math.max(1, src.length - 1);
+    if (l.gradient && l.gradient.length > 1) l.gradient.forEach((c, k) => items.push([l.path && l.path[k] ? l.path[k].x : x - .5 + k / (l.gradient.length - 1), c]));
+    else items.push([x, l.color]);
+  });
+  const by = {}; items.forEach(([x, c]) => { (by[c] = by[c] || { n: 0, x: 0 }); by[c].n++; by[c].x += x; });
+  let cs = Object.entries(by).sort((a, b) => b[1].n - a[1].n).slice(0, 3).sort((a, b) => a[1].x / a[1].n - b[1].x / b[1].n).map(e => e[0]);
+  if (cs.length === 1) cs = [lighten(cs[0], .25), cs[0]];
+  return { css: `linear-gradient(${angle}deg, ${cs.map(c => boost(c, 190)).join(", ")})`, colors: cs };
+}
 function planSvg(r) {
   const ls = r.lights, pos = ls.map((l, i) => l.pos ? [179 + l.pos.x * 140, 100 - l.pos.y * 64] : [60 + (ls.length > 1 ? i / (ls.length - 1) : .5) * 238, 100]);
   const shapes = ls.map((l, i) => {
     const [x, y] = pos[i], k = lampKind(l.archetype), c = l.on ? boost(l.color, 200) : "#3a3a3c", glow = l.on ? `filter:drop-shadow(0 0 8px ${c})` : "";
-    if (l.path && l.path.length > 1) {   // ruban placé sur le plan : on suit son tracé
-      const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c");
-      const P = l.path.map(q => [179 + q.x * 140, 100 - q.y * 64]), col = j => gr[Math.min(gr.length - 1, Math.round(j / (P.length - 1) * (gr.length - 1)))];
-      return P.slice(1).map((q, j) => `<defs><linearGradient id="g${i}_${j}" gradientUnits="userSpaceOnUse" x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}"><stop offset="0" stop-color="${col(j)}"/><stop offset="1" stop-color="${col(j + 1)}"/></linearGradient></defs><line x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}" stroke="url(#g${i}_${j})" stroke-width="8" stroke-linecap="round" style="${glow}"/>`).join("");
+    if ((l.line || l.path) && (l.line || l.path).length > 1) {   // ruban placé sur le plan : on suit son tracé
+      const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? x : "#3a3a3c");
+      const P = (l.line || l.path).map(q => [179 + q.x * 140, 100 - q.y * 64]), col = j => gradAt(gr, j / (P.length - 1));
+      const segs = P.slice(1).map((q, j) => { const dx = q[0] - P[j][0], dy = q[1] - P[j][1], d = Math.hypot(dx, dy) || 1, e = .6 / d;   // léger chevauchement : pas de jointure visible
+        return `<linearGradient id="g${i}_${j}" gradientUnits="userSpaceOnUse" x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}"><stop offset="0" stop-color="${col(j)}"/><stop offset="1" stop-color="${col(j + 1)}"/></linearGradient>|<line x1="${P[j][0] - dx * e}" y1="${P[j][1] - dy * e}" x2="${q[0] + dx * e}" y2="${q[1] + dy * e}" stroke="url(#g${i}_${j})" stroke-width="7" stroke-linecap="butt"/>`; });
+      return `<defs>${segs.map(x => x.split("|")[0]).join("")}</defs><g style="${l.on ? `filter:drop-shadow(0 0 6px ${gr[0]}aa)` : ""}">${segs.map(x => x.split("|")[1]).join("")}</g>`;
     }
     if (k === "strip") { const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c"); return `<defs><linearGradient id="g${i}">${gr.map((x, j) => `<stop offset="${gr.length > 1 ? j / (gr.length - 1) : 0}" stop-color="${x}"/>`).join("")}</linearGradient></defs><rect x="${x - 50}" y="${y - 4}" width="100" height="8" rx="4" fill="url(#g${i})" style="${glow}"/>`; }
     if (k === "bar") return `<rect x="${x - 26}" y="${y - 6}" width="52" height="12" rx="6" fill="${c}" style="${glow}"/>`;
@@ -3824,16 +4088,17 @@ function planSvg(r) {
 function renderPiece() {
   const r = ROOMS && !ROOMS.error && ROOMS.find(x => x.id === route.arg);
   if (!r) { $("#piece").innerHTML = `<div class="nh"><button class="rb" data-back aria-label="Retour">${icon("plus", 22).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button><span class="t">Pièce</span></div><p class="note">${ROOMS ? "Pièce introuvable." : "Chargement…"}</p>`; return; }
-  const cs = roomColors(r).map(c => boost(c, 200)), c0 = cs[0] || "#ffe2b8", c1 = cs[1] || cs[0] || "#ffb066", dark = lum(c1) > .5;
+  const rb = roomBg(r, 160), c1 = boost(rb.colors[rb.colors.length - 1], 190), dark = rb.colors.reduce((a, c) => a + lum(boost(c, 190)), 0) / rb.colors.length > .5;
   const fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
   const scenes = allPalettes().filter(p => p.scenes);
-  $("#piece").innerHTML = `<div class="rhead" style="background:${r.on ? `linear-gradient(160deg, ${lighten(c0, .25)}, ${c1})` : "#232326"};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
+  $("#piece").innerHTML = `<div class="rhead" style="background:${r.on ? rb.css : "#232326"};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
     <div style="display:flex;align-items:center;gap:16px"><button class="rb" data-back aria-label="Retour" style="background:${r.on ? (dark ? "rgba(0,0,0,.12)" : "rgba(255,255,255,.18)") : "#3a3b40"};color:inherit">${icon("plus", 22, "currentColor", 2.6).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button>
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
     <button class="pwbtn" id="pPow" aria-label="${r.on ? "Éteindre" : "Allumer"}" style="width:48px;height:48px;background:${r.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 22, "currentColor", 2.4)}</button></div>
     ${r.on ? `<div class="sl" id="pBri" style="margin:18px 4px 2px"><div class="tr" style="background:rgba(0,0,0,.12)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>
     <div class="plan" style="position:relative">${planSvg(r)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
+    <div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Animation des scènes</span><div class="seg wide">${ANIMS.map(([v, n]) => `<button data-anim="${v}" class="${(ANIM[r.id] || 0) === v ? "on" : ""}">${n}</button>`).join("")}</div></div>
     <div class="pad"><div class="label in">Scènes</div><div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>
     <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
@@ -3841,6 +4106,7 @@ function renderPiece() {
   $$("[data-spr]").forEach(b => b.onclick = () => { spread = b.dataset.spr; store("spread", spread); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else renderPiece(); });
   $$("[data-scene]").forEach(b => b.onclick = () => applyScene(r, b.dataset.scene));
   $$("[data-editplan]").forEach(b => b.onclick = () => go("plan", "r:" + r.id));
+  $$("[data-anim]").forEach(b => b.onclick = () => { ANIM[r.id] = +b.dataset.anim; store("anim", JSON.stringify(ANIM)); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else { renderPiece(); toast(ANIM[r.id] ? "Choisis une scène : elle sera animée" : "Scènes fixes"); } });
   $$("[data-newpal]").forEach(b => b.onclick = () => openCreer("scene"));
   $$("[data-lpow]").forEach(b => b.onclick = e => { e.stopPropagation(); lightPower(r, b.dataset.lpow); });
   $$("[data-lamp]").forEach(b => b.onclick = () => go("lampe", r.id + "|" + b.dataset.lamp));
@@ -3848,11 +4114,9 @@ function renderPiece() {
 function lampTile(l) {
   const k = lampKind(l.archetype), c = boost(l.color, 210), grad = l.gradient && l.gradient.length > 1;
   let bg = "#2a2b30";
-  if (l.on && grad) {        // 3 teintes adoucies, du plus foncé (en haut à gauche) au plus clair
-    const g = [...new Set(l.gradient)].map(x => boost(x, 200)).sort((a, b) => lum(a) - lum(b));
-    const pk = g.length >= 3 ? [g[0], g[Math.floor(g.length / 2)], g[g.length - 1]] : [g[0], g[0], g[g.length - 1]];
-    const [a, m, z] = pk.map((x, i) => lighten(x, .12 + i * .06));
-    bg = `radial-gradient(90% 80% at 100% 100%, ${z} 0%, transparent 70%), linear-gradient(140deg, ${a} 0%, ${m} 55%, ${z} 100%)`;
+  if (l.on && grad) {        // le dégradé du ruban tel qu'il est allumé, du début à la fin
+    const u = [...new Set(l.gradient)], g = (u.length > 3 ? [u[0], u[Math.floor(u.length / 2)], u[u.length - 1]] : u).map(x => boost(x, 190));
+    bg = g.length > 1 ? `linear-gradient(155deg, ${g.map((c, i) => `${c} ${Math.round(8 + i / (g.length - 1) * 84)}%`).join(", ")})` : g[0];
   } else if (l.on) bg = `linear-gradient(160deg, ${lighten(c, .35)}, ${c})`;
   const light = l.on && (grad ? l.gradient.reduce((a, x) => a + lum(boost(x, 200)), 0) / l.gradient.length < .5 : lum(c) < .45);
   const fg = l.on && !light ? "#1b1c20" : "#fff";
@@ -3866,15 +4130,11 @@ async function lightPower(r, id) {
 async function applyScene(r, pid) {
   scenePick[r.id] = pid; const colors = palColors(pid), cyc = spread === "tour";
   r.on = true;
-  r.lights.forEach((l, i) => {
-    l.on = true;
-    const p = l.pos || { x: r.lights.length > 1 ? -1 + 2 * i / (r.lights.length - 1) : 0, y: 0 };
-    const t = spread === "fb" ? (1 - p.y) / 2 : spread === "centre" ? Math.min(1, Math.hypot(p.x, p.y) / 1.42) : spread === "tour" ? ((Math.atan2(-p.y, p.x) + Math.PI * 1.5) % (2 * Math.PI)) / (2 * Math.PI) : (p.x + 1) / 2;
-    if (l.has_gradient) l.gradient = [...colors].sort((a, b) => lum(a) - lum(b)).slice(0, 5); else l.color = colors[Math.min(colors.length - 1, Math.floor(Math.max(0, Math.min(.999, t)) * colors.length))];
-  });
-  roomsLock = Date.now() + 2000 + 120 * r.lights.length; render();
+  r.lights.forEach(l => { l.on = true; });
+  roomsLock = Date.now() + 2000 + 120 * r.lights.length;
   try {
-    const res = await api("/api/room/palette", { id: r.id, colors, spread });
+    const res = await api("/api/room/palette", { id: r.id, colors, spread, speed: ANIM[r.id] || 0 });
+    if (res.animated) toast("Scène animée lancée");
     Object.entries(res.lights || {}).forEach(([id, v]) => { const l = r.lights.find(x => x.id === id); if (l) Object.assign(l, v); });
     roomsLock = Date.now() + 1500 + (res.ms || 0); render();
   } catch (e) { toast(e.message); }
