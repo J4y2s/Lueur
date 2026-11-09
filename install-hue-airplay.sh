@@ -20,7 +20,7 @@ apt-get install -y --no-install-recommends --no-remove \
   libpopt-dev libconfig-dev libasound2-dev avahi-daemon avahi-utils libavahi-client-dev \
   libssl-dev libsoxr-dev libplist-dev libplist-utils libsodium-dev libavutil-dev libavcodec-dev \
   libavformat-dev uuid-dev libgcrypt-dev xxd \
-  python3 python3-numpy openssl \
+  python3 python3-numpy python3-pil openssl \
   bluez bluez-tools bluez-alsa-utils libasound2-plugin-bluez alsa-utils rfkill usbutils
 # systemd.pc (utile à la compilation d'AirPlay) : déjà fourni par "systemd" sur Debian 12.
 # Ne JAMAIS installer systemd-dev depuis les backports : APT retirerait systemd et le noyau
@@ -89,7 +89,7 @@ fi
 cd "$BUILD/shairport-sync"
 autoreconf -fi
 ./configure --sysconfdir=/etc --with-alsa --with-stdout --with-pipe --with-soxr \
-            --with-avahi --with-ssl=openssl --with-airplay-2
+            --with-avahi --with-ssl=openssl --with-airplay-2 --with-metadata
 make -j"$(nproc)"
 make install
 # On n'utilise pas le service shairport-sync standard : c'est hue-airplay qui le lance
@@ -469,9 +469,24 @@ def custom_palettes(conf_dir):
         return []
 
 
+COVER_FILE = "cover.json"
+
+
+def cover_palette(conf_dir):
+    """Couleurs extraites de la pochette du morceau AirPlay en cours (écrites par l'interface web)."""
+    try:
+        with open(os.path.join(conf_dir, COVER_FILE)) as f:
+            cols = json.load(f).get("colors") or []
+        return cols if len(cols) >= 2 else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
 def resolve_palette(name, conf_dir):
     if name in PALETTES:
         return PALETTES[name]
+    if name == "cover":
+        return (cover_palette(conf_dir) if conf_dir else None) or PALETTES["sunset"]
     for p in custom_palettes(conf_dir) if conf_dir else []:
         if p.get("id") == name:
             return p["colors"]
@@ -1130,6 +1145,10 @@ def cmd_run(args):
                 last_check = now
                 try:
                     m = os.path.getmtime(args.settings)
+                    if settings.get("palette") == "cover":     # nouvelle pochette = nouvelle palette
+                        cp = os.path.join(os.path.dirname(args.settings), COVER_FILE)
+                        if os.path.exists(cp):
+                            m = (m, os.path.getmtime(cp))
                 except OSError:
                     m = settings_mtime
                 if m != settings_mtime:
@@ -1269,17 +1288,27 @@ Sert la page index.html et une petite API JSON :
   POST /api/light      {"id", "on"?, "bri"?, "color"?}  pilote une lampe hors synchro
   POST /api/room       {"id", "on"?, "bri"?}             pilote toute une pièce
   POST /api/room/palette {"id", "colors": [...]}         applique une scène / palette à la pièce
+  GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
+  GET  /api/cover      pochette du morceau en cours
+
+La pochette est lue dans le tube de métadonnées de shairport-sync ; ses couleurs (extraites
+avec Pillow si disponible) alimentent la palette « Pochette » (cover.json).
 
 Aucune dépendance hors Python standard. À utiliser sur le réseau local uniquement.
 """
 
 import base64
+import colorsys
+import hashlib
+import io
 import json
 import os
 import re
 import secrets
 import subprocess
 import sys
+import select
+import stat
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1292,6 +1321,8 @@ PALETTE_IMG_DIR = os.path.join(CONF_DIR, "palettes")
 PALETTE_ID_RE = re.compile(r"^c_[0-9a-f]{8}$")
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 STATUS_PATH = os.environ.get("HUE_SYNC_STATUS", "/run/hue-music-sync/status.json")
+META_PIPE = os.environ.get("HUE_SYNC_META_PIPE", "/run/hue-music-sync/metadata")
+COVER_PATH = os.path.join(CONF_DIR, "cover.json")
 DEFAULTS_PATH = os.environ.get("HUE_SYNC_DEFAULTS", "/etc/default/hue-airplay")
 SYSTEMCTL = os.environ.get("HUE_SYNC_SYSTEMCTL", "systemctl")
 SERVICE = "hue-airplay"
@@ -1737,6 +1768,183 @@ def delete_palette(pid):
 
 
 # ---------------------------------------------------------------------------
+# Morceau en cours (métadonnées AirPlay de shairport-sync)
+# ---------------------------------------------------------------------------
+META = {"playing": False, "title": "", "artist": "", "album": "", "client": "",
+        "cover": None, "colors": [], "pos": None, "dur": None, "t": 0.0}
+_cover = {"id": None, "data": b"", "type": "image/jpeg"}
+_meta_lock = threading.Lock()
+ITEM_RE = re.compile(rb"<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code>"
+                     rb"<length>(\d+)</length>(?:\s*<data encoding=\"base64\">\s*([^<]*)</data>)?\s*</item>",
+                     re.S)
+RTP_RATE = 44100
+
+
+def _hex4(h):
+    return bytes.fromhex(h.decode()).decode("latin-1")
+
+
+def cover_colors(data, n=4):
+    """Couleurs marquantes d'une pochette : vives, distinctes, triées du plus foncé au plus clair."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    try:
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:  # image illisible
+        return []
+    im.thumbnail((96, 96))
+    q = im.quantize(colors=12, method=Image.Quantize.MEDIANCUT)
+    pal = q.getpalette()
+    cands = []
+    for count, idx in q.getcolors() or []:
+        r, g, b = pal[idx * 3:idx * 3 + 3]
+        h, l, sat = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        chroma = sat * (1 - abs(2 * l - 1))          # ni gris, ni noir, ni blanc
+        cands.append({"rgb": (r, g, b), "h": h, "l": l, "c": chroma,
+                      "score": count * (0.15 + chroma) ** 1.5})
+    cands.sort(key=lambda c: -c["score"])
+    colourful = sum(1 for c in cands if c["c"] >= 0.12) >= 2
+    picked = []
+    for c in cands:
+        if colourful and c["c"] < 0.12:
+            continue                                  # écarte les gris s'il y a assez de couleur
+        if all(min(abs(c["h"] - p["h"]), 1 - abs(c["h"] - p["h"])) > 0.06 or abs(c["l"] - p["l"]) > 0.25
+               for p in picked):
+            picked.append(c)
+        if len(picked) == n:
+            break
+    out = []
+    for c in picked:                                  # couleurs rendues par des lampes :
+        h, l, sat = colorsys.rgb_to_hls(*(v / 255 for v in c["rgb"]))
+        l = min(max(l, 0.35), 0.62)                   # ni trop sombres, ni délavées
+        if c["c"] >= 0.12:
+            sat = max(sat, 0.55)
+        r, g, b = colorsys.hls_to_rgb(h, l, sat)
+        out.append((l, "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))))
+    if len(out) == 1:
+        out.append(out[0])
+    return [hx for _, hx in sorted(out)]
+
+
+def _set_cover(data):
+    cid = hashlib.sha1(data).hexdigest()[:12]
+    colors = cover_colors(data)
+    ctype = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
+    with _meta_lock:
+        _cover.update(id=cid, data=data, type=ctype)
+        META["cover"] = cid
+        META["colors"] = colors
+        title, artist = META["title"], META["artist"]
+    if len(colors) >= 2:
+        try:
+            if read_json(COVER_PATH, {}).get("colors") != colors:
+                write_json(COVER_PATH, {"id": cid, "colors": colors, "title": title,
+                                        "artist": artist, "time": int(time.time())})
+        except OSError:
+            pass
+
+
+def _meta_item(typ, code, data):
+    if typ == "core":
+        key = {"minm": "title", "asar": "artist", "asal": "album"}.get(code)
+        if key:
+            with _meta_lock:
+                META[key] = data.decode("utf-8", "replace").strip()
+        return
+    if typ != "ssnc":
+        return
+    if code == "PICT":
+        if len(data) > 64:
+            _set_cover(data)
+        return
+    with _meta_lock:
+        now = time.time()
+        if code == "mdst":                    # nouveau bloc de métadonnées = nouveau morceau
+            META.update(title="", artist="", album="")
+        elif code in ("pbeg", "prsm"):
+            META.update(playing=True, t=now)
+        elif code in ("pend", "pfls"):
+            if META["playing"] and META["pos"] is not None:
+                META["pos"] = min(META["pos"] + now - META["t"], META["dur"] or 1e9)
+            META.update(playing=False, t=now)
+            if code == "pend":
+                META.update(pos=None, dur=None)
+        elif code == "snam":
+            META["client"] = data.decode("utf-8", "replace")
+        elif code == "prgr":
+            try:
+                a, c, e = (int(x) for x in data.decode().split("/"))
+            except ValueError:
+                return
+            M = 1 << 32
+            META.update(pos=((c - a) % M) / RTP_RATE, dur=((e - a) % M) / RTP_RATE or None,
+                        playing=True, t=now)
+
+
+def meta_feed(buf):
+    """Traite les éléments complets du tampon et renvoie le reste."""
+    last = 0
+    for m in ITEM_RE.finditer(buf):
+        last = m.end()
+        try:
+            _meta_item(_hex4(m.group(1)), _hex4(m.group(2)), base64.b64decode(m.group(4) or b""))
+        except (ValueError, UnicodeDecodeError):
+            continue
+    rest = buf[last:]
+    return b"" if len(rest) > 8_000_000 else rest   # flux corrompu : on repart de zéro
+
+
+def meta_reader():
+    """Lit en continu le tube de métadonnées (recréé s'il disparaît, par ex. après un redémarrage)."""
+    while True:
+        fd = None
+        try:
+            if not os.path.isdir(os.path.dirname(META_PIPE)):
+                time.sleep(3)
+                continue
+            if not os.path.exists(META_PIPE):
+                os.mkfifo(META_PIPE, 0o660)
+            st = os.stat(META_PIPE)
+            if not stat.S_ISFIFO(st.st_mode):
+                time.sleep(10)
+                continue
+            fd = os.open(META_PIPE, os.O_RDWR)        # lecture + écriture : jamais de fin de fichier
+            buf = b""
+            while True:
+                r, _, _ = select.select([fd], [], [], 5)
+                if not r:
+                    try:
+                        if os.stat(META_PIPE).st_ino != st.st_ino:
+                            break
+                    except OSError:
+                        break
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                buf = meta_feed(buf + chunk)
+        except OSError as e:
+            print(f"Métadonnées AirPlay : {e}", flush=True)
+            time.sleep(5)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def now_playing():
+    with _meta_lock:
+        m = dict(META)
+    now = time.time()
+    if m["playing"] and m["pos"] is not None:
+        m["pos"] = min(m["pos"] + now - m["t"], m["dur"] or 1e9)
+    m["t"] = now
+    m["has"] = bool(m["title"] or m["cover"])
+    return m
+
+
+# ---------------------------------------------------------------------------
 # Bluetooth (bluetoothctl)
 # ---------------------------------------------------------------------------
 def btctl(*args, timeout=10):
@@ -1924,9 +2132,23 @@ class Handler(BaseHTTPRequestHandler):
                 "settings": get_settings(), "airplay_name": airplay_name(),
                 "palettes": hms.PALETTES, "custom_palettes": list_custom_palettes(),
                 "intensities": list(hms.INTENSITY), "presets": hms.INTENSITY,
-                "pairing": pairing, "live": get_live()})
+                "pairing": pairing, "live": get_live(), "now": now_playing()})
+        if path == "/api/now":
+            return self._send(200, now_playing())
+        if path == "/api/cover":
+            with _meta_lock:
+                data, ctype = _cover["data"], _cover["type"]
+            if not data:
+                return self._send(404, {"error": "aucune pochette"})
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path == "/api/live":
-            return self._send(200, get_live())
+            return self._send(200, {**get_live(), "now": now_playing()})
         if path == "/api/areas":
             try:
                 return self._send(200, get_areas(force="refresh" in self.path))
@@ -2035,6 +2257,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=bt_watchdog, daemon=True).start()
+    threading.Thread(target=meta_reader, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Interface Hue Sync sur http://0.0.0.0:{PORT}", flush=True)
     srv.serve_forever()
@@ -2181,7 +2404,22 @@ a{color:var(--blue);text-decoration:none}
 .cover .glow{position:absolute;inset:-20%;filter:blur(30px);transition:background .25s}
 .cover .lights{position:absolute;inset:0}
 .cover .lights i{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;transition:background .12s,box-shadow .12s,transform .12s}
-.stitle{margin-top:20px;font-size:23px;font-weight:700;text-align:center;padding:0 24px}
+.coverwrap{position:relative;width:min(62vw,240px);aspect-ratio:1}
+.stage>*:not(.coverwrap){position:relative;z-index:1}
+.coverwrap .halo{position:absolute;inset:-20%;border-radius:50%;filter:blur(38px);opacity:0;transition:opacity .4s,background .25s;pointer-events:none}
+.coverwrap.art .halo{opacity:.85}
+.cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .5s}
+.coverwrap.art .cover img{opacity:1}
+.coverwrap.art .cover .lights{display:none}
+.pbar{width:min(78vw,300px);margin-top:16px}
+.pbar .tr{height:4px;border-radius:2px;background:#393a3f;overflow:hidden}
+.pbar .tr i{display:block;height:100%;width:0;background:#fff;border-radius:2px}
+.pbar .tm{display:flex;justify-content:space-between;color:var(--t2);font-size:11px;margin-top:6px;font-variant-numeric:tabular-nums}
+.pchip{margin-top:12px;display:inline-flex;align-items:center;gap:8px;background:var(--card);border-radius:20px;padding:6px 12px 6px 8px;font-size:12px;color:var(--t2)}
+.pchip .sw4{display:flex}.pchip .sw4 i{width:12px;height:12px;border-radius:50%;margin-right:-3px;border:1.5px solid var(--card)}
+.orb .auto{position:absolute;top:8px;right:8px;font-size:9px;font-weight:700;letter-spacing:1px;background:var(--cta);color:#fff;padding:2px 5px;border-radius:5px}
+.orb{position:relative}
+.stitle{margin-top:20px;font-size:23px;font-weight:700;text-align:center;padding:0 24px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ssub{margin-top:4px;color:var(--t2);font-size:15px;display:flex;align-items:center;gap:7px}
 .dot{width:8px;height:8px;border-radius:50%;background:#636366}
 .dot.on{background:var(--green);box-shadow:0 0 10px var(--green)}
@@ -2316,9 +2554,12 @@ pre.logs{white-space:pre-wrap;font-size:12px;line-height:1.45;color:#d1d1d6;back
       </button>
     </div>
     <div class="stage">
-      <div class="cover" id="cover"><div class="glow" id="coverGlow"></div><div class="lights" id="coverLights"></div></div>
+      <div class="coverwrap" id="coverWrap"><div class="halo" id="coverHalo"></div>
+        <div class="cover" id="cover"><div class="glow" id="coverGlow"></div><div class="lights" id="coverLights"></div><img id="coverImg" alt=""></div></div>
       <div class="stitle" id="sTitle">En attente de musique</div>
       <div class="ssub"><i class="dot" id="sDot"></i><span id="sSub">Choisis « Lueur » dans AirPlay</span></div>
+      <div class="pbar hidden" id="pBar"><div class="tr"><i id="pFill"></i></div><div class="tm"><span id="pCur">0:00</span><span id="pDur">0:00</span></div></div>
+      <button class="pchip hidden" id="pChip" data-sheet="shCouleur"><span class="sw4" id="pChipSw"></span>Couleurs tirées de la pochette</button>
     </div>
     <div class="ctrls">
       <button class="ctrl" data-sheet="shEffet"><span class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 11v2"/></svg></span><small>Effet</small><em id="cEffet">—</em></button>
@@ -2538,7 +2779,9 @@ function save(patch, now) {
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 function allPalettes() {
-  const b = Object.entries(S.palettes).map(([id, colors]) => ({ id, name: PAL_N[id] || id, colors, builtin: true, scenes: true, synchro: true }));
+  const now = S.now || {}, cc = now.colors && now.colors.length >= 2 ? now.colors : null;
+  const cover = { id: "cover", name: "Pochette", colors: cc || ["#3a3b40", "#6e6f75", "#a9aab0"], builtin: true, auto: true, scenes: !!cc, synchro: true };
+  const b = [cover].concat(Object.entries(S.palettes).map(([id, colors]) => ({ id, name: PAL_N[id] || id, colors, builtin: true, scenes: true, synchro: true })));
   return b.concat((S.custom_palettes || []).map(p => ({ ...p, scenes: p.scenes !== false, synchro: p.synchro !== false })));
 }
 function palColors(id) { const p = allPalettes().find(x => x.id === id); return p ? p.colors : S.palettes.sunset; }
@@ -2598,7 +2841,7 @@ function renderSheets() {
   $$("[data-int]").forEach(b => b.onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: b.dataset.int }, true); renderSheets(); renderSync(); });
   const nfx = Object.keys(st.fx || {}).length;
   $("#intNote").textContent = nfx ? `${nfx} réglage${nfx > 1 ? "s" : ""} avancé${nfx > 1 ? "s" : ""} modifié${nfx > 1 ? "s" : ""}. Choisir une intensité les remet à zéro.` : "";
-  $("#palList").innerHTML = allPalettes().filter(p => p.synchro).map(p => orbTile(p.name, p.colors, p.id === st.palette, `data-pal="${p.id}"`)).join("") + orbTile("Créer", null, false, 'data-newpal="sync"');
+  $("#palList").innerHTML = allPalettes().filter(p => p.synchro).map(p => orbTile(p.name, p.colors, p.id === st.palette, `data-pal="${p.id}"`, p.auto ? "AUTO" : "")).join("") + orbTile("Créer", null, false, 'data-newpal="sync"');
   $$("[data-pal]").forEach(b => b.onclick = () => { save({ palette: b.dataset.pal }, true); renderSheets(); renderSync(); });
   $$("[data-newpal]").forEach(b => b.onclick = () => { closeSheets(); openCreer(b.dataset.newpal); });
   setSl($("#lumSl"), (st.brightness - 0.05) / 0.95); $("#lumPct").textContent = Math.round(st.brightness * 100) + " %";
@@ -2607,9 +2850,9 @@ function renderSheets() {
 slider($("#lumSl"), t => { const v = Math.round((0.05 + t * 0.95) * 100) / 100; setSl($("#lumSl"), t); $("#lumPct").textContent = Math.round(v * 100) + " %"; save({ brightness: v }); renderSync(); });
 $("#effAdv").onclick = () => { closeSheets(); go("avances"); };
 
-function orbTile(name, colors, on, attrs) {
+function orbTile(name, colors, on, attrs, badge) {
   const o = colors ? `<span class="o" style="background:${orbBg(colors)};box-shadow:0 6px 18px ${boost(colors[Math.min(2, colors.length - 1)])}66"></span>` : `<span class="o dash">+</span>`;
-  return `<button class="orb ${on ? "on" : ""}" ${attrs}>${o}<span>${esc(name)}</span></button>`;
+  return `<button class="orb ${on ? "on" : ""}" ${attrs}>${badge ? `<b class="auto">${badge}</b>` : ""}${o}<span>${esc(name)}</span></button>`;
 }
 
 /* =================== APERÇU D'EFFET (bandeau) =================== */
@@ -2651,8 +2894,17 @@ function renderSync() {
   $("#powerBtn").classList.toggle("on", active);
   $("#powerBtn").setAttribute("aria-label", active ? "Arrêter la synchro" : "Démarrer la synchro");
   $("#sDot").classList.toggle("on", syncing);
-  $("#sTitle").textContent = !active ? "Synchro arrêtée" : syncing ? "Synchro en cours" : "En attente de musique";
-  $("#sSub").textContent = !active ? "Touche le bouton pour la démarrer" : syncing ? `${live.area || (z && z.name) || ""} · ${palName(st.palette)}` : `Choisis « ${S.airplay_name} » dans AirPlay`;
+  const np = S.now || {}, track = active && np.has && np.title;
+  $("#sTitle").textContent = track ? np.title : !active ? "Synchro arrêtée" : syncing ? "Synchro en cours" : "En attente de musique";
+  $("#sSub").textContent = track ? [np.artist, np.album].filter(Boolean).join(" · ") || (z && z.name) || ""
+    : !active ? "Touche le bouton pour la démarrer" : syncing ? `${live.area || (z && z.name) || ""} · ${palName(st.palette)}` : `Choisis « ${S.airplay_name} » dans AirPlay`;
+  const art = active && np.cover;
+  if (art && $("#coverImg").dataset.id !== np.cover) { $("#coverImg").dataset.id = np.cover; $("#coverImg").src = "/api/cover?" + np.cover; }
+  $("#coverWrap").classList.toggle("art", !!art);
+  const auto = st.palette === "cover" && np.colors && np.colors.length >= 2 && active && np.has;
+  $("#pChip").classList.toggle("hidden", !auto);
+  if (auto) $("#pChipSw").innerHTML = np.colors.map(c => `<i style="background:${c}"></i>`).join("");
+  renderProgress();
   renderCover();
 }
 function renderCover() {
@@ -2670,7 +2922,19 @@ function renderCover() {
   const g = cols.slice(0, 4).map(c => boost(c, 160));
   $("#coverGlow").style.background = `radial-gradient(circle at 30% 30%, ${g[0]} 0%, transparent 55%), radial-gradient(circle at 75% 70%, ${g[1] || g[0]} 0%, transparent 55%), radial-gradient(circle at 70% 25%, ${g[2] || g[0]} 0%, transparent 50%), #111`;
   $("#coverGlow").style.opacity = syncing ? 1 : .55;
+  $("#coverHalo").style.background = `radial-gradient(circle at 30% 35%, ${g[0]} 0%, transparent 60%), radial-gradient(circle at 72% 65%, ${g[1] || g[0]} 0%, transparent 60%), radial-gradient(circle at 65% 25%, ${g[2] || g[0]} 0%, transparent 55%)`;
 }
+let nowAt = 0;
+const mmss = t => { t = Math.max(0, Math.floor(t)); return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0"); };
+function renderProgress() {
+  const np = S && S.now, ok = np && np.has && np.dur && np.pos != null && S.service.active;
+  $("#pBar").classList.toggle("hidden", !ok);
+  if (!ok) return;
+  const pos = Math.min(np.dur, np.pos + (np.playing ? (Date.now() - nowAt) / 1000 : 0));
+  $("#pFill").style.width = (pos / np.dur * 100).toFixed(2) + "%";
+  $("#pCur").textContent = mmss(pos); $("#pDur").textContent = "-" + mmss(np.dur - pos);
+}
+function setNow(n) { if (n) { S.now = n; nowAt = Date.now(); } }
 $("#powerBtn").onclick = async () => {
   const on = !S.service.active; $("#powerBtn").classList.add("busy"); lockUntil = Date.now() + 4000;
   try { await api("/api/power", { on }); toast(on ? "Synchro démarrée" : "Synchro arrêtée"); } catch (e) { toast("Échec : " + e.message); }
@@ -3083,7 +3347,7 @@ $("#wGo").onclick = async () => {
 
 /* =================== BOUCLES =================== */
 async function refresh(forceZones) {
-  try { const st = await api("/api/state"); if (Date.now() < lockUntil && S) st.settings = S.settings; S = st; live = st.live; }
+  try { const st = await api("/api/state"); if (Date.now() < lockUntil && S) st.settings = S.settings; S = st; live = st.live; nowAt = Date.now(); }
   catch (e) { return; }
   if (!S.paired && $("#welcome").classList.contains("hidden")) { showWelcome(false); return; }
   if (S.paired && !forcedWelcome) { $("#welcome").classList.add("hidden"); $("#app").classList.remove("hidden"); }
@@ -3092,13 +3356,13 @@ async function refresh(forceZones) {
   if ($(".sheet.open")) renderSheets();
 }
 async function liveLoop() {
-  if (!document.hidden && S && S.service.active && route.v === "sync") { try { live = await api("/api/live"); renderSync(); } catch (e) {} }
+  if (!document.hidden && S && S.service.active && route.v === "sync") { try { const l = await api("/api/live"); const n = l.now; delete l.now; live = l; if (n && (!S.now || n.cover !== S.now.cover || n.title !== S.now.title || n.playing !== S.now.playing)) { setNow(n); if ($(".sheet.open")) renderSheets(); } else if (n) setNow(n); renderSync(); } catch (e) {} }
   setTimeout(liveLoop, 150);
 }
 const Q = new URLSearchParams(location.search);
 go(Q.get("v") || load("tab") || "sync", Q.get("a") || "", false);
 if (Q.get("sheet")) setTimeout(() => openSheet(Q.get("sheet")), 900);
-refresh(); setInterval(() => !document.hidden && refresh(), 3000); liveLoop(); loadRooms(); loadBt();
+refresh(); setInterval(() => !document.hidden && refresh(), 3000); setInterval(() => !document.hidden && S && route.v === "sync" && renderProgress(), 500); liveLoop(); loadRooms(); loadBt();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); loadRooms(); } });
 </script>
 </body>
@@ -3106,12 +3370,12 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) { re
 HUE_FILE_EOF
 [ -f /etc/shairport-sync.conf ] && [ ! -f /etc/shairport-sync.conf.orig ] && cp /etc/shairport-sync.conf /etc/shairport-sync.conf.orig || true
 cat > /etc/shairport-sync.conf <<'HUE_FILE_EOF'
-// Récepteur AirPlay 2 "Hue Sync" : le son n'est pas joué, il est envoyé
+// Récepteur AirPlay 2 "Lueur" : le son n'est pas joué, il est envoyé
 // au script sur STDOUT (44,1 kHz, 16 bits, stéréo), qui l'analyse et peut le
 // rejouer sur une enceinte Bluetooth.
 general =
 {
-  name = "Hue Sync";               // nom visible dans le menu AirPlay de l'iPhone
+  name = "Lueur";                 // nom visible dans le menu AirPlay de l'iPhone
   output_backend = "stdout";
   mdns_backend = "avahi";
   ignore_volume_control = "no";    // le volume de l'iPhone règle aussi l'enceinte Bluetooth
@@ -3133,6 +3397,16 @@ sessioncontrol =
   run_this_after_exiting_active_state = "/usr/bin/rm -f /run/hue-music-sync/airplay-active";
   active_state_timeout = 20.0;     // garde les lampes prêtes 20 s entre deux morceaux ou en pause
   wait_for_completion = "no";
+};
+
+// Titre, artiste, album et pochette du morceau : envoyés à l'interface web (palette « Pochette »)
+metadata =
+{
+  enabled = "yes";
+  include_cover_art = "yes";
+  cover_art_cache_directory = "";  // pas de cache disque : la pochette passe par le tube
+  pipe_name = "/run/hue-music-sync/metadata";
+  pipe_timeout = 5000;
 };
 
 diagnostics =
