@@ -4379,6 +4379,42 @@ async function sendEq() {
   clearTimeout(eqTimer);
   try { await api("/api/plan/eq", { id: PLAN.id, eq: PED.eq }); const p = { ...(S.settings.plans || {}) }; p[PLAN.id] = { ...(p[PLAN.id] || {}), eq: { ...PED.eq } }; S.settings.plans = p; } catch (e) { toast(e.message); }
 }
+// Carte des couleurs du test : chaque point de la pièce prend la couleur du point du ruban le plus
+// proche (mélange des deux segments voisins), comme le moteur le fait pour un spot placé là.
+let FIELD = { key: "", url: "" };
+function stripPolyline(pts) {       // paires de segments voisins (+ fermeture si le ruban fait le tour)
+  const pairs = []; for (let i = 0; i < pts.length - 1; i++) pairs.push([i, i + 1]);
+  if (pts.length > 2) {
+    const steps = pairs.map(([a, b]) => Math.hypot(pts[b][0] - pts[a][0], pts[b][1] - pts[a][1])).sort((a, b) => a - b);
+    if (Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]) <= 1.6 * steps[Math.floor(steps.length / 2)]) pairs.push([pts.length - 1, 0]);
+  }
+  return pairs;
+}
+function fieldColor(pts, cols, pairs, x, y) {
+  if (pts.length === 1) return hexRgb(cols[0]);
+  let best = null;
+  for (const [a, b] of pairs) {
+    const dx = pts[b][0] - pts[a][0], dy = pts[b][1] - pts[a][1], L = dx * dx + dy * dy;
+    const f = L < 1e-9 ? 0 : Math.max(0, Math.min(1, ((x - pts[a][0]) * dx + (y - pts[a][1]) * dy) / L));
+    const d = (pts[a][0] + dx * f - x) ** 2 + (pts[a][1] + dy * f - y) ** 2;
+    if (!best || d < best[0]) best = [d, a, b, f];
+  }
+  const ca = hexRgb(cols[best[1]]), cb = hexRgb(cols[best[2]]);
+  return ca.map((v, i) => v + (cb[i] - v) * best[3]);
+}
+function colorField(pts, cols, W, H) {   // image de fond (calculée une fois par réglage du ruban)
+  const key = JSON.stringify([pts.map(p => p.map(v => v.toFixed(2))), cols, W, H.toFixed(1)]);
+  if (FIELD.key === key) return FIELD.url;
+  const pairs = stripPolyline(pts), cw = 160, ch = Math.max(40, Math.round(160 * H / W)), cv = document.createElement("canvas");
+  cv.width = cw; cv.height = ch; const ctx = cv.getContext("2d"), img = ctx.createImageData(cw, ch);
+  for (let j = 0; j < ch; j++) for (let i = 0; i < cw; i++) {
+    const c = fieldColor(pts, cols, pairs, (i + .5) / cw * W, (j + .5) / ch * H), k = (j * cw + i) * 4;
+    img.data[k] = c[0]; img.data[k + 1] = c[1]; img.data[k + 2] = c[2]; img.data[k + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  FIELD = { key, url: cv.toDataURL() };
+  return FIELD.url;
+}
 function drawPlan() {
   // proportions de la pièce : largeur (mur de l'écran) × profondeur, carré si non renseignées
   const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0, W = 100, H = dw && dd ? Math.max(35, Math.min(150, 100 * dd / dw)) : 75;
@@ -4386,6 +4422,16 @@ function drawPlan() {
   let h = `<rect x="${PM * W}" y="${PM * H}" width="${(1 - 2 * PM) * W}" height="${(1 - 2 * PM) * H}" rx="2" fill="none" stroke="#3a3b40" stroke-width=".5" stroke-dasharray="1.5 1.5"/>`;
   h += `<rect x="38" y="1.2" width="24" height="1.6" rx=".8" fill="#4a4b52"/>`;
   const { rub, single } = planDevs(), CT = COLORTEST;
+  // Pendant le test : fond = couleur que prendrait un spot à chaque endroit de la pièce
+  let fieldAt = null;
+  if (CT && rub.length && CT.segments.length) {
+    const [, cs] = rub[0], spts = cs.map(c => [X(pos[c.id].p), Y(pos[c.id].p)]), cols = cs.map((c, i) => CT.segments[i] || "#ffffff");
+    const pairs = stripPolyline(spts);
+    fieldAt = (x, y) => rgbHex(fieldColor(spts, cols, pairs, x, y));
+    const rx = PM * W, ry = PM * H, rw = (1 - 2 * PM) * W, rh = (1 - 2 * PM) * H;
+    h = `<defs><clipPath id="roomclip"><rect x="${rx}" y="${ry}" width="${rw}" height="${rh.toFixed(1)}" rx="2"/></clipPath><radialGradient id="vign"><stop offset=".6" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity=".3"/></radialGradient></defs>`
+      + `<g clip-path="url(#roomclip)"><image href="${colorField(spts, cols, W, H)}" x="0" y="0" width="${W}" height="${H.toFixed(1)}" preserveAspectRatio="none" opacity=".72"/><rect x="${rx}" y="${ry}" width="${rw}" height="${rh.toFixed(1)}" fill="url(#vign)"/></g>` + h;
+  }
   rub.forEach(([d, cs]) => {
     const r = PED.rubans[d], pts = []; for (let k = 0; k <= 60; k++) pts.push(alongP(r, k / 60, PED.dims));
     h += `<polyline points="${pts.map(p => X(p).toFixed(1) + "," + Y(p).toFixed(1)).join(" ")}" fill="none" stroke="#2a2b30" stroke-width="3.2" stroke-linecap="round"/>`;
@@ -4394,7 +4440,7 @@ function drawPlan() {
     const a = alongP(r, .02, PED.dims), b = alongP(r, .12, PED.dims), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = alongP(r, 0, PED.dims);
     h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
   });
-  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && CT.spots[c.light || c.id], col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && (fieldAt ? fieldAt(X(q), Y(q)) : CT.spots[c.light || c.id]), col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
     h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
   const svg = $("#planSvg"); svg.setAttribute("viewBox", `0 0 ${W} ${H.toFixed(1)}`); svg.innerHTML = h;
   svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
