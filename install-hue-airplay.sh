@@ -183,13 +183,13 @@ INTENSITY = {
     # every     : changement de couleur tous les N temps    fade : fondu de couleur (s)
     # pattern   : "all" toutes ensemble, "alt" lampes en alternance, "chase" chenillard
     # strobe    : flash blanc sur les drops        beat_k / min_beat : sensibilité de détection
-    "subtle":   dict(base=0.30, beat=0.22, tau=0.55, energy=0.35, every=4, fade=1.60,
+    "subtle":   dict(base=0.15, beat=0.10, tau=0.70, energy=0.25, every=4, fade=1.60,
                      pattern="all", strobe=False, beat_k=2.0, min_beat=0.40, source="full"),
-    "moderate": dict(base=0.22, beat=0.70, tau=0.28, energy=0.20, every=2, fade=0.45,
+    "moderate": dict(base=0.18, beat=0.45, tau=0.32, energy=0.18, every=2, fade=0.50,
                      pattern="all", strobe=False, beat_k=1.7, min_beat=0.28, source="full"),
-    "high":     dict(base=0.07, beat=0.93, tau=0.17, energy=0.12, every=1, fade=0.12,
+    "high":     dict(base=0.06, beat=0.75, tau=0.20, energy=0.12, every=1, fade=0.15,
                      pattern="alt", strobe=False, beat_k=1.5, min_beat=0.26, source="full"),
-    "intense":  dict(base=0.00, beat=1.00, tau=0.10, energy=0.05, every=1, fade=0.00,
+    "intense":  dict(base=0.00, beat=0.90, tau=0.12, energy=0.05, every=1, fade=0.00,
                      pattern="chase", strobe=True, beat_k=1.35, min_beat=0.22, source="full"),
 }
 
