@@ -1704,19 +1704,29 @@ def tv_load(conf_dir):
 
 
 class TvWatcher:
-    """Lit en continu l'état de la TV et les couleurs de l'Ambilight, dans son propre fil.
-    Ne fait rien tant que la synchro vidéo n'est pas activée."""
+    """Dialogue avec la TV dans son propre fil (une seule connexion, l'API supporte mal les rafales) :
+    - TV allumée et synchro vidéo active : lit en continu les couleurs de l'Ambilight ;
+    - TV en veille et musique en cours : envoie à l'Ambilight les couleurs de la synchro musique
+      (chaque côté prend la couleur des lampes voisines sur le plan), puis lui rend son état d'avant."""
+
+    AMBI_HZ = 20                         # envois par seconde vers l'Ambilight (mesuré : ~50/s possibles)
+    AMBI_FLAG = ".ambilight-musique"     # présent tant que Lueur pilote l'Ambilight (restauration après un arrêt brutal)
 
     def __init__(self, conf_dir):
         self.conf_dir = conf_dir
-        self.enabled, self.hz = False, 12
+        self.enabled, self.video, self.music, self.hz = False, False, False, 12
         self.frame, self.frame_t, self.power, self.error, self.rate = None, 0.0, None, "", 0.0
         self.src = "processed"
+        self.mapper = None               # VideoMapper : positions des lampes et de la TV sur le plan
+        self.pushed, self.push_t = None, 0.0
+        self.ambi_on, self.ambi_prev, self.topo, self.ambi_last = False, None, None, None
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def configure(self, tv):
-        self.enabled = bool(tv.get("on"))
+        self.video = bool(tv.get("on"))
+        self.music = bool(tv.get("music", True))
+        self.enabled = self.video or self.music
         try:
             self.hz = max(4, min(25, int(tv.get("hz", 12))))
         except (TypeError, ValueError):
@@ -1724,21 +1734,86 @@ class TvWatcher:
 
     @property
     def active(self):
-        return self.enabled and self.power == "On" and time.time() - self.frame_t < 1.5
+        return self.video and self.power == "On" and time.time() - self.frame_t < 1.5
 
     def get(self):
         with self.lock:
             return self.frame
 
+    def push(self, colors):
+        """Couleurs de la synchro musique [(canal, r, g, b)], appelé par la boucle principale."""
+        with self.lock:
+            self.pushed, self.push_t = {c: (r, g, b) for c, r, g, b in colors}, time.time()
+
     def info(self):
-        return {"on": self.enabled, "power": self.power, "rate": round(self.rate, 1), "error": self.error,
-                "active": self.active, "src": self.src}
+        return {"on": self.video, "music": self.music, "power": self.power, "rate": round(self.rate, 1),
+                "error": self.error, "active": self.active, "src": self.src, "ambi": self.ambi_on}
+
+    # --- Ambilight piloté par la musique ---
+    def _flag(self):
+        return os.path.join(self.conf_dir, self.AMBI_FLAG) if self.conf_dir else None
+
+    def _ambi_start(self, client):
+        try:                     # déjà démarré avant une coupure de connexion : on garde l'état d'origine
+            with open(self._flag()) as f:
+                prev = json.load(f).get("power")
+        except (OSError, ValueError, TypeError, AttributeError):
+            prev = client.request("GET", "/6/ambilight/power").get("power")
+            try:
+                with open(self._flag(), "w") as f:
+                    json.dump({"power": prev}, f)
+            except (OSError, TypeError):
+                pass
+        self.topo = client.request("GET", "/6/ambilight/topology")
+        client.request("POST", "/6/ambilight/power", {"power": "On"})
+        client.request("POST", "/6/ambilight/mode", {"current": "manual"})
+        self.ambi_on, self.ambi_prev, self.ambi_last = True, prev, None
+        log("TV en veille : l'Ambilight suit la synchro musique.")
+
+    def _ambi_stop(self, client, why):
+        prev = self.ambi_prev
+        self.ambi_on, self.ambi_last = False, None
+        try:
+            client.request("POST", "/6/ambilight/mode", {"current": "internal"})
+            if prev and prev != "On" and self.power != "On":
+                client.request("POST", "/6/ambilight/power", {"power": prev})
+        finally:
+            try:
+                os.remove(self._flag())
+            except (OSError, TypeError):
+                pass
+        log(f"Ambilight rendu à la TV ({why}).")
+
+    def _ambi_recover(self, client):
+        """Après un arrêt brutal de Lueur, l'Ambilight peut être resté sur nos couleurs : on le rend."""
+        try:
+            with open(self._flag()) as f:
+                self.ambi_prev = json.load(f).get("power")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return
+        self._ambi_stop(client, "reprise après un arrêt de Lueur")
+
+    def shutdown(self):
+        """Arrêt du moteur : rend l'Ambilight tout de suite (sans attendre le fil)."""
+        if not self.ambi_on:
+            return
+        c = tv_load(self.conf_dir)
+        if c:
+            try:
+                self._ambi_stop(TvClient(c["ip"], c["user"], c["key"], timeout=2), "arrêt du moteur")
+            except Exception:
+                pass
 
     def _loop(self):
         client, creds, next_power, times = None, None, 0.0, collections.deque(maxlen=25)
         while True:
             if not self.enabled:
                 if client:
+                    if self.ambi_on:
+                        try:
+                            self._ambi_stop(client, "fonction coupée")
+                        except Exception:
+                            pass
                     client.close()
                     client = None
                 creds = None            # à la réactivation, on relit l'appairage et on recrée la connexion
@@ -1752,6 +1827,11 @@ class TvWatcher:
                 if client:
                     client.close()
                 client = TvClient(c["ip"], c["user"], c["key"]) if c else None
+                if client:
+                    try:
+                        self._ambi_recover(client)
+                    except Exception:
+                        pass
             if not client:
                 if self.error != "TV non appairée.":
                     log(f"TV : non appairée (fichier {os.path.join(self.conf_dir or '?', TV_FILE)} absent ou incomplet).")
@@ -1765,12 +1845,31 @@ class TvWatcher:
             try:
                 if t0 >= next_power:
                     p = client.request("GET", "/6/powerstate").get("powerstate")
-                    if p != self.power:
+                    if (p == "On") != (self.power == "On") or self.power is None:
                         log(f"TV : {'allumée' if p == 'On' else 'en veille' if p else 'état inconnu'}.")
                     self.power = p
                     next_power = t0 + 3
+                with self.lock:
+                    pushed, push_t = self.pushed, self.push_t
+                music_now = self.music and pushed is not None and t0 - push_t < 1.5
                 if self.power != "On":
                     self.error = ""
+                    if music_now and self.power:            # TV en veille et musique : l'Ambilight suit
+                        if not self.ambi_on:
+                            self._ambi_start(client)
+                        body = self.mapper.ambi(pushed, self.topo) if self.mapper else None
+                        if body and body != self.ambi_last:
+                            client.request("POST", "/6/ambilight/cached", body)
+                            self.ambi_last = body
+                        time.sleep(max(0.0, 1.0 / self.AMBI_HZ - (time.time() - t0)))
+                        continue
+                    if self.ambi_on:
+                        self._ambi_stop(client, "fin de la musique")
+                    time.sleep(0.25 if self.music else 1)
+                    continue
+                if self.ambi_on:                             # la TV vient d'être allumée
+                    self._ambi_stop(client, "TV allumée")
+                if not self.video:
                     time.sleep(1)
                     continue
                 fr, src = tv_read(client, self.src)
@@ -1787,6 +1886,7 @@ class TvWatcher:
                 if str(e) != self.error:
                     log(f"TV : {e}")
                 self.error, self.power = str(e), None
+                self.ambi_on = False             # la connexion est perdue ; le drapeau permettra de rendre l'Ambilight
                 client.close()
                 time.sleep(3)
                 continue
@@ -1795,6 +1895,7 @@ class TvWatcher:
                 if msg != self.error:
                     log(f"TV : {msg}")
                 self.error, self.power = msg, None
+                self.ambi_on = False
                 client.close()
                 time.sleep(3)
                 continue
@@ -1816,6 +1917,7 @@ class VideoMapper:
 
     def __init__(self):
         self.map, self.cur, self.flip, self.tau = [], {}, False, 0.14
+        self.pos, self.geo = {}, (0.5, 0.15, 4.0, 4.0)   # positions des lampes ; TV (centre, demi-largeur 0-1, W, D)
 
     def configure(self, channels, kinds, plans, area_id, tv):
         plan = (plans or {}).get(area_id) if isinstance(plans, dict) else None
@@ -1831,7 +1933,8 @@ class VideoMapper:
         back, spots = num(tv.get("back"), 0.35, 0.0, 1.0), num(tv.get("spots"), 0.3, 0.0, 1.0)
         self.flip = bool(tv.get("flip"))
         self.tau = self.SMOOTH.get(tv.get("smooth"), 0.14)
-        self.map = []
+        self.map, self.pos = [], {}
+        self.geo = (xc, hw / W, W, D)
         for c in channels:
             p = c.get("position", {})
             # Plan Lueur comme repères du pont : x et y de -1 à 1, y = +1 du côté de la TV.
@@ -1843,6 +1946,7 @@ class VideoMapper:
                 spec = ("top", (du / hw + 1) / 2, 0.0)
             else:
                 spec = ("left" if du < 0 else "right", 0.0, min(1.0, (abs(du) - hw) / 0.6))
+            self.pos[c["channel_id"]] = (u, v, kinds.get(c["channel_id"]))
             bri = 1 - (1 - back) * _smooth(0.1, 0.9, v)
             if kinds.get(c["channel_id"]) == "spots":
                 bri *= spots
@@ -1880,6 +1984,41 @@ class VideoMapper:
             self.cur[cid] = c
             out.append((cid, float(c[0]), float(c[1]), float(c[2])))
         return out
+
+    def ambi(self, colors, topo):
+        """Couleurs à envoyer à l'Ambilight (`/6/ambilight/cached`) pendant la musique : chaque pixel,
+        placé sur le mur de la TV, prend la couleur des deux lampes les plus proches sur le plan
+        (le ruban d'abord ; les spots seulement s'il n'y a pas de ruban)."""
+        if not colors or not self.pos:
+            return None
+        xc, hu, W, D = self.geo
+        lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors and k != "spots"]
+        if not lamps:
+            lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors]
+        if not lamps:
+            return None
+
+        def at(u):
+            near = sorted(((math.hypot((u - lu) * W, lv * D), col) for lu, lv, col in lamps), key=lambda x: x[0])[:2]
+            ws = [1 / (d + 0.05) for d, _ in near]
+            return [sum(w * col[i] for w, (_, col) in zip(ws, near)) / sum(ws) for i in range(3)]
+
+        topo = topo if isinstance(topo, dict) else {}
+        n = {k: int(topo.get(k) or 0) for k in ("left", "top", "right")}
+        if not any(n.values()):
+            n = {"left": 3, "top": 7, "right": 3}
+        px = lambda c: {"r": int(max(0, min(1, c[0])) * 255), "g": int(max(0, min(1, c[1])) * 255),
+                        "b": int(max(0, min(1, c[2])) * 255)}
+        left, right = at(xc - hu), at(xc + hu)
+        top = [at(xc - hu + (i + 0.5) / n["top"] * 2 * hu) for i in range(n["top"])]
+        if self.flip:                    # même convention que pour la lecture des couleurs
+            left, right, top = right, left, top[::-1]
+        layer = {"top": {str(i): px(c) for i, c in enumerate(top)}}
+        if n["left"]:
+            layer["left"] = {str(i): px(left) for i in range(n["left"])}
+        if n["right"]:
+            layer["right"] = {str(i): px(right) for i in range(n["right"])}
+        return {"layer1": layer}
 
     def hexes(self):
         return ["#%02x%02x%02x" % tuple(int(max(0, min(1, v)) * 255) for v in self.cur[m[0]])
@@ -2037,6 +2176,7 @@ def cmd_run(args):
     tv = TvWatcher(conf_dir) if conf_dir and not args.dry_run else None
     vmap = VideoMapper()
     if tv:
+        tv.mapper = vmap
         tv.configure(settings["tv"])
         vmap.configure(plan_channels(area, settings["plans"]), kinds, settings["plans"], area["id"], settings["tv"])
     video_on, video_t = False, 0.0
@@ -2194,6 +2334,8 @@ def cmd_run(args):
                 delayed.popleft()
             colors = delayed[0]
             session.send(colors)
+            if tv and session.active:
+                tv.push(colors)             # TV en veille : l'Ambilight suit la musique
             if beat:
                 beats += 1
             status.write(state="syncing" if session.active else "waiting",
@@ -2203,6 +2345,8 @@ def cmd_run(args):
                          bt={"device": player.device, "playing": player.playing} if player else None)
     finally:
         audio.close()
+        if tv:
+            tv.shutdown()
         session.release("arrêt du script")
         status.write(force=True, state="stopped", area=area_name, colors=[])
         log("Synchro arrêtée.")
@@ -2611,6 +2755,7 @@ def clean_tv(d):
     out = {}
     num = lambda k, lo, hi, dflt: max(lo, min(hi, float(d[k]))) if isinstance(d.get(k), (int, float)) else dflt
     out["on"] = bool(d.get("on"))
+    out["music"] = bool(d.get("music", True))             # TV en veille : l'Ambilight suit la musique
     out["x"] = round(num("x", 0.0, 1.0, 0.5), 3)          # centre de la TV le long du mur (0-1)
     out["w"] = round(num("w", 0.3, 4.0, 1.23), 2)         # largeur de la TV en mètres
     out["back"] = round(num("back", 0.0, 1.0, 0.35), 2)   # luminosité au fond de la pièce
@@ -5833,7 +5978,7 @@ function renderBt() {
 
 /* =================== TÉLÉVISEUR AMBILIGHT =================== */
 let TV = null, tvTimer = null, tvTest = null, tvBusy = false;
-const TVD = { on: false, x: .5, w: 1.23, back: .35, spots: .3, hz: 12, smooth: "normale", flip: false };
+const TVD = { on: false, music: true, x: .5, w: 1.23, back: .35, spots: .3, hz: 12, smooth: "normale", flip: false };
 const tvCfg = () => ({ ...TVD, ...(S.settings.tv || {}) });
 function tvSave(k, v) { save({ tv: { ...tvCfg(), [k]: v } }); }
 $("#tvRow").onclick = () => { tvTest = null; go("tv"); };
@@ -5842,7 +5987,7 @@ async function loadTv() {
   if ((route.v === "tv" || route.v === "reglages") && !document.hidden) { try { TV = await api("/api/tv"); if (route.v === "tv") renderTv(true); tvSubline(); } catch (e) {} }
   tvTimer = setTimeout(loadTv, route.v === "tv" ? 2000 : 6000);
 }
-function tvPower(t) { const e = t && t.engine; if (!t || !t.paired) return "Non appairée"; if (!tvCfg().on) return "Appairée · synchro vidéo coupée"; if (!e) return "Appairée · synchro arrêtée"; if (e.error) return e.error; if (e.power === "On") return e.active ? `Allumée · ${e.rate} images/s` : "Allumée"; return e.power ? "En veille" : "Connexion…"; }
+function tvPower(t) { const e = t && t.engine, c = tvCfg(); if (!t || !t.paired) return "Non appairée"; if (!c.on && !c.music) return "Appairée · fonctions coupées"; if (!e) return "Appairée · synchro arrêtée"; if (e.error) return e.error; if (e.power === "On") return e.active ? `Allumée · ${e.rate} images/s` : c.on ? "Allumée" : "Allumée · synchro vidéo coupée"; if (e.ambi) return "En veille · l'Ambilight suit la musique"; return e.power ? "En veille" : "Connexion…"; }
 function tvSubline() { const el = $("#tvSub"); if (el && TV) el.textContent = TV.paired ? tvPower(TV) : "Synchro vidéo du ruban et des spots"; }
 function tvSlider(id, label, val, txt, hint) { return `<div class="row" style="align-items:flex-start;padding:16px 0 12px"><span style="flex:1;padding:0 22px"><span style="display:flex;justify-content:space-between"><span class="t1" style="font-size:17px;font-weight:600">${label}</span><span class="val" id="${id}V" style="color:var(--t2)">${txt}</span></span><div class="sl" id="${id}" style="margin:10px 0 6px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>${hint ? `<span style="color:var(--t3);font-size:14px">${hint}</span>` : ""}</span></div>`; }
 function tvPlanSvg() {   // la pièce vue de dessus, TV en haut, lampes de la zone de synchro
@@ -5860,7 +6005,7 @@ function renderTv(fromPoll) {
   if (!TV) { el.innerHTML = `<p class="note" style="padding:16px 20px">Chargement…</p>`; loadTv(); return; }
   if (fromPoll && (document.activeElement && el.contains(document.activeElement) || tvBusy || $("#tv .sl.drag"))) { const st = $("#tvState"); if (st) st.textContent = tvPower(TV); return; }
   const c = tvCfg(), pr = TV.pairing || {};
-  let h = `<p class="note" style="padding:16px 20px 0">Lueur lit les couleurs de l'Ambilight et les répartit sur ta zone de synchro selon le plan de la pièce : chaque segment du ruban prend la couleur du côté de l'écran le plus proche de lui. La musique reste prioritaire.</p>`;
+  let h = `<p class="note" style="padding:16px 20px 0">TV allumée : Lueur lit les couleurs de l'Ambilight et les répartit sur ta zone de synchro selon le plan de la pièce, chaque segment du ruban prenant la couleur du côté de l'écran le plus proche. TV en veille : c'est l'inverse, l'Ambilight suit la synchro musique. La musique reste prioritaire.</p>`;
   if (!TV.paired) {
     const pin = pr.state === "pin";
     h += `<div class="label">Appairage</div><div class="list">
@@ -5881,6 +6026,7 @@ function renderTv(fromPoll) {
   h += `<div class="label">Téléviseur</div><div class="list">
     <div class="row"><span class="ic">${icon("tv")}</span><span class="bd"><span class="tx"><span class="t1">${esc(TV.model || "TV Philips")}</span><span class="t2" id="tvState">${esc(tvPower(TV))}</span></span><span class="val" style="color:var(--t3)">${esc(TV.ip)}</span></span></div>
     <button class="row" id="tvOn" role="switch" aria-checked="${c.on}"><span class="ic">${icon("sync")}</span><span class="bd"><span class="tx"><span class="t1">Synchro vidéo</span><span class="t2">Dès que la TV est allumée et qu'aucune musique ne joue</span></span><span class="sw ${c.on ? "on" : ""}"><i></i></span></span></button>
+    <button class="row" id="tvMusic" role="switch" aria-checked="${c.music}"><span class="ic">${icon("airplay")}</span><span class="bd"><span class="tx"><span class="t1">Ambilight avec la musique</span><span class="t2">TV en veille : ses côtés suivent la synchro musique</span></span><span class="sw ${c.music ? "on" : ""}"><i></i></span></span></button>
     <button class="row" id="tvTestB" ${tvBusy ? "disabled" : ""}><span class="ic" style="color:var(--blue)">${tvBusy ? '<span class="spin"></span>' : icon("sliders")}</span><span class="bd"><span class="tx"><span class="t1" style="color:var(--blue)">${tvBusy ? "Mesure en cours…" : "Mesurer la liaison"}</span><span class="t2">20 lectures des couleurs de l'Ambilight</span></span></span></button>
   </div>`;
   if (t) h += t.ok ? `<div class="pad" style="padding-top:12px"><div style="background:var(--card);border-radius:16px;padding:14px 16px">
@@ -5908,6 +6054,7 @@ function renderTv(fromPoll) {
   el.innerHTML = h;
   $("#tvOn").onclick = () => { tvSave("on", !c.on); renderTv(); };
   $("#tvFlip").onclick = () => { tvSave("flip", !c.flip); renderTv(); };
+  $("#tvMusic").onclick = () => { tvSave("music", !c.music); renderTv(); };
   $$("[data-sm]").forEach(b => b.onclick = () => { tvSave("smooth", b.dataset.sm); renderTv(); });
   $("#tvForget").onclick = async () => { if (!confirm("Oublier cette TV ? Il faudra refaire l'appairage.")) return; try { TV = await api("/api/tv/forget", {}); S.settings.tv = { ...tvCfg(), on: false }; } catch (e) { toast(e.message); } tvTest = null; renderTv(); };
   $("#tvTestB").onclick = async () => { tvBusy = true; renderTv(); try { tvTest = await api("/api/tv/test", {}); } catch (e) { tvTest = { ok: false, message: e.message }; } tvBusy = false; renderTv(); };
