@@ -1649,7 +1649,9 @@ class TvWatcher:
                 if client:
                     client.close()
                     client = None
-                self.power, self.frame_t = None, 0.0
+                creds = None            # à la réactivation, on relit l'appairage et on recrée la connexion
+                self.power, self.frame_t, self.rate, self.error = None, 0.0, 0.0, ""
+                times.clear()
                 time.sleep(0.5)
                 continue
             c = tv_load(self.conf_dir)
@@ -1659,9 +1661,14 @@ class TvWatcher:
                     client.close()
                 client = TvClient(c["ip"], c["user"], c["key"]) if c else None
             if not client:
+                if self.error != "TV non appairée.":
+                    log(f"TV : non appairée (fichier {os.path.join(self.conf_dir or '?', TV_FILE)} absent ou incomplet).")
                 self.error = "TV non appairée."
                 time.sleep(2)
                 continue
+            if self.error == "TV non appairée.":
+                self.error = ""
+                log("TV : appairage trouvé.")
             t0 = time.time()
             try:
                 if t0 >= next_power:
@@ -1688,6 +1695,14 @@ class TvWatcher:
                 if str(e) != self.error:
                     log(f"TV : {e}")
                 self.error, self.power = str(e), None
+                client.close()
+                time.sleep(3)
+                continue
+            except Exception as e:                  # réponse inattendue : on le note et on réessaie,
+                msg = f"Réponse inattendue de la TV ({e.__class__.__name__} : {str(e)[:120]})."   # le fil ne doit jamais s'arrêter
+                if msg != self.error:
+                    log(f"TV : {msg}")
+                self.error, self.power = msg, None
                 client.close()
                 time.sleep(3)
                 continue
