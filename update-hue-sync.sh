@@ -1724,14 +1724,13 @@ class VideoMapper:
         back, spots = num(tv.get("back"), 0.35, 0.0, 1.0), num(tv.get("spots"), 0.3, 0.0, 1.0)
         self.flip = bool(tv.get("flip"))
         self.tau = self.SMOOTH.get(tv.get("smooth"), 0.14)
-        has_plan = bool(plan.get("ch"))
         self.map = []
         for c in channels:
             p = c.get("position", {})
-            if has_plan and "sx" in p:
-                u, v = float(p["sx"]), float(p.get("y", 0))         # plan Lueur : 0-1, v = 0 au mur de la TV
-            else:
-                u, v = (float(p.get("x", 0)) + 1) / 2, (1 - float(p.get("y", 0))) / 2   # repères du pont
+            # Plan Lueur comme repères du pont : x et y de -1 à 1, y = +1 du côté de la TV.
+            # « sx » est la vraie position gauche-droite (« x » sert à l'ordre de parcours).
+            x = float(p["sx"]) if "sx" in p else float(p.get("x", 0))
+            u, v = (x + 1) / 2, (1 - float(p.get("y", 0))) / 2   # u : 0 à gauche, 1 à droite ; v : 0 au mur de la TV
             du = (u - xc) * W
             if abs(du) <= hw:
                 spec = ("top", (du / hw + 1) / 2, 0.0)
@@ -5740,12 +5739,14 @@ function tvPower(t) { const e = t && t.engine; if (!t || !t.paired) return "Non 
 function tvSubline() { const el = $("#tvSub"); if (el && TV) el.textContent = TV.paired ? tvPower(TV) : "Synchro vidéo du ruban et des spots"; }
 function tvSlider(id, label, val, txt, hint) { return `<div class="row" style="align-items:flex-start;padding:16px 0 12px"><span style="flex:1;padding:0 22px"><span style="display:flex;justify-content:space-between"><span class="t1" style="font-size:17px;font-weight:600">${label}</span><span class="val" id="${id}V" style="color:var(--t2)">${txt}</span></span><div class="sl" id="${id}" style="margin:10px 0 6px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>${hint ? `<span style="color:var(--t3);font-size:14px">${hint}</span>` : ""}</span></div>`; }
 function tvPlanSvg() {   // la pièce vue de dessus, TV en haut, lampes de la zone de synchro
-  const c = tvCfg(), pl = (S.settings.plans || {})[S.settings.area] || {}, dm = pl.dims || {}, W = +dm.w || 4, D = +dm.d || W;
+  const z = currentZone(), zid = (z && z.id) || S.settings.area || live.area_id, pl = (S.settings.plans || {})[zid] || {};
+  const c = tvCfg(), dm = pl.dims || {}, W = +dm.w || 4, D = +dm.d || W;
   const H = Math.max(40, Math.min(110, 100 * D / W)), tw = Math.min(1, c.w / W) * 100, tx = c.x * 100 - tw / 2;
   const cols = live.state === "syncing" && live.source === "tv" ? live.colors || [] : [];
-  const dots = Object.values(pl.ch || {}).map((q, i) => `<circle cx="${(q.x * 100).toFixed(1)}" cy="${(q.y * H).toFixed(1)}" r="2.6" fill="${cols[i] ? boost(cols[i], 200) : "#8d8e94"}"/>`).join("");
+  // points du plan : x et y de -1 à 1, y = +1 du côté de la TV (en haut)
+  const dots = Object.entries(pl.ch || {}).sort((a, b) => +a[0] - +b[0]).map(([, q], i) => `<circle cx="${((q.x + 1) / 2 * 100).toFixed(1)}" cy="${((1 - q.y) / 2 * H).toFixed(1)}" r="2.6" fill="${cols[i] ? boost(cols[i], 200) : "#8d8e94"}"/>`).join("");
   return `<svg viewBox="-4 -6 108 ${H + 10}" style="display:block;width:100%;max-height:260px"><rect x="0" y="0" width="100" height="${H}" rx="3" fill="#1f2024" stroke="#3a3b40"/><rect x="${tx.toFixed(1)}" y="-3" width="${tw.toFixed(1)}" height="3" rx="1" fill="#fff"/>${dots}</svg>` +
-    (pl.ch ? "" : `<p class="hint" style="margin:6px 4px 0">La zone choisie n'a pas encore de plan : les lampes seront placées d'après le pont. Fais le plan dans « Pièces et zones de synchro » pour un meilleur résultat.</p>`);
+    `<p class="hint" style="margin:6px 4px 0">${pl.ch ? `Zone de synchro : « ${esc(z ? z.name : "?")} », d'après son plan.` : `La zone « ${esc(z ? z.name : "?")} » n'a pas encore de plan : les lampes seront placées d'après le pont. Fais le plan dans « Pièces et zones de synchro », ou choisis dans Synchro la zone qui en a un.`}</p>`;
 }
 function renderTv(fromPoll) {
   const el = $("#tv"); if (!el) return;
