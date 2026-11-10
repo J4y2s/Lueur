@@ -126,8 +126,13 @@ Mode serveur AirPlay (LXC) :
 """
 
 import argparse
+import base64
 import collections
+import hashlib
+import hmac
+import http.client
 import json
+import math
 import os
 import queue
 import shutil
@@ -1487,7 +1492,7 @@ class Session:
                        f"/clip/v2/resource/entertainment_configuration/{self.area['id']}",
                        key=self.cfg["username"], body={"action": action})
 
-    def acquire(self):
+    def acquire(self, why="Musique détectée"):
         if self.active or time.time() < self.retry_at:
             return
         try:
@@ -1497,7 +1502,7 @@ class Session:
                 self._action("start")
                 self.stream = HueStream(self.cfg["bridge"], self.cfg["app_id"],
                                         self.cfg["clientkey"], self.area["id"])
-            log("Musique détectée : synchro démarrée.")
+            log(f"{why} : synchro démarrée.")
         except HueError as e:
             log(f"Pont indisponible, nouvel essai dans 3 s. ({e})")
             self.stream = None
@@ -1522,6 +1527,322 @@ class Session:
             self.stream = None
 
 
+
+# ---------------------------------------------------------------------------
+# Téléviseur Philips Ambilight (API JointSpace v6, TV Android : HTTPS port 1926)
+# ---------------------------------------------------------------------------
+TV_FILE = "tv.json"                       # identifiants d'appairage, écrits par l'interface web
+TV_SHARED_KEY = base64.b64decode(         # clé publique commune utilisée par les TV Philips pour
+    "ZmVay1EQVFOaZhwQ4Kv81ypLAZNczV9sG4KkseXWn1NEk6cXmPKO/MCa9sryslvLCFMnNe4Z4CPXzToowvhHvA==")  # signer le PIN
+
+
+class TvError(Exception):
+    pass
+
+
+class TvClient:
+    """Client minimal JointSpace v6. Une seule connexion HTTPS gardée ouverte et un défi Digest
+    réutilisé : un appel = une requête, parce que la TV supporte mal les rafales d'appels."""
+
+    def __init__(self, ip, user="", key="", timeout=2.0, port=1926):
+        self.ip, self.user, self.key, self.timeout, self.port = ip, user, key, timeout, port
+        self.conn, self.chal, self.nc = None, None, 0
+        self.ctx = ssl.create_default_context()
+        self.ctx.check_hostname = False           # certificat auto-signé de la TV
+        self.ctx.verify_mode = ssl.CERT_NONE
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
+    @staticmethod
+    def _parse_chal(h):
+        if not h or not h.lower().startswith("digest"):
+            return None
+        import re as _re
+        return {m[0].lower(): m[1] or m[2] for m in _re.findall(r'(\w+)=(?:"([^"]*)"|([^,\s]*))', h[6:])}
+
+    def _auth(self, method, path):
+        c = self.chal
+        if not c or not self.user:
+            return None
+        md5 = lambda t: hashlib.md5(t.encode()).hexdigest()
+        self.nc += 1
+        nc, cnonce = "%08x" % self.nc, os.urandom(8).hex()
+        ha1 = md5(f"{self.user}:{c.get('realm', '')}:{self.key}")
+        ha2 = md5(f"{method}:{path}")
+        qop = "auth" if "auth" in [q.strip() for q in c.get("qop", "").split(",")] else ""
+        resp = md5(f"{ha1}:{c.get('nonce', '')}:{nc}:{cnonce}:{qop}:{ha2}") if qop else md5(f"{ha1}:{c.get('nonce', '')}:{ha2}")
+        parts = [f'username="{self.user}"', f'realm="{c.get("realm", "")}"', f'nonce="{c.get("nonce", "")}"',
+                 f'uri="{path}"', f'response="{resp}"', "algorithm=MD5"]
+        if c.get("opaque"):
+            parts.append(f'opaque="{c["opaque"]}"')
+        if qop:
+            parts += [f"qop={qop}", f"nc={nc}", f'cnonce="{cnonce}"']
+        return "Digest " + ", ".join(parts)
+
+    def request(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        sent_auth = False
+        for attempt in range(4):
+            if self.conn is None:
+                self.conn = http.client.HTTPSConnection(self.ip, self.port, timeout=self.timeout, context=self.ctx)
+            headers = {"Content-Type": "application/json"} if data is not None else {}
+            a = self._auth(method, path)
+            if a:
+                headers["Authorization"] = a
+            try:
+                self.conn.request(method, path, body=data, headers=headers)
+                r = self.conn.getresponse()
+                raw = r.read()
+            except (OSError, http.client.HTTPException) as e:
+                self.close()
+                if attempt >= 1:
+                    raise TvError(f"TV injoignable ({e.__class__.__name__}).")
+                continue
+            if r.status == 401 and self.user:
+                ch = self._parse_chal(r.getheader("WWW-Authenticate"))
+                if not ch:
+                    raise TvError("La TV refuse la connexion.")
+                if a and sent_auth and ch.get("stale", "").lower() != "true":
+                    raise TvError("La TV ne reconnaît plus Lueur : refais l'appairage.")
+                sent_auth = bool(a) or sent_auth
+                self.chal, self.nc = ch, 0
+                continue
+            if r.status >= 400:
+                raise TvError(f"La TV a répondu {r.status} sur {path}.")
+            try:
+                return json.loads(raw or b"{}")
+            except ValueError:
+                return {}
+        raise TvError("La TV ne reconnaît plus Lueur : refais l'appairage.")
+
+
+def tv_device(dev_id):
+    return {"device_name": "Lueur", "device_os": "Android", "app_name": "Lueur", "type": "native",
+            "app_id": "app.lueur", "id": dev_id}
+
+
+def tv_pair_request(ip):
+    """1re étape : la TV affiche un code PIN. Renvoie l'état à garder pour tv_pair_grant()."""
+    dev_id = "".join(chr(97 + b % 26) for b in os.urandom(16))
+    r = TvClient(ip, timeout=5).request("POST", "/6/pair/request",
+                                        {"scope": ["read", "write", "control"], "device": tv_device(dev_id)})
+    if r.get("error_id") != "SUCCESS" or not r.get("auth_key"):
+        raise TvError("La TV refuse l'appairage : " + str(r.get("error_text") or r.get("error_id") or r)[:160])
+    return {"ip": ip, "id": dev_id, "auth_key": r["auth_key"], "timestamp": r.get("timestamp"),
+            "timeout": r.get("timeout", 60)}
+
+
+def tv_pair_grant(st, pin):
+    """2e étape : on renvoie le PIN signé. Deux formes de signature circulent selon les TV :
+    on essaie la plus courante (hexadécimal), puis la variante en base64."""
+    pin = str(pin).strip()
+    h = hmac.new(TV_SHARED_KEY, (str(st["timestamp"]) + pin).encode(), hashlib.sha1).hexdigest()
+    last = None
+    for sig in (h, base64.b64encode(h.encode()).decode()):
+        body = {"auth": {"auth_AppId": "1", "pin": pin, "auth_timestamp": st["timestamp"],
+                         "auth_signature": sig}, "device": tv_device(st["id"])}
+        try:
+            TvClient(st["ip"], st["id"], st["auth_key"], timeout=5).request("POST", "/6/pair/grant", body)
+            return {"ip": st["ip"], "user": st["id"], "key": st["auth_key"]}
+        except TvError as e:
+            last = e
+    raise last or TvError("Appairage refusé.")
+
+
+def tv_frame(js):
+    """Couleurs Ambilight (`/6/ambilight/processed`) -> {côté: tableau N×3 dans [0, 1]}."""
+    layer = js.get("layer1") if isinstance(js, dict) else None
+    if not isinstance(layer, dict):
+        layer = next((v for v in (js or {}).values() if isinstance(v, dict)), {}) if isinstance(js, dict) else {}
+    out = {}
+    for side in ("left", "top", "right", "bottom"):
+        d = layer.get(side) or {}
+        px = [d[k] for k in sorted(d, key=lambda k: int(k) if str(k).isdigit() else 0)] if isinstance(d, dict) else []
+        out[side] = np.array([[p.get("r", 0), p.get("g", 0), p.get("b", 0)] for p in px if isinstance(p, dict)],
+                             dtype=float).reshape(-1, 3) / 255.0
+    return out
+
+
+def tv_load(conf_dir):
+    try:
+        with open(os.path.join(conf_dir, TV_FILE)) as f:
+            d = json.load(f)
+        return d if d.get("ip") and d.get("user") and d.get("key") else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+class TvWatcher:
+    """Lit en continu l'état de la TV et les couleurs de l'Ambilight, dans son propre fil.
+    Ne fait rien tant que la synchro vidéo n'est pas activée."""
+
+    def __init__(self, conf_dir):
+        self.conf_dir = conf_dir
+        self.enabled, self.hz = False, 12
+        self.frame, self.frame_t, self.power, self.error, self.rate = None, 0.0, None, "", 0.0
+        self.lock = threading.Lock()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def configure(self, tv):
+        self.enabled = bool(tv.get("on"))
+        try:
+            self.hz = max(4, min(25, int(tv.get("hz", 12))))
+        except (TypeError, ValueError):
+            self.hz = 12
+
+    @property
+    def active(self):
+        return self.enabled and self.power == "On" and time.time() - self.frame_t < 1.5
+
+    def get(self):
+        with self.lock:
+            return self.frame
+
+    def info(self):
+        return {"on": self.enabled, "power": self.power, "rate": round(self.rate, 1), "error": self.error,
+                "active": self.active}
+
+    def _loop(self):
+        client, creds, next_power, times = None, None, 0.0, collections.deque(maxlen=25)
+        while True:
+            if not self.enabled:
+                if client:
+                    client.close()
+                    client = None
+                self.power, self.frame_t = None, 0.0
+                time.sleep(0.5)
+                continue
+            c = tv_load(self.conf_dir)
+            if c != creds:
+                creds = c
+                if client:
+                    client.close()
+                client = TvClient(c["ip"], c["user"], c["key"]) if c else None
+            if not client:
+                self.error = "TV non appairée."
+                time.sleep(2)
+                continue
+            t0 = time.time()
+            try:
+                if t0 >= next_power:
+                    p = client.request("GET", "/6/powerstate").get("powerstate")
+                    if p != self.power:
+                        log(f"TV : {'allumée' if p == 'On' else 'en veille' if p else 'état inconnu'}.")
+                    self.power = p
+                    next_power = t0 + 3
+                if self.power != "On":
+                    self.error = ""
+                    time.sleep(1)
+                    continue
+                fr = tv_frame(client.request("GET", "/6/ambilight/processed"))
+                with self.lock:
+                    self.frame, self.frame_t = fr, time.time()
+                times.append(self.frame_t)
+                if len(times) > 2:
+                    self.rate = (len(times) - 1) / max(1e-3, times[-1] - times[0])
+                self.error = ""
+            except TvError as e:
+                if str(e) != self.error:
+                    log(f"TV : {e}")
+                self.error, self.power = str(e), None
+                client.close()
+                time.sleep(3)
+                continue
+            time.sleep(max(0.0, 1.0 / self.hz - (time.time() - t0)))
+
+
+def _smooth(a, b, x):
+    t = max(0.0, min(1.0, (x - a) / (b - a)))
+    return t * t * (3 - 2 * t)
+
+
+class VideoMapper:
+    """Couleurs de l'Ambilight -> canaux de la zone, d'après le plan de la pièce.
+    Le haut du plan est le mur de la TV. Ce qui est au-dessus de la TV prend la couleur du haut
+    de l'Ambilight à la même position ; ce qui est à gauche ou à droite prend celle du côté ;
+    plus on s'éloigne de la TV, plus la lumière baisse et tend vers la moyenne de l'image."""
+
+    SMOOTH = {"vive": 0.05, "normale": 0.14, "douce": 0.35}
+
+    def __init__(self):
+        self.map, self.cur, self.flip, self.tau = [], {}, False, 0.14
+
+    def configure(self, channels, kinds, plans, area_id, tv):
+        plan = (plans or {}).get(area_id) if isinstance(plans, dict) else None
+        plan = plan if isinstance(plan, dict) else {}
+        dims = plan.get("dims") if isinstance(plan.get("dims"), dict) else {}
+        num = lambda v, d, lo, hi: max(lo, min(hi, float(v))) if isinstance(v, (int, float)) else d
+        try:
+            W = max(1.0, float(dims.get("w") or 4.0))
+            D = max(1.0, float(dims.get("d") or W))
+        except (TypeError, ValueError):
+            W = D = 4.0
+        xc, hw = num(tv.get("x"), 0.5, 0.0, 1.0), num(tv.get("w"), 1.23, 0.3, 4.0) / 2
+        back, spots = num(tv.get("back"), 0.35, 0.0, 1.0), num(tv.get("spots"), 0.3, 0.0, 1.0)
+        self.flip = bool(tv.get("flip"))
+        self.tau = self.SMOOTH.get(tv.get("smooth"), 0.14)
+        has_plan = bool(plan.get("ch"))
+        self.map = []
+        for c in channels:
+            p = c.get("position", {})
+            if has_plan and "sx" in p:
+                u, v = float(p["sx"]), float(p.get("y", 0))         # plan Lueur : 0-1, v = 0 au mur de la TV
+            else:
+                u, v = (float(p.get("x", 0)) + 1) / 2, (1 - float(p.get("y", 0))) / 2   # repères du pont
+            du = (u - xc) * W
+            if abs(du) <= hw:
+                spec = ("top", (du / hw + 1) / 2, 0.0)
+            else:
+                spec = ("left" if du < 0 else "right", 0.0, min(1.0, (abs(du) - hw) / 0.6))
+            bri = 1 - (1 - back) * _smooth(0.1, 0.9, v)
+            if kinds.get(c["channel_id"]) == "spots":
+                bri *= spots
+            self.map.append((c["channel_id"], spec, 0.5 * _smooth(0.4, 1.0, v), bri))
+        self.cur = {k: v for k, v in self.cur.items() if any(m[0] == k for m in self.map)}
+
+    def colors(self, frame, brightness, dt):
+        top, left, right = frame.get("top"), frame.get("left"), frame.get("right")
+        if self.flip:
+            left, right, top = right, left, top[::-1]
+        parts = [a for a in (left, top, right) if len(a)]
+        avg = np.concatenate(parts).mean(0) if parts else np.zeros(3)
+        L = left.mean(0) if len(left) else (top[0] if len(top) else avg)
+        R = right.mean(0) if len(right) else (top[-1] if len(top) else avg)
+        cl = top[0] if len(top) else L
+        cr = top[-1] if len(top) else R
+        n = len(top)
+        k = 1 - math.exp(-max(0.0, dt) / self.tau)
+        out = []
+        for cid, (side, t, f), bb, bri in self.map:
+            if side == "top":
+                if n:
+                    i, w = t * (n - 1), max(1.0, n * 0.06)
+                    c = top[max(0, int(i - w)):min(n, int(i + w) + 1)].mean(0)
+                else:
+                    c = avg
+            elif side == "left":
+                c = cl * (1 - f) + L * f
+            else:
+                c = cr * (1 - f) + R * f
+            c = (c * (1 - bb) + avg * bb) * bri * brightness
+            prev = self.cur.get(cid)
+            if prev is not None:
+                c = prev + (c - prev) * k
+            self.cur[cid] = c
+            out.append((cid, float(c[0]), float(c[1]), float(c[2])))
+        return out
+
+    def hexes(self):
+        return ["#%02x%02x%02x" % tuple(int(max(0, min(1, v)) * 255) for v in self.cur[m[0]])
+                for m in self.map if m[0] in self.cur]
+
+
 # ---------------------------------------------------------------------------
 # Commande "run"
 # ---------------------------------------------------------------------------
@@ -1532,14 +1853,15 @@ ALONG = ("glisse", "comete", "vague", "vumetre", "etincelles", "respiration")   
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
                      "layers": {}, "plans": {}, "test": {},
                      "brightness": 1.0, "idle_release": 15,
-                     "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}}
+                     "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "tv": {}}
 
 
 def load_settings(path, args):
     """Réglages : fichier JSON (modifiable à chaud par l'interface web) sinon ligne de commande."""
     s = {"area": args.area or "", "palette": args.palette, "intensity": args.intensity,
          "mode": args.mode, "brightness": args.brightness, "idle_release": args.idle_release,
-         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}, "plans": {}, "test": {}}
+         "bt_device": "", "bt_offset_ms": 300, "area_rev": 0, "fx": {}, "speed": 1.0, "layers": {}, "plans": {}, "test": {},
+         "tv": {}}
     if path and os.path.exists(path):
         try:
             with open(path) as f:
@@ -1560,6 +1882,8 @@ def load_settings(path, args):
         s["speed"] = 1.0
     if not isinstance(s.get("layers"), dict):
         s["layers"] = {}
+    if not isinstance(s.get("tv"), dict):
+        s["tv"] = {}
     s["fx"] = clean_fx(s.get("fx"))
     s["fx_params"] = fx_params(s["intensity"], s["fx"])
     try:
@@ -1666,6 +1990,13 @@ def cmd_run(args):
     analyzer = Analyzer(p["beat_k"], p["min_beat"], p["source"])
     fx = Layered(plan_channels(area, settings["plans"]), settings["palette_colors"], p, settings["brightness"],
                  settings["mode"], settings["speed"], kinds, settings["layers"])
+    conf_dir = os.path.dirname(args.settings) if args.settings else None
+    tv = TvWatcher(conf_dir) if conf_dir and not args.dry_run else None
+    vmap = VideoMapper()
+    if tv:
+        tv.configure(settings["tv"])
+        vmap.configure(plan_channels(area, settings["plans"]), kinds, settings["plans"], area["id"], settings["tv"])
+    video_on, video_t = False, 0.0
     airplay_on, airplay_seen = False, 0.0   # signal « lecture en cours » d'AirPlay
     last_flag = 0.0
 
@@ -1725,6 +2056,10 @@ def cmd_run(args):
                     analyzer.set_params(q["beat_k"], q["min_beat"], q["source"])
                     fx.configure(plan_channels(area, settings["plans"]), settings["palette_colors"], q, settings["brightness"],
                                  settings["mode"], settings["speed"], kinds, settings["layers"])
+                    if tv:
+                        tv.configure(settings["tv"])
+                        vmap.configure(plan_channels(area, settings["plans"]), kinds, settings["plans"], area["id"],
+                                       settings["tv"])
                     log(f"Réglages appliqués : {settings['palette']}, {settings['intensity']}, "
                         f"{settings['mode']} ×{settings['speed']:g}, luminosité {settings['brightness']}"
                         + (f" — couches : {fx.desc}" if fx.desc else ""))
@@ -1777,6 +2112,32 @@ def cmd_run(args):
                     colors.append((cid, *(max(b, w) for b in base)))
                 session.send(colors)
                 continue
+            # Synchro vidéo : la TV est allumée et aucune musique ne joue (la musique reste prioritaire)
+            music = rms >= 0.001 or airplay_on
+            if tv and tv.active and not music:
+                fr = tv.get()
+                if fr is not None:
+                    if not video_on:
+                        video_on, video_t = True, now
+                        session.acquire("Image de la TV reçue")
+                    silent_since = now
+                    colors = vmap.colors(fr, settings["brightness"], now - video_t)
+                    video_t = now
+                    eq = plan_eq(area, settings["plans"])
+                    if eq:
+                        colors = [(c, r * f, g * f, b * f) for c, r, g, b in colors
+                                  for f in (eq.get(devs.get(c), 1.0),)]
+                    session.send(colors)
+                    status.write(state="syncing" if session.active else "waiting", source="tv",
+                                 area=area_name, area_id=area["id"], level=0, beats=beats,
+                                 colors=vmap.hexes() if session.active else [], tv=tv.info(),
+                                 bt={"device": player.device, "playing": player.playing} if player else None)
+                    continue
+            if video_on:
+                video_on = False
+                vmap.cur.clear()
+                if not music:
+                    session.release("TV éteinte ou synchro vidéo coupée")
             colors = fx.update(rms, bands, beat, strength)
             # Équilibre de luminosité choisi dans le plan : une lampe trop forte est atténuée
             eq = plan_eq(area, settings["plans"])
@@ -1794,7 +2155,8 @@ def cmd_run(args):
                 beats += 1
             status.write(state="syncing" if session.active else "waiting",
                          area=area_name, area_id=area["id"], level=round(float(rms), 4),
-                         beats=beats, colors=fx.colors_hex() if session.active else [],
+                         beats=beats, colors=fx.colors_hex() if session.active else [], source="music",
+                         tv=tv.info() if tv else None,
                          bt={"device": player.device, "playing": player.playing} if player else None)
     finally:
         audio.close()
@@ -2201,6 +2563,123 @@ def clean_layers(d):
     return out
 
 
+def clean_tv(d):
+    """Réglages de la synchro vidéo (Ambilight)."""
+    out = {}
+    num = lambda k, lo, hi, dflt: max(lo, min(hi, float(d[k]))) if isinstance(d.get(k), (int, float)) else dflt
+    out["on"] = bool(d.get("on"))
+    out["x"] = round(num("x", 0.0, 1.0, 0.5), 3)          # centre de la TV le long du mur (0-1)
+    out["w"] = round(num("w", 0.3, 4.0, 1.23), 2)         # largeur de la TV en mètres
+    out["back"] = round(num("back", 0.0, 1.0, 0.35), 2)   # luminosité au fond de la pièce
+    out["spots"] = round(num("spots", 0.0, 1.0, 0.3), 2)  # luminosité des spots
+    out["hz"] = int(num("hz", 4, 25, 12))
+    out["smooth"] = d.get("smooth") if d.get("smooth") in ("vive", "normale", "douce") else "normale"
+    out["flip"] = bool(d.get("flip"))
+    return out
+
+
+# --- Téléviseur : appairage et état ---
+TV_PATH = os.path.join(CONF_DIR, hms.TV_FILE)
+tv_pairing = {"state": "idle", "message": ""}
+_tv_pending = {}
+
+
+def tv_state():
+    c = hms.tv_load(CONF_DIR)
+    if not c and tv_pairing["state"] == "done":
+        tv_pairing.update(state="idle", message="")
+    st = get_live()
+    return {"paired": bool(c), "ip": (c or {}).get("ip") or _tv_pending.get("ip", ""),
+            "model": (c or {}).get("model", ""), "pairing": tv_pairing,
+            "engine": st.get("tv") if isinstance(st.get("tv"), dict) else None,
+            "source": st.get("source"), "settings": clean_tv(get_settings().get("tv") or {})}
+
+
+def tv_pair(body):
+    ip = str(body.get("ip", "")).strip()
+    if not re.match(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$", ip):
+        raise ValueError("Adresse IP de la TV invalide.")
+    try:
+        st = hms.tv_pair_request(ip)
+    except hms.TvError as e:
+        tv_pairing.update(state="error", message=str(e))
+        return tv_state()
+    _tv_pending.clear()
+    _tv_pending.update(st, t=time.time())
+    tv_pairing.update(state="pin", message="Saisis le code affiché sur la TV.")
+    return tv_state()
+
+
+def tv_pin(body):
+    if not _tv_pending or time.time() - _tv_pending.get("t", 0) > max(30, _tv_pending.get("timeout") or 60) + 30:
+        tv_pairing.update(state="error", message="Code expiré : recommence l'appairage.")
+        return tv_state()
+    pin = re.sub(r"\D", "", str(body.get("pin", "")))
+    if not pin:
+        raise ValueError("Code PIN manquant.")
+    try:
+        cred = hms.tv_pair_grant(_tv_pending, pin)
+    except hms.TvError as e:
+        tv_pairing.update(state="error", message="Code refusé par la TV : vérifie-le et recommence l'appairage.")
+        return tv_state()
+    try:
+        info = hms.TvClient(cred["ip"], cred["user"], cred["key"], timeout=4).request("GET", "/6/system")
+        cred["model"] = str(info.get("name") or info.get("model") or "")[:60]
+    except hms.TvError:
+        pass
+    write_json(TV_PATH, cred)
+    try:
+        os.chmod(TV_PATH, 0o600)
+    except OSError:
+        pass
+    _tv_pending.clear()
+    tv_pairing.update(state="done", message="TV appairée.")
+    return tv_state()
+
+
+def tv_forget():
+    try:
+        os.remove(TV_PATH)
+    except OSError:
+        pass
+    s = get_settings()
+    s["tv"] = {**clean_tv(s.get("tv") or {}), "on": False}
+    write_json(SETTINGS_PATH, s)
+    tv_pairing.update(state="idle", message="")
+    return tv_state()
+
+
+def tv_test():
+    """Mesure combien de fois par seconde on peut lire les couleurs de l'Ambilight (20 lectures)."""
+    c = hms.tv_load(CONF_DIR)
+    if not c:
+        raise ValueError("TV non appairée.")
+    cl = hms.TvClient(c["ip"], c["user"], c["key"], timeout=3)
+    try:
+        power = cl.request("GET", "/6/powerstate").get("powerstate")
+        if power != "On":
+            return {"ok": False, "power": power, "message": "Allume la TV (pas en veille) pour mesurer."}
+        topo = cl.request("GET", "/6/ambilight/topology")
+        mode = cl.request("GET", "/6/ambilight/mode").get("current")
+        times, last = [], None
+        t0 = time.time()
+        for _ in range(20):
+            a = time.time()
+            last = hms.tv_frame(cl.request("GET", "/6/ambilight/processed"))
+            times.append(time.time() - a)
+        total = time.time() - t0
+    except hms.TvError as e:
+        return {"ok": False, "message": str(e)}
+    finally:
+        cl.close()
+    times.sort()
+    sides = {k: len(v) for k, v in (last or {}).items()}
+    to_hex = lambda a: ["#%02x%02x%02x" % tuple(int(max(0, min(1, x)) * 255) for x in p) for p in a]
+    return {"ok": True, "power": power, "hz": round(20 / total, 1), "ms": round(times[len(times) // 2] * 1000),
+            "ms_max": round(times[-1] * 1000), "topology": topo, "mode": mode, "sides": sides,
+            "preview": {k: to_hex(v) for k, v in (last or {}).items() if len(v)}}
+
+
 def update_settings(body):
     s = get_settings()
     restart = False
@@ -2244,6 +2723,8 @@ def update_settings(body):
         s["idle_release"] = max(0, min(3600, int(body["idle_release"])))
     if "bt_offset_ms" in body:
         s["bt_offset_ms"] = max(0, min(1500, int(body["bt_offset_ms"])))
+    if isinstance(body.get("tv"), dict):
+        s["tv"] = clean_tv({**(s.get("tv") if isinstance(s.get("tv"), dict) else {}), **body["tv"]})
     zones[s.get("area", "")] = {k: s.get(k) for k in ZONE_KEYS}
     s["zones"] = zones
     write_json(SETTINGS_PATH, s)
@@ -3592,6 +4073,8 @@ class Handler(BaseHTTPRequestHandler):
                 "devices": bt_devices() if adapter else [],
                 "selected": get_settings().get("bt_device", ""), "reason": bt_diag["reason"],
                 **bt_state})
+        if path == "/api/tv":
+            return self._send(200, tv_state())
         if path == "/api/logs":
             try:
                 r = subprocess.run(["journalctl", "-u", SERVICE, "-n", "60", "--no-pager",
@@ -3650,6 +4133,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, identify_light(body))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
+            if path in ("/api/tv/pair", "/api/tv/pin", "/api/tv/forget", "/api/tv/test"):
+                fn = {"/api/tv/pair": lambda: tv_pair(body), "/api/tv/pin": lambda: tv_pin(body),
+                      "/api/tv/forget": tv_forget, "/api/tv/test": tv_test}[path]
+                return self._send(200, fn())
             if path == "/api/palettes":
                 return self._send(200, save_palette(body))
             if path == "/api/palettes/delete":
@@ -3975,87 +4462,111 @@ button:active{transform:scale(.96);opacity:.82}
 /* =================== ORDINATEUR (écran large) =================== */
 .brand{display:none}
 @media (min-width:960px){
-  :root{--side:236px}
-  body{background:radial-gradient(1200px 700px at 70% -10%,#26272d 0%,var(--bg) 60%) fixed}
-  .app{max-width:none;margin:0 0 0 var(--side);padding-bottom:48px}
-  .view{max-width:1180px;margin:0 auto;padding:0 32px}
-  .nh{margin:20px 0 0;padding:14px 18px;border-radius:20px;top:12px}
-
-  /* barre d'onglets → colonne de gauche */
-  .tabs{left:0;top:0;bottom:0;right:auto;width:var(--side);flex-direction:column;justify-content:flex-start;align-items:stretch;
-        border-top:0;border-right:.5px solid rgba(255,255,255,.07);padding:30px 14px;background:rgba(16,16,18,.78)}
-  .tabs .in{flex-direction:column;gap:4px;max-width:none}
-  .tabs button{flex:none;flex-direction:row;gap:14px;padding:11px 14px;border-radius:12px;font-size:15px;font-weight:600}
-  .tabs button:hover{background:rgba(255,255,255,.05);color:#d1d1d6}
-  .tabs button.on{background:var(--card);color:#fff}
-  .tabs svg{width:22px;height:22px}
-  .brand{display:flex;align-items:center;gap:12px;padding:0 10px 26px;font-size:20px;font-weight:800;letter-spacing:-.2px}
-  .brand i{width:34px;height:34px;border-radius:10px;background:var(--card);display:grid;place-items:center}
-  .brand i:after{content:"";width:16px;height:16px;border-radius:50%;background:radial-gradient(circle at 40% 35%,#ffd27a,#ff6a3d 55%,#ff375f);box-shadow:0 0 14px #ff375f88}
-  .brand small{display:block;color:var(--t3);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-top:2px}
-
-  .big{padding:48px 0 26px;font-size:44px}
-  .label{padding-left:4px;padding-right:4px}
-  .note{padding-left:4px;padding-right:4px}
+  :root{--side:240px;--wrap:1040px;--gut:40px}
+  body{background:var(--bg)}
+  .app{max-width:none;margin:0 0 0 var(--side);padding-bottom:56px}
+  /* une seule largeur et un seul alignement pour tous les écrans */
+  .view{max-width:var(--wrap);margin:0 auto;padding:0 var(--gut)}
+  .big{padding:52px 0 28px;font-size:40px}
+  .label{padding:32px 2px 12px}.label.in{padding:28px 2px 12px}
+  .note{padding:12px 2px 0}
   .pad{padding:0}
+  .hint{margin-left:2px!important;margin-right:2px!important}
+  .nh{position:static;margin:40px 0 8px;padding:0;background:none;box-shadow:none;gap:16px}
+  .nh .t{font-size:28px;font-weight:800}
+  .nh .rb{width:44px;height:44px}
 
-  /* Synchro : pochette à gauche, commandes à droite */
-  .view[data-view=sync].on{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);grid-template-areas:"head head" "stage ." "stage ctrls" "stage dock" "stage .";
-        grid-template-rows:auto 1fr auto auto 1fr;column-gap:56px;min-height:100vh;padding-bottom:40px;align-items:center}
-  .syhead{grid-area:head;justify-content:flex-start;padding:30px 0 0}
-  .zonebtn{align-items:flex-start;padding:8px 14px;border-radius:14px;background:var(--card)}
-  .zonebtn:hover{filter:brightness(1.15)}
-  .stage{grid-area:stage;margin:0;align-self:center}
-  .coverwrap{width:min(34vw,440px,58vh)}
-  .stitle{font-size:28px;margin-top:28px}
-  .pbar,.leds{width:min(34vw,440px)}
-  .ctrls{grid-area:ctrls;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:0}
-  .ctrl{flex-direction:row;align-items:center;gap:14px;padding:16px;border-radius:20px;background:var(--card);text-align:left;display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto auto}
-  .ctrl .ci{grid-row:1/3;width:54px;height:54px;background:var(--card2)}
-  .ctrl small,.ctrl em{justify-self:start}
-  .ctrl em{font-size:16px;font-weight:600}
-  .ctrl:hover{filter:brightness(1.12)}
-  .dock{grid-area:dock;margin:30px 0 0;justify-content:center;gap:48px}
-  .dock .side:hover{color:#fff}
+  /* colonne de gauche */
+  .tabs{left:0;top:0;bottom:0;right:auto;width:var(--side);flex-direction:column;justify-content:flex-start;align-items:stretch;
+        border-top:0;border-right:1px solid #26272c;padding:28px 16px;background:#161619;-webkit-backdrop-filter:none;backdrop-filter:none}
+  .tabs .in{flex-direction:column;gap:2px;max-width:none}
+  .tabs button{flex:none;flex-direction:row;gap:12px;padding:10px 12px;border-radius:10px;font-size:15px;font-weight:600;color:#9a9ba1}
+  .tabs button:hover{background:#1f2024;color:#e5e5ea}
+  .tabs button.on{background:#26272c;color:#fff}
+  .tabs svg{width:20px;height:20px}
+  .brand{display:flex;align-items:center;gap:12px;padding:0 8px 28px;font-size:19px;font-weight:800}
+  .brand i{width:34px;height:34px;border-radius:10px;background:#26272c;display:grid;place-items:center;flex:none}
+  .brand i:after{content:"";width:15px;height:15px;border-radius:50%;background:radial-gradient(circle at 40% 35%,#ffd27a,#ff6a3d 55%,#ff375f);box-shadow:0 0 12px #ff375f88}
+  .brand small{display:block;color:var(--t3);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;margin-top:1px}
 
-  /* Lumières : pièces en grille */
-  .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;padding:0}
-  .room:hover{filter:brightness(1.06)}
+  /* Synchro : pochette à gauche, tout le reste aligné à droite */
+  .view[data-view=sync].on{display:grid;align-content:center;min-height:100vh;padding-top:40px;padding-bottom:40px;
+        grid-template-columns:minmax(260px,400px) minmax(0,1fr);column-gap:56px;
+        grid-template-areas:"cover head" "cover title" "cover sub" "cover leds" "cover pbar" "cover chip" "cover ctrls" "cover dock"}
+  .stage{display:contents}
+  .coverwrap{grid-area:cover;width:100%;align-self:center}
+  .syhead{grid-area:head;justify-content:flex-start;padding:0;margin-bottom:22px}
+  .zonebtn{align-items:flex-start;padding:0}
+  .zonebtn b{font-size:15px;color:var(--t2)}
+  .stitle{grid-area:title;margin:0;padding:0;text-align:left;font-size:32px;line-height:1.15}
+  .ssub{grid-area:sub;margin-top:6px}
+  .leds{grid-area:leds;width:100%;justify-content:flex-start;margin-top:22px}
+  .pbar{grid-area:pbar;width:100%;margin-top:14px}
+  .pchip{grid-area:chip;justify-self:start}
+  .ctrls{grid-area:ctrls;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:30px 0 0}
+  .ctrl{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto auto;column-gap:14px;row-gap:2px;align-items:center;
+        padding:14px;border-radius:16px;background:var(--card);text-align:left}
+  .ctrl .ci{grid-row:1/3;width:46px;height:46px;background:var(--card2)}
+  .ctrl .ci svg{width:22px;height:22px}
+  .ctrl small{align-self:end;font-size:10.5px}
+  .ctrl em{align-self:start;font-size:16px;font-weight:600}
+  .ctrl:hover{background:#2c2d33}
+  .dock{grid-area:dock;margin:22px 0 0;justify-content:space-between;padding:0 6px}
+  .dock .side{flex-direction:row;width:auto;gap:10px;padding:12px 16px;border-radius:14px;background:var(--card)}
+  .dock .side:hover{background:#2c2d33;color:#fff}
+  .dock .side svg{width:22px;height:22px}
+  .power{width:76px!important;height:76px!important;flex:none}
+  .dock .side{white-space:nowrap}
+  .power svg{width:30px;height:30px}
 
-  /* Pièce : plan à gauche, scènes et lampes à droite */
-  .pgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:32px;align-items:start;margin-top:20px}
-  .pgrid .pl{position:sticky;top:20px}
+  /* Lumières */
+  .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;padding:0}
+
+  /* Pièce : bandeau sur une ligne, puis plan à gauche et scènes à droite */
+  .rhead{margin:40px 0 0;border-radius:20px;padding:14px 18px;display:flex;align-items:center;gap:16px}
+  .rhead>div:first-child{display:contents!important}
+  .rhead>div:first-child>span{font-size:24px!important;font-weight:800!important}
+  .rhead .sl{order:2;flex:none;width:min(340px,28vw);margin:0 6px!important}
+  .rhead #pPow{order:3}
+  .pgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;align-items:start;margin-top:24px}
+  .pgrid .pl{position:sticky;top:24px}
   .pgrid .plan{margin:0}
-  .pgrid .spr{margin:14px 4px 0}
+  .pgrid .spr{margin:14px 2px 0}
   .pgrid .pr .label.in:first-child{padding-top:0}
-  .rhead{margin:20px 0 0;border-radius:24px;padding:18px 22px 22px}
-  .grid3{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
-  .grid2{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+  .grid3{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+  .grid2{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
 
-  /* écrans de réglages : colonne lisible, listes en cartes */
-  .view[data-view=reglages],.view[data-view=lampe],.view[data-view=creer]{max-width:820px}
-  .view[data-view=plans],.view[data-view=plan],.view[data-view=avances]{max-width:1000px}
-  .list{border-radius:18px;overflow:hidden}
-  .row:hover{background:rgba(255,255,255,.03)}
+  /* listes en cartes, plan à la hauteur de l'écran */
+  .list{border-radius:16px;overflow:hidden}
+  .row{min-height:66px}
+  .row:hover{background:#2a2b30}
   .stagebox{margin:18px 0 0}
-  .proom{max-width:min(860px,calc((100vh - 190px) * 1.3));margin:0 auto}
+  .proom{max-width:min(100%,calc((100vh - 220px) * 1.3))}
+  .wheel{width:300px}
 
   /* feuilles → fenêtres au centre */
-  .sheet{top:50%;bottom:auto;left:calc(50% + var(--side) / 2);right:auto;width:min(600px,calc(100vw - var(--side) - 64px));margin:0;max-height:84vh;
-         border-radius:22px;padding:0 22px 24px;opacity:0;pointer-events:none;transform:translate(-50%,-47%) scale(.97);
-         transition:transform .22s cubic-bezier(.2,.8,.2,1),opacity .18s;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+  .sheet{top:50%;bottom:auto;left:calc(50% + var(--side) / 2);right:auto;width:min(560px,calc(100vw - var(--side) - 64px));margin:0;max-height:84vh;
+         border-radius:20px;padding:0 22px 24px;opacity:0;pointer-events:none;transform:translate(-50%,-48%) scale(.98);
+         transition:transform .2s cubic-bezier(.2,.8,.2,1),opacity .16s;box-shadow:0 30px 80px rgba(0,0,0,.55),0 0 0 1px #34353a}
   .sheet.open{transform:translate(-50%,-50%);opacity:1;pointer-events:auto}
   .sheet .grab{display:none}
-  .sheet .sh{margin:0 -22px 12px;padding:20px 22px 12px}
+  .sheet .sh{margin:0 -22px 14px;padding:20px 22px 12px}
   .toast{left:calc(50% + var(--side) / 2);bottom:32px}
 
-  /* souris : survol et pas d'écrasement au clic */
-  .tile:hover,.orb:hover,.lamp:hover,.cta:hover,.rb:hover{filter:brightness(1.12)}
-  button:active{transform:scale(.98)}
+  /* souris */
+  .tile:hover,.orb:hover,.lamp:hover,.room:hover{filter:brightness(1.1)}
+  button:active{transform:none;opacity:.85}
   .proom .spot:active{cursor:grabbing}
 }
 @media (min-width:960px) and (max-height:760px){
-  .coverwrap{width:min(30vw,360px,50vh)}
+  .view[data-view=sync].on{grid-template-columns:minmax(240px,320px) minmax(0,1fr)}
+}
+@media (min-width:960px) and (max-width:1199px){
+  :root{--side:200px;--gut:28px}
+  .view[data-view=sync].on{grid-template-columns:minmax(220px,300px) minmax(0,1fr);column-gap:36px}
+  .stitle{font-size:26px}
+  .dock .side{padding:10px 12px;letter-spacing:.5px}
+  .dock .side span{display:none}
 }
 </style>
 </head>
@@ -4126,6 +4637,10 @@ button:active{transform:scale(.96);opacity:.82}
     <p class="note" style="padding:16px 20px 0">Place tes lampes comme dans la vraie pièce. La synchro (Comète, Vague, Stéréo…) et les couleurs des scènes suivent ce plan.</p>
     <div id="plansList"></div>
   </section>
+  <section class="view" data-view="tv">
+    <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t">Téléviseur Ambilight</span></div>
+    <div id="tv"></div>
+  </section>
   <section class="view" data-view="plan">
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t" id="planTitle">Plan</span><button class="txtbtn" id="planSave">OK</button></div>
     <div class="pad" style="padding-top:14px">
@@ -4174,6 +4689,7 @@ button:active{transform:scale(.96);opacity:.82}
       <button class="row" id="bridgeRow"><span class="ic" data-i="pont"></span><span class="bd"><span class="tx"><span class="t1">Pont d'éclairage</span><span class="t2" id="bridgeSub">—</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="lampsRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Lampes de la synchro</span><span class="t2" id="lampsSub">Zone utilisée pour la musique</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="plansRow"><span class="ic" data-i="zones"></span><span class="bd"><span class="tx"><span class="t1">Pièces et zones de synchro</span><span class="t2">Plans, et création des zones pour la musique</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
+      <button class="row" id="tvRow"><span class="ic" data-i="tv"></span><span class="bd"><span class="tx"><span class="t1">Téléviseur Ambilight</span><span class="t2" id="tvSub">Synchro vidéo du ruban et des spots</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button>
       <button class="row" id="syncRow" role="switch"><span class="ic" data-i="sync"></span><span class="bd"><span class="tx"><span class="t1">Synchro active</span><span class="t2" id="syncSub">—</span></span><span class="sw" id="syncSw"><i></i></span></span></button>
     </div>
     <div class="label">Son · AirPlay</div>
@@ -4411,7 +4927,7 @@ function slider(el, onValue, onEnd) {
 function setSl(el, t) { t = Math.max(0, Math.min(1, t)); el.querySelector(".fi").style.width = t * 100 + "%"; el.querySelector(".kn").style.left = t * 100 + "%"; }
 
 /* =================== NAVIGATION =================== */
-const TAB_OF = { sync: "sync", avances: "sync", lumieres: "lumieres", piece: "lumieres", lampe: "lumieres", creer: "lumieres", reglages: "reglages", plans: "reglages", plan: "reglages" };
+const TAB_OF = { sync: "sync", avances: "sync", lumieres: "lumieres", piece: "lumieres", lampe: "lumieres", creer: "lumieres", reglages: "reglages", plans: "reglages", plan: "reglages", tv: "reglages" };
 let route = { v: "sync", arg: "" }, backTo = [];
 function go(v, arg = "", push = true) {
   if (push && route.v !== v) backTo.push({ ...route });
@@ -4439,6 +4955,7 @@ function render() {
   if (v === "reglages") renderReglages();
   if (v === "plans") renderPlans();
   if (v === "plan") renderPlan();
+  if (v === "tv") renderTv();
 }
 
 /* =================== PLANS DES PIÈCES =================== */
@@ -5267,6 +5784,93 @@ function renderBt() {
   $("#btOffset").classList.toggle("hidden", !BT.selected);
 }
 
+
+/* =================== TÉLÉVISEUR AMBILIGHT =================== */
+let TV = null, tvTimer = null, tvTest = null, tvBusy = false;
+const TVD = { on: false, x: .5, w: 1.23, back: .35, spots: .3, hz: 12, smooth: "normale", flip: false };
+const tvCfg = () => ({ ...TVD, ...(S.settings.tv || {}) });
+function tvSave(k, v) { save({ tv: { ...tvCfg(), [k]: v } }); }
+$("#tvRow").onclick = () => { tvTest = null; go("tv"); };
+async function loadTv() {
+  clearTimeout(tvTimer);
+  if ((route.v === "tv" || route.v === "reglages") && !document.hidden) { try { TV = await api("/api/tv"); if (route.v === "tv") renderTv(true); tvSubline(); } catch (e) {} }
+  tvTimer = setTimeout(loadTv, route.v === "tv" ? 2000 : 6000);
+}
+function tvPower(t) { const e = t && t.engine; if (!t || !t.paired) return "Non appairée"; if (!tvCfg().on) return "Appairée · synchro vidéo coupée"; if (!e) return "Appairée · synchro arrêtée"; if (e.error) return e.error; if (e.power === "On") return e.active ? `Allumée · ${e.rate} images/s` : "Allumée"; return e.power ? "En veille" : "Connexion…"; }
+function tvSubline() { const el = $("#tvSub"); if (el && TV) el.textContent = TV.paired ? tvPower(TV) : "Synchro vidéo du ruban et des spots"; }
+function tvSlider(id, label, val, txt, hint) { return `<div class="row" style="align-items:flex-start;padding:16px 0 12px"><span style="flex:1;padding:0 22px"><span style="display:flex;justify-content:space-between"><span class="t1" style="font-size:17px;font-weight:600">${label}</span><span class="val" id="${id}V" style="color:var(--t2)">${txt}</span></span><div class="sl" id="${id}" style="margin:10px 0 6px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>${hint ? `<span style="color:var(--t3);font-size:14px">${hint}</span>` : ""}</span></div>`; }
+function tvPlanSvg() {   // la pièce vue de dessus, TV en haut, lampes de la zone de synchro
+  const c = tvCfg(), pl = (S.settings.plans || {})[S.settings.area] || {}, dm = pl.dims || {}, W = +dm.w || 4, D = +dm.d || W;
+  const H = Math.max(40, Math.min(110, 100 * D / W)), tw = Math.min(1, c.w / W) * 100, tx = c.x * 100 - tw / 2;
+  const cols = live.state === "syncing" && live.source === "tv" ? live.colors || [] : [];
+  const dots = Object.values(pl.ch || {}).map((q, i) => `<circle cx="${(q.x * 100).toFixed(1)}" cy="${(q.y * H).toFixed(1)}" r="2.6" fill="${cols[i] ? boost(cols[i], 200) : "#8d8e94"}"/>`).join("");
+  return `<svg viewBox="-4 -6 108 ${H + 10}" style="display:block;width:100%;max-height:260px"><rect x="0" y="0" width="100" height="${H}" rx="3" fill="#1f2024" stroke="#3a3b40"/><rect x="${tx.toFixed(1)}" y="-3" width="${tw.toFixed(1)}" height="3" rx="1" fill="#fff"/>${dots}</svg>` +
+    (pl.ch ? "" : `<p class="hint" style="margin:6px 4px 0">La zone choisie n'a pas encore de plan : les lampes seront placées d'après le pont. Fais le plan dans « Pièces et zones de synchro » pour un meilleur résultat.</p>`);
+}
+function renderTv(fromPoll) {
+  const el = $("#tv"); if (!el) return;
+  if (!TV) { el.innerHTML = `<p class="note" style="padding:16px 20px">Chargement…</p>`; loadTv(); return; }
+  if (fromPoll && (document.activeElement && el.contains(document.activeElement) || tvBusy || $("#tv .sl.drag"))) { const st = $("#tvState"); if (st) st.textContent = tvPower(TV); return; }
+  const c = tvCfg(), pr = TV.pairing || {};
+  let h = `<p class="note" style="padding:16px 20px 0">Lueur lit les couleurs de l'Ambilight et les répartit sur ta zone de synchro selon le plan de la pièce : chaque segment du ruban prend la couleur du côté de l'écran le plus proche de lui. La musique reste prioritaire.</p>`;
+  if (!TV.paired) {
+    const pin = pr.state === "pin";
+    h += `<div class="label">Appairage</div><div class="list">
+      <label class="row"><span class="ic">${icon("tv")}</span><span class="bd"><span class="tx"><span class="t1">IP de la TV</span></span><input class="val" id="tvIp" inputmode="decimal" placeholder="192.168.1.50" value="${esc(TV.ip || "")}" autocomplete="off"></span></label>
+      ${pin ? `<label class="row"><span class="ic"></span><span class="bd"><span class="tx"><span class="t1">Code affiché sur la TV</span></span><input class="val" id="tvPin" inputmode="numeric" maxlength="8" autocomplete="one-time-code"></span></label>` : ""}
+    </div>
+    <div class="pad"><button class="cta" id="tvGo">${pin ? "Valider le code" : "Appairer"}</button></div>
+    <p class="note" id="tvMsg" style="color:${pr.state === "error" ? "var(--red)" : "var(--t2)"}">${esc(pr.message || "La TV doit être allumée. Son adresse se trouve dans Paramètres › Réseau sur la TV.")}</p>`;
+    el.innerHTML = h;
+    $("#tvGo").onclick = async () => {
+      tvBusy = true; $("#tvGo").disabled = true; $("#tvGo").textContent = "Patiente…";
+      try { TV = pin ? await api("/api/tv/pin", { pin: $("#tvPin").value }) : await api("/api/tv/pair", { ip: $("#tvIp").value.trim() }); if (TV.paired) { save({ tv: { ...tvCfg(), on: true } }, true); toast("TV appairée"); } } catch (e) { toast(e.message); }
+      tvBusy = false; renderTv();
+    };
+    return;
+  }
+  const t = tvTest;
+  h += `<div class="label">Téléviseur</div><div class="list">
+    <div class="row"><span class="ic">${icon("tv")}</span><span class="bd"><span class="tx"><span class="t1">${esc(TV.model || "TV Philips")}</span><span class="t2" id="tvState">${esc(tvPower(TV))}</span></span><span class="val" style="color:var(--t3)">${esc(TV.ip)}</span></span></div>
+    <button class="row" id="tvOn" role="switch" aria-checked="${c.on}"><span class="ic">${icon("sync")}</span><span class="bd"><span class="tx"><span class="t1">Synchro vidéo</span><span class="t2">Dès que la TV est allumée et qu'aucune musique ne joue</span></span><span class="sw ${c.on ? "on" : ""}"><i></i></span></span></button>
+    <button class="row" id="tvTestB" ${tvBusy ? "disabled" : ""}><span class="ic" style="color:var(--blue)">${tvBusy ? '<span class="spin"></span>' : icon("sliders")}</span><span class="bd"><span class="tx"><span class="t1" style="color:var(--blue)">${tvBusy ? "Mesure en cours…" : "Mesurer la liaison"}</span><span class="t2">20 lectures des couleurs de l'Ambilight</span></span></span></button>
+  </div>`;
+  if (t) h += t.ok ? `<div class="pad" style="padding-top:12px"><div style="background:var(--card);border-radius:16px;padding:14px 16px">
+      <div style="display:flex;justify-content:space-between;font-size:15px"><span>Lectures par seconde</span><b style="color:${t.hz >= 10 ? "var(--green)" : t.hz >= 5 ? "#ffd60a" : "var(--red)"}">${t.hz}</b></div>
+      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Temps de réponse</span><span>${t.ms} ms (max ${t.ms_max} ms)</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Pixels Ambilight</span><span>${Object.entries(t.sides).filter(([, n]) => n).map(([k, n]) => ({ left: "gauche", top: "haut", right: "droite", bottom: "bas" }[k] + " " + n)).join(" · ")}</span></div>
+      ${["left", "top", "right"].filter(k => t.preview[k]).map(k => `<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><small style="width:44px;color:var(--t3)">${{ left: "Gauche", top: "Haut", right: "Droite" }[k]}</small><div style="flex:1;height:14px;border-radius:7px;background:linear-gradient(90deg,${t.preview[k].join(",")})"></div></div>`).join("")}
+      <p class="hint" style="margin:10px 0 0">${t.hz >= 10 ? "Liaison rapide : la synchro vidéo sera fluide." : t.hz >= 5 ? "Liaison correcte : choisis la fluidité « Douce » pour lisser." : "Liaison lente : la synchro suivra l'image avec du retard."}${t.mode && t.mode !== "internal" ? ` Mode Ambilight actuel : « ${esc(t.mode)} ».` : ""}</p></div></div>`
+    : `<p class="note" style="color:var(--red)">${esc(t.message || "Mesure impossible.")}</p>`;
+  h += `<div class="label">Placement dans la pièce</div><div class="pad" style="padding-top:4px"><div style="background:var(--card);border-radius:16px;padding:12px">${tvPlanSvg()}</div></div>
+  <div class="list">
+    ${tvSlider("tvX", "Position de la TV", c.x, c.x < .45 ? "à gauche" : c.x > .55 ? "à droite" : "au centre", "Le long du mur de l'écran (en haut du plan).")}
+    ${tvSlider("tvW", "Largeur de l'écran", (c.w - .5) / 2, c.w.toFixed(2).replace(".", ",") + " m", "Une 55 pouces fait environ 1,23 m de large.")}
+  </div>
+  <div class="label">Rendu</div><div class="pad" style="padding-top:0"><div class="seg" id="tvSmooth">${[["vive", "Vive"], ["normale", "Normale"], ["douce", "Douce"]].map(([k, v]) => `<button data-sm="${k}" class="${c.smooth === k ? "on" : ""}">${v}</button>`).join("")}</div></div>
+  <div class="list" style="margin-top:12px">
+    ${tvSlider("tvBack", "Fond de la pièce", c.back, Math.round(c.back * 100) + " %", "Luminosité des lampes au mur d'en face, par rapport à celles près de la TV.")}
+    ${tvSlider("tvSpots", "Spots", c.spots, c.spots ? Math.round(c.spots * 100) + " %" : "éteints", "Garde-les bas pour ne pas éclairer l'écran.")}
+    ${tvSlider("tvHz", "Lectures par seconde", (c.hz - 4) / 21, c.hz + " /s", "Plus haut = plus réactif, mais la TV peut ralentir si c'est trop.")}
+    <button class="row" id="tvFlip" role="switch" aria-checked="${c.flip}"><span class="bd" style="padding-left:22px"><span class="tx"><span class="t1">Inverser gauche et droite</span><span class="t2">Si les couleurs de gauche arrivent à droite</span></span><span class="sw ${c.flip ? "on" : ""}"><i></i></span></span></button>
+  </div>
+  <p class="note">Coupe « Ambilight + hue » dans les réglages de la TV : un pont ne joue qu'un flux à la fois, et la TV prendrait les lampes à Lueur.</p>
+  <div class="list"><button class="row" id="tvForget"><span class="bd" style="padding-left:22px"><span class="t1" style="color:var(--red)">Oublier la TV</span></span></button></div><div style="height:24px"></div>`;
+  el.innerHTML = h;
+  $("#tvOn").onclick = () => { tvSave("on", !c.on); renderTv(); };
+  $("#tvFlip").onclick = () => { tvSave("flip", !c.flip); renderTv(); };
+  $$("[data-sm]").forEach(b => b.onclick = () => { tvSave("smooth", b.dataset.sm); renderTv(); });
+  $("#tvForget").onclick = async () => { if (!confirm("Oublier cette TV ? Il faudra refaire l'appairage.")) return; try { TV = await api("/api/tv/forget", {}); S.settings.tv = { ...tvCfg(), on: false }; } catch (e) { toast(e.message); } tvTest = null; renderTv(); };
+  $("#tvTestB").onclick = async () => { tvBusy = true; renderTv(); try { tvTest = await api("/api/tv/test", {}); } catch (e) { tvTest = { ok: false, message: e.message }; } tvBusy = false; renderTv(); };
+  const bind = (id, to, txt, key) => { const sl = $("#" + id); setSl(sl, { tvX: c.x, tvW: (c.w - .5) / 2, tvBack: c.back, tvSpots: c.spots, tvHz: (c.hz - 4) / 21 }[id]);
+    slider(sl, r => { sl.classList.add("drag"); const v = to(r); setSl(sl, r); $("#" + id + "V").textContent = txt(v); S.settings.tv = { ...tvCfg(), [key]: v }; const pv = $("#tv svg"); if (pv) pv.outerHTML = tvPlanSvg().split("</svg>")[0] + "</svg>"; tvSave(key, v); }, () => sl.classList.remove("drag")); };
+  bind("tvX", r => Math.round(r * 100) / 100, v => v < .45 ? "à gauche" : v > .55 ? "à droite" : "au centre", "x");
+  bind("tvW", r => Math.round((.5 + r * 2) * 20) / 20, v => v.toFixed(2).replace(".", ",") + " m", "w");
+  bind("tvBack", r => Math.round(r * 20) / 20, v => Math.round(v * 100) + " %", "back");
+  bind("tvSpots", r => Math.round(r * 20) / 20, v => v ? Math.round(v * 100) + " %" : "éteints", "spots");
+  bind("tvHz", r => Math.round(4 + r * 21), v => v + " /s", "hz");
+}
+
 /* =================== PREMIER LANCEMENT / APPAIRAGE =================== */
 let bridges = [], picked = "", manual = false, forcedWelcome = false;
 function showWelcome(force) { forcedWelcome = !!force; $("#welcome").classList.remove("hidden"); $("#app").classList.add("hidden"); $("#wStep0").classList.remove("hidden"); $("#wStep1").classList.add("hidden"); $("#wGo").textContent = "Continuer"; discover(); }
@@ -5318,7 +5922,7 @@ async function liveLoop() {
 const Q = new URLSearchParams(location.search);
 go(Q.get("v") || load("tab") || "sync", Q.get("a") || "", false);
 if (Q.get("sheet")) setTimeout(() => openSheet(Q.get("sheet")), 900);
-refresh(); setInterval(() => !document.hidden && refresh(), 3000); setInterval(() => !document.hidden && S && route.v === "sync" && renderProgress(), 500); liveLoop(); loadRooms(); loadBt();
+refresh(); setInterval(() => !document.hidden && refresh(), 3000); setInterval(() => !document.hidden && S && route.v === "sync" && renderProgress(), 500); liveLoop(); loadRooms(); loadBt(); loadTv();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); loadRooms(); } });
 </script>
 </body>
