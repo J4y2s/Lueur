@@ -1602,6 +1602,40 @@ def tv_read(client, src):
     return fr, src
 
 
+def tv_amb_apply(client, amb):
+    """Ambilight comme une lampe : couleur fixe (`amb` = {on, color, bri}), ou une couleur par pixel
+    (`amb["pix"]` = {left, top, right}, vu de face : gauche de bas en haut, haut de gauche à droite,
+    droite de haut en bas), ou éteint. `amb["flip"]` : même inversion gauche/droite que la synchro vidéo."""
+    if amb and amb.get("on"):
+        k = max(1, min(100, int(amb.get("bri") or 80))) / 100
+
+        def rgb(h):
+            h = str(h or amb.get("color") or "#ffb36b").lstrip("#")
+            try:
+                return {c: int(int(h[i:i + 2], 16) * k) for c, i in zip("rgb", (0, 2, 4))}
+            except ValueError:
+                return {"r": 0, "g": 0, "b": 0}
+
+        client.request("POST", "/6/ambilight/power", {"power": "On"})
+        client.request("POST", "/6/ambilight/mode", {"current": "manual"})
+        pix = amb.get("pix") if isinstance(amb.get("pix"), dict) else None
+        if pix:
+            left, top, right = (list(pix.get(s) or []) for s in ("left", "top", "right"))
+            # la TV numérote ses pixels dans le sens des aiguilles d'une montre, vu de face, comme `pix`
+            if amb.get("flip"):          # TV vue en miroir : gauche ↔ droite, chaque côté retourné
+                left, right, top = right[::-1], left[::-1], top[::-1]
+            layer = {}
+            for side, cols in (("left", left), ("top", top), ("right", right)):
+                if cols:
+                    layer[side] = {str(i): rgb(c) for i, c in enumerate(cols)}
+            client.request("POST", "/6/ambilight/cached", {"layer1": layer})
+        else:
+            client.request("POST", "/6/ambilight/cached", rgb(amb.get("color")))
+    else:
+        client.request("POST", "/6/ambilight/mode", {"current": "internal"})
+        client.request("POST", "/6/ambilight/power", {"power": "Off"})
+
+
 def tv_load(conf_dir):
     try:
         with open(os.path.join(conf_dir, TV_FILE)) as f:
@@ -1626,12 +1660,14 @@ class TvWatcher:
     def __init__(self, conf_dir):
         self.conf_dir = conf_dir
         self.enabled, self.video, self.music, self.hz = False, False, False, 12
+        self.lamp = {}
         self.frame, self.frame_t, self.power, self.error, self.rate = None, 0.0, None, "", 0.0
         self.src = "processed"
         self.mapper = None               # VideoMapper : positions des lampes et de la TV sur le plan
         self.pushed, self.push_t = None, 0.0
         self.ambi_on, self.ambi_prev, self.topo, self.ambi_last, self.ambi_sent = False, None, None, None, 0.0
         self.fails = 0
+        self.here = True                 # la zone de synchro en cours est celle de la TV (ou TV non rattachée)
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
         threading.Thread(target=self._power_loop, daemon=True).start()
@@ -1672,6 +1708,7 @@ class TvWatcher:
 
     def configure(self, tv):
         self.video = bool(tv.get("on"))
+        self.lamp = {**tv["amb"], "flip": tv.get("flip")} if isinstance(tv.get("amb"), dict) else {}
         self.music = bool(tv.get("music", True))
         self.enabled = self.video or self.music
         try:
@@ -1695,7 +1732,7 @@ class TvWatcher:
     def info(self):
         return {"on": self.video, "music": self.music, "power": self.power, "rate": round(self.rate, 1),
                 "error": self.error, "active": self.active, "src": self.src, "ambi": self.ambi_on,
-                "fails": self.fails}
+                "fails": self.fails, "here": self.here}
 
     # --- Ambilight piloté par la musique ---
     def _flag(self):
@@ -1722,9 +1759,12 @@ class TvWatcher:
         prev = self.ambi_prev
         self.ambi_on, self.ambi_last = False, None
         try:
-            client.request("POST", "/6/ambilight/mode", {"current": "internal"})
-            if prev and prev != "On" and self.power != "On":
-                client.request("POST", "/6/ambilight/power", {"power": prev})
+            if (self.lamp or {}).get("on"):          # l'Ambilight était allumé comme une lampe : on remet sa couleur
+                tv_amb_apply(client, self.lamp)
+            else:
+                client.request("POST", "/6/ambilight/mode", {"current": "internal"})
+                if prev and prev != "On" and self.power != "On":
+                    client.request("POST", "/6/ambilight/power", {"power": prev})
         finally:
             try:
                 os.remove(self._flag())
@@ -2249,9 +2289,13 @@ def cmd_run(args):
                     colors.append((cid, *(max(b, w) for b in base)))
                 session.send(colors)
                 continue
+            # La TV peut être rattachée à une zone (sa pièce) : ailleurs, elle est ignorée
+            if tv:
+                tv_area = settings["tv"].get("area") or ""
+                tv.here = not tv_area or tv_area == area["id"]
             # Synchro vidéo : la TV est allumée et aucune musique ne joue (la musique reste prioritaire)
             music = rms >= 0.001 or airplay_on
-            if tv and tv.active and not music:
+            if tv and tv.here and tv.active and not music:
                 fr = tv.get()
                 if fr is not None:
                     if not video_on:
@@ -2288,7 +2332,7 @@ def cmd_run(args):
                 delayed.popleft()
             colors = delayed[0]
             session.send(colors)
-            if tv and session.active:
+            if tv and tv.here and session.active:
                 tv.push(colors)             # TV en veille : l'Ambilight suit la musique
             if beat:
                 beats += 1
@@ -2710,6 +2754,8 @@ def clean_tv(d):
     num = lambda k, lo, hi, dflt: max(lo, min(hi, float(d[k]))) if isinstance(d.get(k), (int, float)) else dflt
     out["on"] = bool(d.get("on"))
     out["music"] = bool(d.get("music", True))             # TV en veille : l'Ambilight suit la musique
+    a = str(d.get("area") or "")
+    out["area"] = a if re.match(r"^[0-9a-f-]{36}$", a) else ""   # zone de synchro de la pièce de la TV ("" = toutes)
     out["x"] = round(num("x", 0.0, 1.0, 0.5), 3)          # centre de la TV le long du mur (0-1)
     out["w"] = round(num("w", 0.3, 4.0, 1.23), 2)         # largeur de la TV en mètres
     out["back"] = round(num("back", 0.0, 1.0, 0.35), 2)   # luminosité au fond de la pièce
@@ -2717,6 +2763,7 @@ def clean_tv(d):
     out["hz"] = int(num("hz", 4, 25, 12))
     out["smooth"] = d.get("smooth") if d.get("smooth") in ("vive", "normale", "douce") else "normale"
     out["flip"] = bool(d.get("flip"))
+    out["amb"] = clean_amb(d.get("amb"))          # l'Ambilight comme une lampe (couleur fixe)
     return out
 
 
@@ -2789,6 +2836,55 @@ def tv_forget():
     write_json(SETTINGS_PATH, s)
     tv_pairing.update(state="idle", message="")
     return tv_state()
+
+
+AMB_SIDES = ("left", "top", "right")
+
+
+def clean_amb(d):
+    """L'Ambilight piloté comme une lampe : allumé, couleur, luminosité, et couleurs pixel par pixel
+    (`pix` = {left: [...], top: [...], right: [...]}, vu de face ; None = une seule couleur partout)."""
+    d = d if isinstance(d, dict) else {}
+    col = d.get("color") if isinstance(d.get("color"), str) and HEX_RE.match(d.get("color")) else "#ffb36b"
+    try:
+        bri = max(1, min(100, int(d.get("bri", 80))))
+    except (TypeError, ValueError):
+        bri = 80
+    pix = None
+    if isinstance(d.get("pix"), dict):
+        pix = {}
+        for side in AMB_SIDES:
+            v = d["pix"].get(side)
+            v = v if isinstance(v, list) else []
+            pix[side] = [c if isinstance(c, str) and HEX_RE.match(c) else col for c in v[:16]]
+        if not any(pix.values()):
+            pix = None
+    return {"on": bool(d.get("on")), "color": col, "bri": bri, "pix": pix}
+
+
+def tv_ambilight(body):
+    """Allume l'Ambilight en couleur fixe (comme une lampe), change sa couleur ou sa luminosité,
+    ou l'éteint. Indépendant de l'allumage de la TV."""
+    c = hms.tv_load(CONF_DIR)
+    if not c:
+        raise ValueError("TV non appairée.")
+    s = get_settings()
+    tv = clean_tv(s.get("tv") or {})
+    amb = clean_amb({**tv.get("amb", {}), **{k: body[k] for k in ("on", "color", "bri", "pix") if k in body}})
+    if "color" in body and "pix" not in body:
+        amb["pix"] = None                      # une seule couleur : tous les pixels pareils
+    if ("color" in body or "bri" in body or "pix" in body) and "on" not in body:
+        amb["on"] = True                       # toucher la roue ou la luminosité allume, comme une lampe
+    cl = hms.TvClient(c["ip"], c["user"], c["key"], timeout=4)
+    try:
+        hms.tv_amb_apply(cl, {**amb, "flip": tv.get("flip")})
+    except hms.TvError as e:
+        raise ValueError(f"La TV ne répond pas ({e}).")
+    finally:
+        cl.close()
+    s["tv"] = {**tv, "amb": amb}
+    write_json(SETTINGS_PATH, s)
+    return {"ok": True, "amb": amb}
 
 
 def tv_test():
@@ -3226,6 +3322,21 @@ def set_light(body):
     if body.get("mirek"):
         b["color_temperature"] = {"mirek": max(153, min(500, int(body["mirek"])))}
         b.setdefault("on", {"on": True})
+    grad = body.get("gradient")
+    if isinstance(grad, list) and grad:         # dégradé point par point, comme l'app Hue (2 à 5 points)
+        gh = [c for c in grad if isinstance(c, str) and HEX_RE.match(c)][:GRAD_POINTS]
+        if len(gh) < 2:
+            raise ValueError("Il faut 2 à 5 couleurs.")
+        gxy = [hex_to_xy(c) for c in gh]
+        gb = {"points": [{"color": {"xy": {"x": x, "y": y}}} for x, y in gxy]}
+        if body.get("mode") in GRAD_MODES:
+            gb["mode"] = body["mode"]
+        b["gradient"] = gb
+        b.pop("color", None)
+        APPLIED[body.get("id")] = {"grad": gh, "gxy": gxy}
+        b.setdefault("on", {"on": True})
+    elif body.get("mode") in GRAD_MODES:        # changer seulement le style du dégradé
+        b["gradient"] = {"mode": body["mode"]}
     _put(cfg, "light", body.get("id"), b)
     return {"ok": True}
 
@@ -4278,9 +4389,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, identify_light(body))
                 except hms.HueError as e:
                     return self._send(502, {"error": str(e)})
-            if path in ("/api/tv/pair", "/api/tv/pin", "/api/tv/forget", "/api/tv/test"):
+            if path in ("/api/tv/pair", "/api/tv/pin", "/api/tv/forget", "/api/tv/test", "/api/tv/ambilight"):
                 fn = {"/api/tv/pair": lambda: tv_pair(body), "/api/tv/pin": lambda: tv_pin(body),
-                      "/api/tv/forget": tv_forget, "/api/tv/test": tv_test}[path]
+                      "/api/tv/forget": tv_forget, "/api/tv/test": tv_test, "/api/tv/ambilight": lambda: tv_ambilight(body)}[path]
                 return self._send(200, fn())
             if path == "/api/palettes":
                 return self._send(200, save_palette(body))
@@ -4539,6 +4650,31 @@ body.locked{overflow:hidden}
 .srow .h span:last-child{color:var(--t2)}
 .hint{margin:2px 0 8px;color:var(--t3);font-size:13px;line-height:1.4}
 
+/* ---- cartes (écran TV, page Pièce) ---- */
+.tcard{background:var(--card);border-radius:18px;padding:14px 16px}
+.tcard .srow{padding:12px 0 2px}.tcard .srow .h{font-size:15px}.tcard .srow .hint{margin:4px 0 0}
+.tcard .seg{background:var(--card2)}
+.tstats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.tstat{background:var(--card2);border-radius:14px;padding:10px 8px;text-align:center;display:flex;flex-direction:column;gap:2px}
+.tstat b{font-size:20px;font-weight:700}.tstat small{color:var(--t2);font-size:11px;letter-spacing:.5px;text-transform:uppercase}
+.tstrip{display:flex;align-items:center;gap:10px;margin-top:8px}.tstrip small{width:52px;color:var(--t3);font-size:12px}
+.tstrip div{flex:1;height:12px;border-radius:6px}
+.tplan{background:#141518;border-radius:14px;padding:10px;border:1px solid #2c2d32}
+.tsw{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:14px 0 2px;color:#fff}
+.tsw .tx{flex:1;display:flex;flex-direction:column;gap:2px}.tsw .tx b{font-size:15px;font-weight:600}.tsw .tx small{color:var(--t2);font-size:13px}
+.tstate{display:inline-flex;align-items:center;gap:6px}.tstate i{width:8px;height:8px;border-radius:50%;background:#636366;flex:none}
+.tstate i.on{background:var(--green);box-shadow:0 0 8px var(--green)}.tstate i.amb{background:var(--orange);box-shadow:0 0 8px var(--orange)}
+.cta.red{color:var(--red)}
+.pcard{background:var(--card);border-radius:18px;margin-top:12px;overflow:hidden}
+.pch{display:flex;align-items:center;gap:12px;width:100%;padding:14px 16px;text-align:left;color:#fff}
+.pch .tx{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}.pch b{font-size:17px}
+.pch small{color:var(--t2);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pch svg.cv{transition:transform .2s;flex:none}.pcard.open .pch svg.cv{transform:rotate(90deg)}
+.pcb{padding:0 16px 16px}.pcard:not(.open) .pcb{display:none}
+.pcb .spr{margin:12px 0 0}.pcb .spr:first-child{margin-top:0}
+.pcb .orb,.pcb .tile,.pcb .seg{background:var(--card2)}.pcb .seg button.on{background:#55565d}
+.pcards{padding:0 16px}
+
 /* ---- pièces ---- */
 .rooms{display:flex;flex-direction:column;gap:12px;padding:0 16px}
 .room{border-radius:22px;padding:16px;display:flex;flex-direction:column;gap:14px;transition:background .3s}
@@ -4562,6 +4698,24 @@ body.locked{overflow:hidden}
 .wheel.white:after{display:none}
 .pin{position:absolute;width:48px;height:48px;margin:-24px 0 0 -24px;border-radius:50%;border:3px solid #fff;box-shadow:0 4px 14px rgba(0,0,0,.45);z-index:2;display:grid;place-items:center;color:#1b1c20;pointer-events:none}
 .pin svg{width:22px;height:22px}
+.pin.gp{width:34px;height:34px;margin:-17px 0 0 -17px;border-width:2px;opacity:.92;transition:width .12s,height .12s,margin .12s}
+.pin.gp b{font-size:13px;font-weight:700;color:#1b1c20}
+.pin.gp.sel{width:50px;height:50px;margin:-25px 0 0 -25px;border-width:3px;opacity:1;z-index:3;box-shadow:0 0 0 4px rgba(0,0,0,.35),0 6px 18px rgba(0,0,0,.5)}
+.gbox{background:var(--card);border-radius:18px;margin:22px 16px 0;padding:14px 16px}
+.gh{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;margin-bottom:10px}.gh .gs{color:var(--t2);font-weight:400;font-size:14px}
+.gbar{height:34px;border-radius:12px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+.gpts{display:flex;gap:10px;margin-top:12px;align-items:center}
+.gpts button{width:40px;height:40px;border-radius:50%;border:2px solid transparent;font-weight:700;font-size:14px;color:#1b1c20}
+.gpts button.on{border-color:#fff;box-shadow:0 0 0 3px rgba(255,255,255,.18)}
+.gpts .gadd{background:#3a3b40;color:#fff;font-size:22px;font-weight:400;border:0}
+.gbox .seg{background:var(--card2)}.gbox .seg button.on{background:#55565d}
+.ghint{font-size:12px;color:var(--t3);margin-top:8px}
+.grow{margin:14px -16px -14px;padding:0 16px;min-height:64px;border-top:1px solid var(--sep,rgba(255,255,255,.08));border-radius:0 0 18px 18px;background:none;width:calc(100% + 32px)}
+.gflip{width:36px;height:36px;border-radius:50%;background:#3a3b40;display:grid;place-items:center;font-size:18px;color:#fff;flex:none}
+.tvpx{position:relative;width:100%;max-width:330px;margin:4px auto 0;aspect-ratio:16/10}
+.tvpx .scr{position:absolute;left:9%;right:9%;top:16%;bottom:8%;border-radius:8px;background:linear-gradient(160deg,#1c1d22,#0b0b0d);box-shadow:inset 0 0 0 2px #3a3b40}
+.tvpx button{position:absolute;width:28px;height:28px;margin:-14px 0 0 -14px;border-radius:50%;border:2px solid rgba(0,0,0,.4);transition:transform .1s}
+.tvpx button.on{border:3px solid #fff;transform:scale(1.12)}
 
 /* ---- création de palette ---- */
 .pick{position:relative;border-radius:18px;overflow:hidden;background:var(--card);min-height:200px;display:grid;place-items:center;margin-top:14px}
@@ -4678,6 +4832,8 @@ button:active{transform:scale(.96);opacity:.82}
   .pgrid .plan{margin:0}
   .pgrid .spr{margin:14px 2px 0}
   .pgrid .pr .label.in:first-child{padding-top:0}
+  .pcards{padding:0}.pgrid .pcard:first-child{margin-top:0}
+  .tplace{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;align-items:center}.pgrid .pl .pcard:first-child{margin-top:14px}
   .grid3{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
   .grid2{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
 
@@ -5682,7 +5838,7 @@ function roomBg(r, angle = 135) {   // dégradé d'une pièce : les couleurs ré
   if (cs.length === 1) cs = [lighten(cs[0], .25), cs[0]];
   return { css: `linear-gradient(${angle}deg, ${cs.map(c => boost(c, 190)).join(", ")})`, colors: cs };
 }
-function planSvg(r) {
+function planSvg(r, tv) {
   const ls = r.lights, pos = ls.map((l, i) => l.pos ? [179 + l.pos.x * 140, 100 - l.pos.y * 64] : [60 + (ls.length > 1 ? i / (ls.length - 1) : .5) * 238, 100]);
   const shapes = ls.map((l, i) => {
     const [x, y] = pos[i], k = lampKind(l.archetype), c = l.on ? boost(l.color, 200) : "#3a3a3c", glow = l.on ? `filter:drop-shadow(0 0 8px ${c})` : "";
@@ -5697,7 +5853,24 @@ function planSvg(r) {
     if (k === "bar") return `<rect x="${x - 26}" y="${y - 6}" width="52" height="12" rx="6" fill="${c}" style="${glow}"/>`;
     return `<circle cx="${x}" cy="${y}" r="${k === "bloom" ? 13 : 10}" fill="${c}" style="${glow}"/>`;
   }).join("");
-  return `<svg viewBox="0 0 358 200" role="img" aria-label="Plan de ${esc(r.name)}"><rect x="18" y="18" width="322" height="164" rx="16" fill="#141416" stroke="#2c2c2e"/>${shapes}</svg>`;
+  return `<svg viewBox="0 0 358 200" role="img" aria-label="Plan de ${esc(r.name)}"><rect x="18" y="18" width="322" height="164" rx="16" fill="#141416" stroke="#2c2c2e"/>${shapes}${tv ? tvOnPlan(r) : ""}</svg>`;
+}
+let PCARD = { scenes: true, lampes: true }; try { PCARD = { ...PCARD, ...JSON.parse(load("pcard") || "{}") }; } catch (e) {}
+const CHEV_R = `<svg class="cv" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8d8e94" stroke-width="2.6" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>`;
+function pcard(key, title, sub, body) {   // carte dépliable de la page Pièce (état mémorisé dans le navigateur)
+  return `<div class="pcard ${PCARD[key] ? "open" : ""}" data-pcard="${key}"><button class="pch" data-pck="${key}"><span class="tx"><b>${title}</b>${sub ? `<small>${sub}</small>` : ""}</span>${CHEV_R}</button><div class="pcb">${body}</div></div>`;
+}
+function tvOfRoom(r) {   // la TV est rattachée à la zone de synchro de cette pièce (« Lueur · <pièce> »)
+  const a = (S.settings.tv || {}).area;
+  if (!a || !Array.isArray(zones)) return null;
+  const z = zones.find(x => x.id === a);
+  return z && z.name === ("Lueur · " + r.name).slice(0, 32) ? z : null;
+}
+function tvOnPlan(r) {   // la TV dessinée en haut du plan de la pièce
+  const c = tvCfg(), W = +(((S.settings.room_plans || {})[r.id] || {}).dims || {}).w || 4;
+  const cx = 179 + (c.x * 2 - 1) * 140, hw = Math.max(14, Math.min(150, c.w / W * 140)), e = (TV && TV.engine) || {};
+  const glow = e.power === "On" ? "filter:drop-shadow(0 0 6px #ffffffaa)" : e.ambi ? "filter:drop-shadow(0 0 6px #ff9f0aaa)" : "";
+  return `<g data-gotv style="cursor:pointer"><rect x="${(cx - hw).toFixed(1)}" y="21" width="${(2 * hw).toFixed(1)}" height="6" rx="3" fill="${e.power === "On" ? "#f2f2f7" : "#8d8e94"}" style="${glow}"/><text x="${cx.toFixed(1)}" y="13" text-anchor="middle" font-size="9" font-weight="700" fill="#8d8e94" letter-spacing="1">TV</text></g>`;
 }
 function renderPiece() {
   const r = ROOMS && !ROOMS.error && ROOMS.find(x => x.id === route.arg);
@@ -5707,20 +5880,30 @@ function renderPiece() {
   const scenes = allPalettes().filter(p => p.scenes);
   const effs = Object.keys(FX_N).filter(k => r.lights.some(l => (l.effects || []).includes(k)));
   const gsup = new Set(r.lights.flatMap(l => l.grad_modes || [])), gmodes = GMODES.filter(([k]) => gsup.has(k));
+  const tvz = tvOfRoom(r);
+  if (tvz && (!TV || Date.now() - (renderPiece.tvAt || 0) > 4000) && !renderPiece.tvBusy) {
+    renderPiece.tvBusy = true; renderPiece.tvAt = Date.now();
+    api("/api/tv").then(x => { const was = JSON.stringify((TV || {}).engine || {}); TV = x; if (route.v === "piece" && JSON.stringify(x.engine || {}) !== was) renderPiece(); }).catch(() => {}).finally(() => { renderPiece.tvBusy = false; });
+  }
   $("#piece").innerHTML = `<div class="rhead" style="background:${r.on ? rb.css : "#232326"};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
     <div style="display:flex;align-items:center;gap:16px"><button class="rb" data-back aria-label="Retour" style="background:${r.on ? (dark ? "rgba(0,0,0,.12)" : "rgba(255,255,255,.18)") : "#3a3b40"};color:inherit">${icon("plus", 22, "currentColor", 2.6).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button>
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
     <button class="pwbtn" id="pPow" aria-label="${r.on ? "Éteindre" : "Allumer"}" style="width:48px;height:48px;background:${r.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 22, "currentColor", 2.4)}</button></div>
     ${r.on ? `<div class="sl" id="pBri" style="margin:18px 4px 2px"><div class="tr" style="background:rgba(0,0,0,.12)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>
     <div class="pgrid"><div class="pl">
-    <div class="plan" style="position:relative">${planSvg(r)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
+    <div class="plan" style="position:relative">${planSvg(r, tvz)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
+    <div class="pcards">
+    ${pcard("reglages", "Réglages des scènes", `${{ lr: "Gauche → droite", fb: "Avant → arrière", tour: "Autour de la pièce", centre: "Centre → murs" }[spread] || ""} · ${(ANIMS.find(a => a[0] === (ANIM[r.id] || 0)) || ANIMS[0])[1]}${gmodes.length > 1 ? " · " + ((GMODES.find(g => g[0] === gmodeOf(r)) || [, ""])[1]) : ""}`, `
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
     <div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Animation des scènes</span><div class="seg wide">${ANIMS.map(([v, n]) => `<button data-anim="${v}" class="${(ANIM[r.id] || 0) === v ? "on" : ""}">${n}</button>`).join("")}</div></div>
     ${gmodes.length > 1 ? `<div class="spr" style="flex-direction:column;align-items:stretch;gap:8px"><span>Rendu du ruban</span><div class="seg wide">${gmodes.map(([k, n]) => `<button data-gmode="${k}" class="${gmodeOf(r) === k ? "on" : ""}">${n}</button>`).join("")}</div><span style="font-size:12px;color:var(--t3)">${GMODE_D[gmodeOf(r)] || ""}</span></div>` : ""}
-    </div><div class="pr">
-    <div class="pad"><div class="label in">Scènes</div><div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>
-    ${effs.length ? `<div class="label in">Effets</div><div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>` : ""}
-    <div class="label in">Lampes</div><div class="grid3">${r.lights.map(l => lampTile(l)).join("")}</div><div style="height:24px"></div></div></div></div>`;
+    `)}
+    </div>
+    </div><div class="pr"><div class="pcards">
+    ${pcard("scenes", "Scènes", scenePick[r.id] && r.on ? esc(palName(scenePick[r.id])) : "Couleurs selon la place de chaque lampe", `<div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>`)}
+    ${effs.length ? pcard("effets", "Effets", r.lights.some(l => l.effect && l.effect !== "no_effect") ? "Un effet est en cours" : "Joués par le pont", `<div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>`) : ""}
+    ${pcard("lampes", "Lampes", `${r.lights.filter(l => l.on).length} allumée${r.lights.filter(l => l.on).length > 1 ? "s" : ""} sur ${r.lights.length}${tvz ? " · Ambilight" : ""}`, `<div class="grid3">${r.lights.map(l => lampTile(l)).join("")}${tvz ? lampTile(tvLamp()) : ""}</div>`)}
+    <div style="height:24px"></div></div></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
   if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 1200; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
   $$("[data-spr]").forEach(b => b.onclick = () => { spread = b.dataset.spr; store("spread", spread); if (scenePick[r.id]) applyScene(r, scenePick[r.id]); else renderPiece(); });
@@ -5732,10 +5915,23 @@ function renderPiece() {
   $$("[data-fx]").forEach(b => b.onclick = () => applyEffect(r, b.dataset.fx));
   $$("[data-lpow]").forEach(b => b.onclick = e => { e.stopPropagation(); lightPower(r, b.dataset.lpow); });
   $$("[data-lamp]").forEach(b => b.onclick = () => go("lampe", r.id + "|" + b.dataset.lamp));
+  $$("[data-pck]").forEach(b => b.onclick = () => { const k = b.dataset.pck; PCARD[k] = !PCARD[k]; store("pcard", JSON.stringify(PCARD)); b.parentElement.classList.toggle("open", PCARD[k]); });
+  $$("[data-gotv]").forEach(b => b.onclick = () => { tvTest = null; go("tv"); });
+
+}
+function tvLamp() {   // l'Ambilight présenté comme une lampe de la pièce
+  const a = tvCfg().amb || {}, e = (TV && TV.engine) || {};
+  return { id: "tv", name: "Ambilight", archetype: "tv", tv: true, on: !!a.on || !!e.ambi, bri: a.bri || 80,
+           color: (a.pix && a.pix.top && a.pix.top[Math.floor(a.pix.top.length / 2)]) || a.color || "#ffb36b", gradient: a.pix ? [...(a.pix.left || []).slice().reverse(), ...(a.pix.top || []), ...(a.pix.right || [])] : [],
+           has_color: true, has_gradient: false, music: !!e.ambi };
+}
+async function tvAmb(patch) {   // envoie la « lampe » Ambilight à la TV
+  S.settings.tv = { ...tvCfg(), amb: { ...(tvCfg().amb || {}), ...patch, ...(patch.color && !patch.pix ? { pix: null } : {}), ...(patch.on === undefined ? { on: true } : {}) } };
+  try { const r = await api("/api/tv/ambilight", patch); S.settings.tv = { ...tvCfg(), amb: r.amb }; } catch (e) { toast(e.message); }
 }
 function lampTile(l) {
-  const k = lampKind(l.archetype), c = boost(l.color, 210), grad = l.gradient && l.gradient.length > 1;
-  let bg = "#2a2b30";
+  const k = l.tv ? "tv" : lampKind(l.archetype), c = boost(l.color, 210), grad = l.gradient && l.gradient.length > 1;
+  let bg = "#34353a";
   if (l.on && grad) {        // le dégradé du ruban tel qu'il est allumé, du début à la fin
     const u = [...new Set(l.gradient)], g = (u.length > 3 ? [u[0], u[Math.floor(u.length / 2)], u[u.length - 1]] : u).map(x => boost(x, 190));
     bg = g.length > 1 ? `linear-gradient(155deg, ${g.map((c, i) => `${c} ${Math.round(8 + i / (g.length - 1) * 84)}%`).join(", ")})` : g[0];
@@ -5746,6 +5942,7 @@ function lampTile(l) {
     <div class="pw"><button class="pwbtn" data-lpow="${l.id}" aria-label="${l.on ? "Éteindre" : "Allumer"} ${esc(l.name)}" style="background:${l.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${l.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div></div>`;
 }
 async function lightPower(r, id) {
+  if (id === "tv") { const on = !tvLamp().on; await tvAmb({ on }); render(); return; }
   const l = r.lights.find(x => x.id === id); l.on = !l.on; r.on = r.lights.some(x => x.on); roomsLock = Date.now() + 1200; render();
   try { await api("/api/light", { id, on: l.on }); } catch (e) { toast(e.message); }
 }
@@ -5764,43 +5961,120 @@ async function applyScene(r, pid) {
 
 /* ----- couleur d'une lampe ----- */
 let wheelMode = "color";
+// roue des couleurs : position ↔ couleur (centre blanc, bord saturé)
+function wheelPos(hex) {
+  const [rr, gg, bb] = hexRgb(hex), mx = Math.max(rr, gg, bb), mn = Math.min(rr, gg, bb);
+  let h = 0; if (mx !== mn) { h = mx === rr ? (gg - bb) / (mx - mn) : mx === gg ? 2 + (bb - rr) / (mx - mn) : 4 + (rr - gg) / (mx - mn); h = (h * 60 + 360) % 360; }
+  const s = mx ? (mx - mn) / mx : 0, d = .5 * Math.min(1, s * 1.1);
+  return [.5 + Math.cos(h * Math.PI / 180) * d, .5 + Math.sin(h * Math.PI / 180) * d];
+}
+function wheelCol(x, y) { const ang = (Math.atan2(y - .5, x - .5) * 180 / Math.PI + 360) % 360; return hsv(ang, Math.min(1, Math.hypot(x - .5, y - .5) * 2), 1); }
+// styles du dégradé, avec les noms de l'app Hue
+const HSTYLES = [["interpolated_palette", "Linéaire", "Les couleurs se fondent d'un point à l'autre."], ["interpolated_palette_mirrored", "Reproduit", "Le dégradé part du centre et se répète en miroir vers les deux bouts."],
+                 ["random_pixelated", "Épars", "Les couleurs sont dispersées le long du ruban."], ["segmented_palette", "Segmenté", "Un bloc net par couleur, côte à côte."]];
+function gradCss(pts, mode) {
+  const c = pts.map(x => boost(x, 200)), n = c.length;
+  if (mode === "segmented_palette") return `linear-gradient(90deg, ${c.map((x, i) => `${x} ${i / n * 100}% ${(i + 1) / n * 100}%`).join(", ")})`;
+  if (mode === "random_pixelated") { const k = [0, 3, 1, 4, 2, 0, 2, 4, 1, 3, 0, 4].map(i => c[i % n]); return `linear-gradient(90deg, ${k.map((x, i) => `${x} ${i / k.length * 100}% ${(i + 1) / k.length * 100}%`).join(", ")})`; }
+  const seq = mode === "interpolated_palette_mirrored" ? [...c.slice().reverse(), ...c.slice(1)] : c;
+  return `linear-gradient(90deg, ${seq.join(", ")})`;
+}
+const LGRAD = {};            // lampe gradient -> {pts, sel} pendant qu'on la règle
+let TVSEL = null;            // pixels de l'Ambilight sélectionnés ("left:0", "top:3"…)
+const TVN = { left: 3, top: 7, right: 3 };
+function tvPix() {           // couleurs des 13 pixels, vues de face (gauche de bas en haut, haut de gauche à droite, droite de haut en bas)
+  const a = tvCfg().amb || {}, p = a.pix || {}, out = {};
+  for (const k of ["left", "top", "right"]) out[k] = Array.from({ length: TVN[k] }, (_, i) => (p[k] && p[k][i]) || a.color || "#ffb36b");
+  return out;
+}
+function tvPixHtml(pix, sel) {
+  const pos = (k, i) => k === "top" ? [8 + (i + .5) / TVN.top * 84, 6] : [k === "left" ? 3 : 97, 22 + (k === "left" ? TVN.left - 1 - i : i) * (64 / Math.max(1, TVN[k] - 1))];
+  return `<div class="tvpx"><div class="scr"></div>${["left", "top", "right"].flatMap(k => pix[k].map((c, i) => { const [x, y] = pos(k, i), id = k + ":" + i;
+    return `<button data-px="${id}" class="${sel.has(id) ? "on" : ""}" style="left:${x}%;top:${y}%;background:${boost(c, 200)};box-shadow:0 0 16px ${boost(c, 200)}aa" aria-label="Pixel ${{ left: "gauche", top: "haut", right: "droite" }[k]} ${i + 1}"></button>`; })).join("")}</div>`;
+}
 function renderLampe() {
-  const [rid, lid] = route.arg.split("|"), r = ROOMS && !ROOMS.error && ROOMS.find(x => x.id === rid), l = r && r.lights.find(x => x.id === lid);
+  const [rid, lid] = route.arg.split("|"), r = ROOMS && !ROOMS.error && ROOMS.find(x => x.id === rid), l = r && (lid === "tv" ? tvLamp() : r.lights.find(x => x.id === lid));
   if (!l) { $("#lampe").innerHTML = '<p class="note">Lampe introuvable.</p>'; return; }
-  const k = lampKind(l.archetype), c = boost(l.color, 210);
+  const k = l.tv ? "tv" : lampKind(l.archetype), c = boost(l.color, 210), color = wheelMode === "color" && l.has_color;
+  const grad = color && l.has_gradient && !l.tv, tvm = color && l.tv;
+  let G = null, pix = null;
+  if (grad) {
+    G = LGRAD[l.id] || (LGRAD[l.id] = { pts: (l.gradient && l.gradient.length > 1 ? l.gradient : [l.color, l.color, l.color]).slice(0, 5), sel: 0 });
+    G.sel = Math.min(G.sel, G.pts.length - 1);
+  }
+  if (tvm) { pix = tvPix(); if (!TVSEL) TVSEL = new Set(["left", "top", "right"].flatMap(s => pix[s].map((_, i) => s + ":" + i))); }
+  const pxCol = id => { const [s, i] = id.split(":"); return pix[s][+i]; };
+  const gmodes = grad ? HSTYLES.filter(([m]) => (l.grad_modes || []).includes(m)) : [], gmode = (grad && l.grad_mode) || "interpolated_palette";
+  const pins = grad ? G.pts.map((p, i) => ({ col: p, i, on: i === G.sel })) : tvm ? (TVSEL.size ? [{ col: pxCol([...TVSEL][0]), i: 0, on: true }] : []) : [{ col: l.color, i: 0, on: true }];
+  const pinHtml = p => `<div class="pin ${grad ? "gp" : ""} ${p.on ? "sel" : ""}" data-pin="${p.i}" style="background:${boost(p.col, 210)}">${grad ? `<b>${p.i + 1}</b>` : icon(k, 22, "#1b1c20", 2.2)}</div>`;
+  const sub = l.on ? (!l.has_color ? "Blanc" : grad ? `Dégradé · ${G.pts.length} couleurs` : tvm && tvCfg().amb && tvCfg().amb.pix ? "Pixel par pixel" : "Couleur") : "Éteinte";
   $("#lampe").innerHTML = `<div class="nh"><button class="rb" data-back aria-label="Retour">${icon("plus", 22, "#fff", 2.6).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button><span class="t">${esc(l.name)}</span></div>
-    <div style="margin:14px 20px 0;color:var(--t2);font-size:14px;text-align:center">${esc(r.name)} · ${l.on ? (l.has_color ? "Couleur" : "Blanc") : "Éteinte"}</div>
+    <div style="margin:14px 20px 0;color:var(--t2);font-size:14px;text-align:center">${esc(r.name)} · ${sub}</div>
     ${l.has_color ? `<div class="seg" style="margin:16px 16px 0"><button data-wm="color" class="${wheelMode === "color" ? "on" : ""}">Couleur</button><button data-wm="white" class="${wheelMode === "white" ? "on" : ""}">Blanc</button></div>` : ""}
-    <div class="wheel ${wheelMode === "white" || !l.has_color ? "white" : ""}" id="wheel"><div class="pin" id="pin" style="background:${c}">${icon(k, 22, "#1b1c20", 2.2)}</div></div>
-    <div style="background:var(--card);border-radius:18px;margin:26px 16px 0;padding:14px 16px 12px"><div style="display:flex;justify-content:space-between"><span style="font-weight:600">Luminosité</span><span style="color:var(--t2)" id="lBriPct">${l.bri} %</span></div><div class="sl" id="lBri" style="margin-top:8px"><div class="tr"></div><div class="fi" style="width:${l.bri}%;background:${c}"></div><div class="kn" style="left:${l.bri}%"></div></div></div>
+    ${tvm ? `<div class="gbox"><div class="gh"><span>Pixels de l'Ambilight</span><span class="gs">${TVSEL.size} sur 13</span></div>${tvPixHtml(pix, TVSEL)}
+      <div class="seg wide" style="margin-top:12px">${[["all", "Tout"], ["left", "Gauche"], ["top", "Haut"], ["right", "Droite"]].map(([g, n]) => { const ids = ["left", "top", "right"].filter(x => g === "all" || x === g).flatMap(x => pix[x].map((_, i) => x + ":" + i)), on = ids.length === TVSEL.size && ids.every(i => TVSEL.has(i)); return `<button data-pxg="${g}" class="${on ? "on" : ""}">${n}</button>`; }).join("")}</div>
+      <div class="ghint">Touche les pixels à colorer, puis choisis la couleur sur la roue.</div></div>` : ""}
+    <div class="wheel ${color ? "" : "white"}" id="wheel">${pins.map(pinHtml).join("")}</div>
+    ${grad ? `<div class="gbox"><div class="gbar" id="gBar" style="background:${gradCss(G.pts, gmode)}"></div>
+      <div class="gpts">${G.pts.map((p, i) => `<button data-gp="${i}" class="${i === G.sel ? "on" : ""}" style="background:${boost(p, 210)}" aria-label="Couleur ${i + 1}">${i + 1}</button>`).join("")}
+        ${G.pts.length < 5 ? `<button class="gadd" id="gAdd" aria-label="Ajouter une couleur">+</button>` : ""}${G.pts.length > 2 ? `<button class="gadd" id="gDel" aria-label="Retirer la couleur ${G.sel + 1}">−</button>` : ""}</div>
+      ${gmodes.length > 1 ? `<div class="gh" style="margin-top:14px"><span>Style</span></div><div class="seg wide">${gmodes.map(([m, n]) => `<button data-gm="${m}" class="${gmode === m ? "on" : ""}">${n}</button>`).join("")}</div><div class="ghint">${(HSTYLES.find(x => x[0] === gmode) || [, , ""])[2]}</div>` : ""}
+      ${l.order ? `<button class="row grow" id="gOrd"><span class="bd"><span class="tx"><span class="t1">Orientation</span><span class="t2">${l.order === "reversed" ? "Inversée" : "Normale"}</span></span><span class="gflip">⇄</span></span></button>` : ""}</div>` : ""}
+    <div style="background:var(--card);border-radius:18px;margin:${grad || tvm ? 16 : 26}px 16px 0;padding:14px 16px 12px"><div style="display:flex;justify-content:space-between"><span style="font-weight:600">Luminosité</span><span style="color:var(--t2)" id="lBriPct">${l.bri} %</span></div><div class="sl" id="lBri" style="margin-top:8px"><div class="tr"></div><div class="fi" style="width:${l.bri}%;background:${c}"></div><div class="kn" style="left:${l.bri}%"></div></div></div>
     <div class="list" style="margin-top:16px"><button class="row" id="lPow" role="switch" style="min-height:64px"><span class="ic">${icon(k, 26)}</span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">Allumée</span></span><span class="sw ${l.on ? "on" : ""}"><i></i></span></span></button></div>`;
   $$("[data-wm]").forEach(b => b.onclick = () => { wheelMode = b.dataset.wm; renderLampe(); });
   $("#lPow").onclick = () => { lightPower(r, l.id); };
-  const wheel = $("#wheel"), pin = $("#pin");
-  const place = (x, y) => { pin.style.left = x * 100 + "%"; pin.style.top = y * 100 + "%"; };
-  // position initiale approximative à partir de la couleur
-  const [rr, gg, bb] = hexRgb(l.color), mx = Math.max(rr, gg, bb), mn = Math.min(rr, gg, bb);
-  if (wheelMode === "white" || !l.has_color) place(.5, .62); else {
-    let h = 0; if (mx !== mn) { h = mx === rr ? (gg - bb) / (mx - mn) : mx === gg ? 2 + (bb - rr) / (mx - mn) : 4 + (rr - gg) / (mx - mn); h = (h * 60 + 360) % 360; }
-    const s = mx ? (mx - mn) / mx : 0, d = .5 * Math.min(1, s * 1.1);
-    place(.5 + Math.cos(h * Math.PI / 180) * d, .5 + Math.sin(h * Math.PI / 180) * d);
-  }
+  const wheel = $("#wheel"), pinEl = i => wheel.querySelector(`[data-pin="${i}"]`);
+  const place = (el, x, y) => { if (el) { el.style.left = x * 100 + "%"; el.style.top = y * 100 + "%"; } };
+  pins.forEach(p => { const [x, y] = color ? wheelPos(p.col) : [.5, .62]; place(pinEl(p.i), x, y); });
   let sendT = null;
+  const later = f => { clearTimeout(sendT); sendT = setTimeout(f, 140); };
+  const sendGrad = () => later(() => { roomsLock = Date.now() + 1500; l.gradient = G.pts.slice(); l.on = true; api("/api/light", { id: l.id, gradient: G.pts, mode: gmode }).catch(er => toast(er.message)); });
+  const sendPix = () => later(() => tvAmb({ pix: tvPix0 }));
+  let tvPix0 = pix;
+  const xy = e => { const rc = wheel.getBoundingClientRect(); let x = (e.clientX - rc.left) / rc.width, y = (e.clientY - rc.top) / rc.height; const d = Math.hypot(x - .5, y - .5); if (d > .5) { x = .5 + (x - .5) * .5 / d; y = .5 + (y - .5) * .5 / d; } return [x, y]; };
   const pick = e => {
-    const rc = wheel.getBoundingClientRect(); let x = (e.clientX - rc.left) / rc.width - .5, y = (e.clientY - rc.top) / rc.height - .5;
-    const d = Math.hypot(x, y); if (d > .5) { x *= .5 / d; y *= .5 / d; }
-    place(x + .5, y + .5);
+    const [x, y] = xy(e);
+    if (grad) {
+      const col = wheelCol(x, y); G.pts[G.sel] = col; place(pinEl(G.sel), x, y); pinEl(G.sel).style.background = boost(col, 210);
+      const ch = $(`[data-gp="${G.sel}"]`); if (ch) ch.style.background = boost(col, 210); $("#gBar").style.background = gradCss(G.pts, gmode); sendGrad(); return;
+    }
+    if (tvm) {
+      if (!TVSEL.size) return toast("Choisis d'abord un ou plusieurs pixels");
+      const col = wheelCol(x, y); place(pinEl(0), x, y); pinEl(0).style.background = boost(col, 210);
+      TVSEL.forEach(id => { const [s, i] = id.split(":"); tvPix0[s][+i] = col; const b = $(`[data-px="${id}"]`); if (b) { b.style.background = boost(col, 200); b.style.boxShadow = `0 0 16px ${boost(col, 200)}aa`; } });
+      sendPix(); return;
+    }
+    place(pinEl(0), x, y);
     let col, body;
-    if (wheelMode === "white" || !l.has_color) { const t = y + .5, mirek = Math.round(500 - t * 347); body = { id: l.id, mirek }; col = mix(["#ff9a4d", "#ffd9a0", "#fff6e6", "#ffffff", "#cfe8ff"], t); }
-    else { const ang = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360, hue = (ang + 0) % 360, sat = Math.min(1, Math.hypot(x, y) * 2); col = hsv(hue, sat, 1); body = { id: l.id, color: col }; }
-    pin.style.background = col; l.color = col; l.on = true;
-    clearTimeout(sendT); sendT = setTimeout(() => { roomsLock = Date.now() + 1200; api("/api/light", body).catch(er => toast(er.message)); }, 120);
+    if (!color) { const t = y, mirek = Math.round(500 - t * 347); body = { id: l.id, mirek }; col = mix(["#ff9a4d", "#ffd9a0", "#fff6e6", "#ffffff", "#cfe8ff"], t); }
+    else { col = wheelCol(x, y); body = { id: l.id, color: col }; }
+    pinEl(0).style.background = col; l.color = col; l.on = true;
+    later(() => { if (l.tv) return tvAmb({ color: col }); roomsLock = Date.now() + 1200; api("/api/light", body).catch(er => toast(er.message)); });
   };
   let drag = false;
-  wheel.addEventListener("pointerdown", e => { drag = true; wheel.setPointerCapture(e.pointerId); pick(e); });
+  wheel.addEventListener("pointerdown", e => {
+    if (grad) {   // toucher un point le sélectionne (sinon on déplace le point sélectionné)
+      const rc = wheel.getBoundingClientRect(); let best = -1, bd = 34;
+      G.pts.forEach((p, i) => { const [px, py] = wheelPos(p), d = Math.hypot(px * rc.width + rc.left - e.clientX, py * rc.height + rc.top - e.clientY); if (d < bd) { bd = d; best = i; } });
+      if (best >= 0 && best !== G.sel) { G.sel = best; wheel.querySelectorAll(".pin").forEach(el => el.classList.toggle("sel", +el.dataset.pin === best)); $$("[data-gp]").forEach(b => b.classList.toggle("on", +b.dataset.gp === best)); }
+    }
+    drag = true; wheel.setPointerCapture(e.pointerId); pick(e);
+  });
   wheel.addEventListener("pointermove", e => drag && pick(e));
   wheel.addEventListener("pointerup", () => drag = false);
-  slider($("#lBri"), t => { setSl($("#lBri"), t); l.bri = Math.max(1, Math.round(t * 100)); $("#lBriPct").textContent = l.bri + " %"; }, () => { roomsLock = Date.now() + 1200; api("/api/light", { id: l.id, bri: l.bri }).catch(e => toast(e.message)); });
+  if (grad) {
+    $$("[data-gp]").forEach(b => b.onclick = () => { G.sel = +b.dataset.gp; renderLampe(); });
+    if ($("#gAdd")) $("#gAdd").onclick = () => { G.pts.splice(G.sel + 1, 0, G.pts[G.sel]); G.sel++; renderLampe(); sendGrad(); };
+    if ($("#gDel")) $("#gDel").onclick = () => { G.pts.splice(G.sel, 1); G.sel = Math.max(0, G.sel - 1); renderLampe(); sendGrad(); };
+    $$("[data-gm]").forEach(b => b.onclick = () => { l.grad_mode = b.dataset.gm; renderLampe(); roomsLock = Date.now() + 1500; api("/api/light", { id: l.id, gradient: G.pts, mode: l.grad_mode }).catch(er => toast(er.message)); });
+    if ($("#gOrd")) $("#gOrd").onclick = async () => { const o = l.order === "reversed" ? "forward" : "reversed"; try { await api("/api/light/order", { light: l.id, order: o }); l.order = o; renderLampe(); } catch (er) { toast(er.message); } };
+  }
+  if (tvm) {
+    $$("[data-px]").forEach(b => b.onclick = () => { const id = b.dataset.px; TVSEL.has(id) ? TVSEL.delete(id) : TVSEL.add(id); renderLampe(); });
+    $$("[data-pxg]").forEach(b => b.onclick = () => { const g = b.dataset.pxg; TVSEL = new Set(["left", "top", "right"].filter(s => g === "all" || s === g).flatMap(s => pix[s].map((_, i) => s + ":" + i))); renderLampe(); });
+  }
+  slider($("#lBri"), t => { setSl($("#lBri"), t); l.bri = Math.max(1, Math.round(t * 100)); $("#lBriPct").textContent = l.bri + " %"; }, () => { if (l.tv) return tvAmb({ bri: l.bri }); roomsLock = Date.now() + 1200; api("/api/light", { id: l.id, bri: l.bri }).catch(e => toast(e.message)); });
 }
 function hsv(h, s, v) { const f = n => { const k = (n + h / 60) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); }; return rgbHex([f(5) * 255, f(3) * 255, f(1) * 255]); }
 
@@ -5932,7 +6206,7 @@ function renderBt() {
 
 /* =================== TÉLÉVISEUR AMBILIGHT =================== */
 let TV = null, tvTimer = null, tvTest = null, tvBusy = false;
-const TVD = { on: false, music: true, x: .5, w: 1.23, back: .35, spots: .3, hz: 12, smooth: "normale", flip: false };
+const TVD = { on: false, music: true, area: "", x: .5, w: 1.23, back: .35, spots: .3, hz: 12, smooth: "normale", flip: false };
 const tvCfg = () => ({ ...TVD, ...(S.settings.tv || {}) });
 function tvSave(k, v) { save({ tv: { ...tvCfg(), [k]: v } }); }
 $("#tvRow").onclick = () => { tvTest = null; go("tv"); };
@@ -5941,25 +6215,27 @@ async function loadTv() {
   if ((route.v === "tv" || route.v === "reglages") && !document.hidden) { try { TV = await api("/api/tv"); if (route.v === "tv") renderTv(true); tvSubline(); } catch (e) {} }
   tvTimer = setTimeout(loadTv, route.v === "tv" ? 2000 : 6000);
 }
-function tvPower(t) { const e = t && t.engine, c = tvCfg(); if (!t || !t.paired) return "Non appairée"; if (!c.on && !c.music) return "Appairée · fonctions coupées"; if (!e) return "Appairée · synchro arrêtée"; if (e.error) return e.error; if (e.power === "On") return e.active ? `Allumée · ${e.rate} images/s` : c.on ? "Allumée" : "Allumée · synchro vidéo coupée"; if (e.ambi) return "En veille · l'Ambilight suit la musique"; return e.power ? "En veille" : "Connexion…"; }
+function tvPower(t) { const e = t && t.engine, c = tvCfg(); if (!t || !t.paired) return "Non appairée"; if (!c.on && !c.music) return "Appairée · fonctions coupées"; if (!e) return "Appairée · synchro arrêtée"; if (e.error) return e.error; if (e.here === false) return (e.power === "On" ? "Allumée" : e.power ? "En veille" : "Connexion…") + " · hors de la zone de synchro"; if (e.power === "On") return e.active ? `Allumée · ${e.rate} images/s` : c.on ? "Allumée" : "Allumée · synchro vidéo coupée"; if (e.ambi) return "En veille · l'Ambilight suit la musique"; return e.power ? "En veille" : "Connexion…"; }
 function tvSubline() { const el = $("#tvSub"); if (el && TV) el.textContent = TV.paired ? tvPower(TV) : "Synchro vidéo du ruban et des spots"; }
-function tvSlider(id, label, val, txt, hint) { return `<div class="row" style="align-items:flex-start;padding:16px 0 12px"><span style="flex:1;padding:0 22px"><span style="display:flex;justify-content:space-between"><span class="t1" style="font-size:17px;font-weight:600">${label}</span><span class="val" id="${id}V" style="color:var(--t2)">${txt}</span></span><div class="sl" id="${id}" style="margin:10px 0 6px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>${hint ? `<span style="color:var(--t3);font-size:14px">${hint}</span>` : ""}</span></div>`; }
+function tvSlider(id, label, txt, hint) { return `<div class="srow"><div class="h"><span>${label}</span><span id="${id}V">${txt}</span></div><div class="sl" id="${id}"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>${hint ? `<p class="hint">${hint}</p>` : ""}</div>`; }
 function tvPlanSvg() {   // la pièce vue de dessus, TV en haut, lampes de la zone de synchro
-  const z = currentZone(), zid = (z && z.id) || S.settings.area || live.area_id, pl = (S.settings.plans || {})[zid] || {};
+  const ZS = zones && !zones.error ? zones : [], ta = tvCfg().area, z = (ta && ZS.find(x => x.id === ta)) || currentZone();
+  const zid = (z && z.id) || ta || S.settings.area || live.area_id, pl = (S.settings.plans || {})[zid] || {};
   const c = tvCfg(), dm = pl.dims || {}, W = +dm.w || 4, D = +dm.d || W;
   const H = Math.max(40, Math.min(110, 100 * D / W)), tw = Math.min(1, c.w / W) * 100, tx = c.x * 100 - tw / 2;
   const cols = live.state === "syncing" && live.source === "tv" ? live.colors || [] : [];
   // points du plan : x et y de -1 à 1, y = +1 du côté de la TV (en haut)
   const dots = Object.entries(pl.ch || {}).sort((a, b) => +a[0] - +b[0]).map(([, q], i) => `<circle cx="${((q.x + 1) / 2 * 100).toFixed(1)}" cy="${((1 - q.y) / 2 * H).toFixed(1)}" r="2.6" fill="${cols[i] ? boost(cols[i], 200) : "#8d8e94"}"/>`).join("");
   return `<svg viewBox="-4 -6 108 ${H + 10}" style="display:block;width:100%;max-height:260px"><rect x="0" y="0" width="100" height="${H}" rx="3" fill="#1f2024" stroke="#3a3b40"/><rect x="${tx.toFixed(1)}" y="-3" width="${tw.toFixed(1)}" height="3" rx="1" fill="#fff"/>${dots}</svg>` +
-    `<p class="hint" style="margin:6px 4px 0">${pl.ch ? `Zone de synchro : « ${esc(z ? z.name : "?")} », d'après son plan.` : `La zone « ${esc(z ? z.name : "?")} » n'a pas encore de plan : les lampes seront placées d'après le pont. Fais le plan dans « Pièces et zones de synchro », ou choisis dans Synchro la zone qui en a un.`}</p>`;
+    `<p class="hint" style="margin:6px 4px 0">${pl.ch ? `Zone de synchro : « ${esc(z ? z.name : "?")} », d'après son plan.` : `La zone « ${esc(z ? z.name : "?")} » n'a pas encore de plan : les lampes seront placées d'après le pont. Fais le plan dans « Pièces et zones de synchro ».`}</p>`;
 }
 function renderTv(fromPoll) {
   const el = $("#tv"); if (!el) return;
   if (!TV) { el.innerHTML = `<p class="note" style="padding:16px 20px">Chargement…</p>`; loadTv(); return; }
   if (fromPoll && (document.activeElement && el.contains(document.activeElement) || tvBusy || $("#tv .sl.drag"))) { const st = $("#tvState"); if (st) st.textContent = tvPower(TV); return; }
+  if (fromPoll && route.v === "tv" && $("#tvState")) { const e = TV.engine || {}; $("#tvState").textContent = tvPower(TV); const d = $("#tvState").previousElementSibling; if (d) d.className = e.ambi ? "amb" : e.power === "On" && e.active ? "on" : ""; return; }
   const c = tvCfg(), pr = TV.pairing || {};
-  let h = `<p class="note" style="padding:16px 20px 0">TV allumée : Lueur lit les couleurs de l'Ambilight et les répartit sur ta zone de synchro selon le plan de la pièce, chaque segment du ruban prenant la couleur du côté de l'écran le plus proche. TV en veille : c'est l'inverse, l'Ambilight suit la synchro musique. La musique reste prioritaire.</p>`;
+  let h = `<p class="note" style="padding:16px 20px 0">TV allumée, les lampes suivent l'image. TV en veille, l'Ambilight suit la musique.</p>`;
   if (!TV.paired) {
     const pin = pr.state === "pin";
     h += `<div class="label">Appairage</div><div class="list">
@@ -5976,44 +6252,52 @@ function renderTv(fromPoll) {
     };
     return;
   }
-  const t = tvTest;
+  const t = tvTest, e = TV.engine || {}, ZL = Array.isArray(zones) ? zones : [];
+  const dot = e.ambi ? "amb" : e.power === "On" && e.active ? "on" : "";
   h += `<div class="label">Téléviseur</div><div class="list">
-    <div class="row"><span class="ic">${icon("tv")}</span><span class="bd"><span class="tx"><span class="t1">${esc(TV.model || "TV Philips")}</span><span class="t2" id="tvState">${esc(tvPower(TV))}</span></span><span class="val" style="color:var(--t3)">${esc(TV.ip)}</span></span></div>
-    <button class="row" id="tvOn" role="switch" aria-checked="${c.on}"><span class="ic">${icon("sync")}</span><span class="bd"><span class="tx"><span class="t1">Synchro vidéo</span><span class="t2">Dès que la TV est allumée et qu'aucune musique ne joue</span></span><span class="sw ${c.on ? "on" : ""}"><i></i></span></span></button>
-    <button class="row" id="tvMusic" role="switch" aria-checked="${c.music}"><span class="ic">${icon("airplay")}</span><span class="bd"><span class="tx"><span class="t1">Ambilight avec la musique</span><span class="t2">TV en veille : ses côtés suivent la synchro musique</span></span><span class="sw ${c.music ? "on" : ""}"><i></i></span></span></button>
-    <button class="row" id="tvTestB" ${tvBusy ? "disabled" : ""}><span class="ic" style="color:var(--blue)">${tvBusy ? '<span class="spin"></span>' : icon("sliders")}</span><span class="bd"><span class="tx"><span class="t1" style="color:var(--blue)">${tvBusy ? "Mesure en cours…" : "Mesurer la liaison"}</span><span class="t2">20 lectures des couleurs de l'Ambilight</span></span></span></button>
+    <div class="row"><span class="ic">${icon("tv")}</span><span class="bd"><span class="tx"><span class="t1">${esc(TV.model || "TV Philips")}</span><span class="t2 tstate"><i class="${dot}"></i><span id="tvState">${esc(tvPower(TV))}</span></span></span><span class="val" style="color:var(--t3);font-size:15px">${esc(TV.ip)}</span></span></div>
+    <label class="row"><span class="ic">${icon("room-salon")}</span><span class="bd"><span class="tx"><span class="t1">Pièce de la TV</span><span class="t2">${c.area ? "Ne sert que dans cette zone de synchro" : "Toutes les zones de synchro"}</span></span>
+      <select class="val" id="tvArea"><option value="">Toutes</option>${ZL.map(z => `<option value="${esc(z.id)}" ${c.area === z.id ? "selected" : ""}>${esc(z.name.replace(/^Lueur · /, ""))}</option>`).join("")}${c.area && Array.isArray(zones) && !zones.some(z => z.id === c.area) ? `<option value="${esc(c.area)}" selected>Zone introuvable</option>` : ""}</select></span></label>
+    <button class="row" id="tvOn" role="switch" aria-checked="${c.on}"><span class="ic">${icon("sync")}</span><span class="bd"><span class="tx"><span class="t1">Synchro vidéo</span><span class="t2">TV allumée : les lampes suivent l'image</span></span><span class="sw ${c.on ? "on" : ""}"><i></i></span></span></button>
+    <button class="row" id="tvMusic" role="switch" aria-checked="${c.music}"><span class="ic">${icon("airplay")}</span><span class="bd"><span class="tx"><span class="t1">Ambilight avec la musique</span><span class="t2">TV en veille : l'Ambilight suit la musique</span></span><span class="sw ${c.music ? "on" : ""}"><i></i></span></span></button>
   </div>`;
-  if (t) h += t.ok ? `<div class="pad" style="padding-top:12px"><div style="background:var(--card);border-radius:16px;padding:14px 16px">
-      <div style="display:flex;justify-content:space-between;font-size:15px"><span>Lectures par seconde</span><b style="color:${t.hz >= 10 ? "var(--green)" : t.hz >= 5 ? "#ffd60a" : "var(--red)"}">${t.hz}</b></div>
-      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Temps de réponse</span><span>${t.ms} ms (max ${t.ms_max} ms)</span></div>
-      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Pixels Ambilight</span><span>${Object.entries(t.sides).filter(([, n]) => n).map(([k, n]) => ({ left: "gauche", top: "haut", right: "droite", bottom: "bas" }[k] + " " + n)).join(" · ")}</span></div>
-      ${["left", "top", "right"].filter(k => t.preview[k]).map(k => `<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><small style="width:44px;color:var(--t3)">${{ left: "Gauche", top: "Haut", right: "Droite" }[k]}</small><div style="flex:1;height:14px;border-radius:7px;background:linear-gradient(90deg,${t.preview[k].join(",")})"></div></div>`).join("")}
-      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Couleurs lues</span><span>${t.black && t.black.processed && t.black.measured ? "aucune (image noire ou Ambilight éteint)" : t.src === "measured" ? "mesurées sur l'image" : "calculées par l'Ambilight"}</span></div>
-      <p class="hint" style="margin:10px 0 0">${t.hz >= 10 ? "Liaison rapide : la synchro vidéo sera fluide." : t.hz >= 5 ? "Liaison correcte : choisis la fluidité « Douce » pour lisser." : "Liaison lente : la synchro suivra l'image avec du retard."}${t.mode && t.mode !== "internal" ? ` Mode Ambilight actuel : « ${esc(t.mode)} ».` : ""}</p></div></div>`
-    : `<p class="note" style="color:var(--red)">${esc(t.message || "Mesure impossible.")}</p>`;
-  h += `<div class="label">Placement dans la pièce</div><div class="pad" style="padding-top:4px"><div style="background:var(--card);border-radius:16px;padding:12px">${tvPlanSvg()}</div></div>
-  <div class="list">
-    ${tvSlider("tvX", "Position de la TV", c.x, c.x < .45 ? "à gauche" : c.x > .55 ? "à droite" : "au centre", "Le long du mur de l'écran (en haut du plan).")}
-    ${tvSlider("tvW", "Largeur de l'écran", (c.w - .5) / 2, c.w.toFixed(2).replace(".", ",") + " m", "Une 55 pouces fait environ 1,23 m de large.")}
-  </div>
-  <div class="label">Rendu</div><div class="pad" style="padding-top:0"><div class="seg" id="tvSmooth">${[["vive", "Vive"], ["normale", "Normale"], ["douce", "Douce"]].map(([k, v]) => `<button data-sm="${k}" class="${c.smooth === k ? "on" : ""}">${v}</button>`).join("")}</div></div>
-  <div class="list" style="margin-top:12px">
-    ${tvSlider("tvBack", "Fond de la pièce", c.back, Math.round(c.back * 100) + " %", "Luminosité des lampes au mur d'en face, par rapport à celles près de la TV.")}
-    ${tvSlider("tvSpots", "Spots", c.spots, c.spots ? Math.round(c.spots * 100) + " %" : "éteints", "Garde-les bas pour ne pas éclairer l'écran.")}
-    ${tvSlider("tvHz", "Lectures par seconde", (c.hz - 4) / 21, c.hz + " /s", "Plus haut = plus réactif, mais la TV peut ralentir si c'est trop.")}
-    <button class="row" id="tvFlip" role="switch" aria-checked="${c.flip}"><span class="bd" style="padding-left:22px"><span class="tx"><span class="t1">Inverser gauche et droite</span><span class="t2">Si les couleurs de gauche arrivent à droite</span></span><span class="sw ${c.flip ? "on" : ""}"><i></i></span></span></button>
-  </div>
-  <p class="note">Coupe « Ambilight + hue » dans les réglages de la TV : un pont ne joue qu'un flux à la fois, et la TV prendrait les lampes à Lueur.</p>
-  <div class="list"><button class="row" id="tvForget"><span class="bd" style="padding-left:22px"><span class="t1" style="color:var(--red)">Oublier la TV</span></span></button></div><div style="height:24px"></div>`;
+  const cz = currentZone();
+  if (c.area && cz && cz.id !== c.area) { const tz = ZL.find(z => z.id === c.area); h += `<p class="note" style="color:var(--orange)">La synchro est réglée sur « ${esc(cz.name)} » : la TV est ignorée tant que « ${esc(tz ? tz.name : "sa zone")} » n'est pas choisie dans Synchro.</p>`; }
+  const okc = v => v >= 10 ? "var(--green)" : v >= 5 ? "#ffd60a" : "var(--red)";
+  h += `<div class="label">Liaison</div><div class="pad"><div class="tcard">
+    ${t && t.ok ? `<div class="tstats">
+        <div class="tstat"><b style="color:${okc(t.hz)}">${t.hz}</b><small>lectures/s</small></div>
+        <div class="tstat"><b>${t.ms}<span style="font-size:13px;font-weight:600"> ms</span></b><small>réponse</small></div>
+        <div class="tstat"><b>${["left", "top", "right"].map(k => t.sides[k] || 0).join("·")}</b><small>pixels G·H·D</small></div></div>
+      ${["left", "top", "right"].filter(k => t.preview[k]).map(k => `<div class="tstrip"><small>${{ left: "Gauche", top: "Haut", right: "Droite" }[k]}</small><div style="background:linear-gradient(90deg,${t.preview[k].join(",")})"></div></div>`).join("")}
+      <p class="hint" style="margin:10px 0 12px">${t.black && t.black.processed && t.black.measured ? "Aucune couleur lue : image noire ou Ambilight éteint." : `Couleurs ${t.src === "measured" ? "mesurées sur l'image" : "calculées par l'Ambilight"}. `}${t.black && t.black.processed && t.black.measured ? "" : t.hz >= 10 ? "Liaison rapide : la synchro vidéo sera fluide." : t.hz >= 5 ? "Liaison correcte : choisis la fluidité « Douce »." : "Liaison lente : la synchro suivra l'image avec du retard."}</p>`
+      : t ? `<p class="hint" style="color:var(--red);margin:0 0 12px">${esc(t.message || "Mesure impossible.")}</p>` : `<p class="hint" style="margin:0 0 12px">Mesure la vitesse de lecture des couleurs de l'Ambilight (20 lectures, TV allumée avec une image).</p>`}
+    <button class="cta ghost" id="tvTestB" style="background:var(--card2);min-height:48px;font-size:16px" ${tvBusy ? "disabled" : ""}>${tvBusy ? "Mesure en cours…" : "Mesurer la liaison"}</button>
+  </div></div>`;
+  h += `<div class="label">Placement</div><div class="pad"><div class="tcard">
+    <div class="tplace"><div class="tplan">${tvPlanSvg()}</div><div>
+    ${tvSlider("tvX", "Position de la TV", c.x < .45 ? "à gauche" : c.x > .55 ? "à droite" : "au centre", "Le long du mur de l'écran, en haut du plan.")}
+    ${tvSlider("tvW", "Largeur de l'écran", c.w.toFixed(2).replace(".", ",") + " m", "Une 55 pouces fait environ 1,23 m.")}</div></div>
+  </div></div>`;
+  h += `<div class="label">Rendu</div><div class="pad"><div class="tcard">
+    <div class="seg" id="tvSmooth">${[["vive", "Vive"], ["normale", "Normale"], ["douce", "Douce"]].map(([k, v]) => `<button data-sm="${k}" class="${c.smooth === k ? "on" : ""}">${v}</button>`).join("")}</div>
+    ${tvSlider("tvBack", "Fond de la pièce", Math.round(c.back * 100) + " %", "Lampes du mur d'en face, par rapport à celles près de la TV.")}
+    ${tvSlider("tvSpots", "Spots", c.spots ? Math.round(c.spots * 100) + " %" : "éteints", "Garde-les bas pour ne pas éclairer l'écran.")}
+    ${tvSlider("tvHz", "Lectures par seconde", c.hz + " /s", "Plus haut = plus réactif ; baisse si la TV ralentit.")}
+    <button class="tsw" id="tvFlip" role="switch" aria-checked="${c.flip}"><span class="tx"><b>Inverser gauche et droite</b><small>Si les couleurs arrivent du mauvais côté</small></span><span class="sw ${c.flip ? "on" : ""}"><i></i></span></button>
+  </div></div>
+  <p class="note">Coupe « Ambilight + hue » dans les réglages de la TV : un pont ne joue qu'un flux à la fois.</p>
+  <div class="pad" style="margin-top:16px"><button class="cta ghost red" id="tvForget">Oublier la TV</button></div><div style="height:28px"></div>`;
   el.innerHTML = h;
   $("#tvOn").onclick = () => { tvSave("on", !c.on); renderTv(); };
   $("#tvFlip").onclick = () => { tvSave("flip", !c.flip); renderTv(); };
   $("#tvMusic").onclick = () => { tvSave("music", !c.music); renderTv(); };
+  $("#tvArea").onchange = e => { tvSave("area", e.target.value); renderTv(); };
   $$("[data-sm]").forEach(b => b.onclick = () => { tvSave("smooth", b.dataset.sm); renderTv(); });
   $("#tvForget").onclick = async () => { if (!confirm("Oublier cette TV ? Il faudra refaire l'appairage.")) return; try { TV = await api("/api/tv/forget", {}); S.settings.tv = { ...tvCfg(), on: false }; } catch (e) { toast(e.message); } tvTest = null; renderTv(); };
   $("#tvTestB").onclick = async () => { tvBusy = true; renderTv(); try { tvTest = await api("/api/tv/test", {}); } catch (e) { tvTest = { ok: false, message: e.message }; } tvBusy = false; renderTv(); };
   const bind = (id, to, txt, key) => { const sl = $("#" + id); setSl(sl, { tvX: c.x, tvW: (c.w - .5) / 2, tvBack: c.back, tvSpots: c.spots, tvHz: (c.hz - 4) / 21 }[id]);
-    slider(sl, r => { sl.classList.add("drag"); const v = to(r); setSl(sl, r); $("#" + id + "V").textContent = txt(v); S.settings.tv = { ...tvCfg(), [key]: v }; const pv = $("#tv svg"); if (pv) pv.outerHTML = tvPlanSvg().split("</svg>")[0] + "</svg>"; tvSave(key, v); }, () => sl.classList.remove("drag")); };
+    slider(sl, r => { sl.classList.add("drag"); const v = to(r); setSl(sl, r); $("#" + id + "V").textContent = txt(v); S.settings.tv = { ...tvCfg(), [key]: v }; const pv = $("#tv .tplan"); if (pv) pv.innerHTML = tvPlanSvg(); tvSave(key, v); }, () => sl.classList.remove("drag")); };
   bind("tvX", r => Math.round(r * 100) / 100, v => v < .45 ? "à gauche" : v > .55 ? "à droite" : "au centre", "x");
   bind("tvW", r => Math.round((.5 + r * 2) * 20) / 20, v => v.toFixed(2).replace(".", ",") + " m", "w");
   bind("tvBack", r => Math.round(r * 20) / 20, v => Math.round(v * 100) + " %", "back");
