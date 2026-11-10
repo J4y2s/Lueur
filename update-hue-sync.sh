@@ -2277,6 +2277,32 @@ def cmd_run(args):
                     cmap = test_color_map(plan_channels(area, settings["plans"]), kinds)
                     session.send([(cid, *(v * 0.85 for v in hex_to_rgb(hx))) for cid, hx in cmap.items()])
                     continue
+                if test.get("mode") == "fx":
+                    # Test des réglages avancés : le moteur rejoue l'effet actuel avec un rythme
+                    # simulé (120 BPM), même sans musique. Tous les curseurs (force, durée,
+                    # fond, motif, couleurs, vitesse, couches, flash blanc) se voient en vrai.
+                    ph = (now % 0.5) / 0.5
+                    beat = ph < 0.05
+                    strength = 0.9
+                    sw = 0.5 + 0.5 * np.sin(2 * np.pi * now / 6.0)
+                    bands = {"bass": 0.9 if beat else 0.25 + 0.2 * sw,
+                             "mid": 0.5 + 0.3 * sw, "high": 0.6 if beat else 0.3,
+                             "on_bass": 1.0 if beat else 0.15, "on_mid": 0.7 if beat else 0.2,
+                             "on_high": 0.8 if beat else 0.25, "energy": 0.35 + 0.5 * sw,
+                             "lr": 0.0}
+                    colors = fx.update(0.3, bands, beat, strength)
+                    eq = plan_eq(area, settings["plans"])
+                    if eq:
+                        colors = [(c, r * f, g * f, b * f) for c, r, g, b in colors
+                                  for f in (eq.get(devs.get(c), 1.0),)]
+                    session.send(colors)
+                    status.write(state="syncing" if session.active else "waiting",
+                                 area=area_name, area_id=area["id"], level=0.3,
+                                 beats=beats, colors=fx.colors_hex() if session.active else [],
+                                 source="music",
+                                 tv=tv.info() if tv else None,
+                                 bt={"device": player.device, "playing": player.playing} if player else None)
+                    continue
                 order = [c["channel_id"] for c in sorted(plan_channels(area, settings["plans"]),
                                                          key=lambda c: c["position"]["x"])]
                 n = len(order)
@@ -2421,6 +2447,7 @@ Sert la page index.html et une petite API JSON :
   POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
   POST /api/area/from_room {"id", "rubans"?, "spots"?}    crée la zone de divertissement d'une pièce d'après son plan
   POST /api/plan/colortest {"id", "rubans", "spots", "dims", "stop"?}  test « couleurs par segment » d'une pièce
+  POST /api/fx/test {"dur"?, "stop"?}  rejoue l'effet actuel sur les lampes (rythme simulé)
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -2689,6 +2716,25 @@ def plan_test(body):
     return {"ok": True, "running": active, "area_selected": s.get("area") in ("", aid)}
 
 
+def fx_test(body):
+    """Réglages avancés : rejoue l'effet actuel sur les vraies lampes (rythme simulé)."""
+    s = get_settings()
+    if body.get("stop"):
+        if (s.get("test") or {}).get("mode") == "fx":
+            s["test"] = {}
+            write_json(SETTINGS_PATH, s)
+        return {"ok": True, "running": service_state()["active"]}
+    try:
+        dur = max(3, min(15, int(body.get("dur", 6))))
+    except (TypeError, ValueError):
+        dur = 6
+    aid = s.get("area", "")
+    s["test"] = {"area": aid, "until": time.time() + dur, "mode": "fx"}
+    write_json(SETTINGS_PATH, s)
+    active = service_state()["active"]
+    return {"ok": True, "running": active, "dur": dur, "area_selected": bool(aid)}
+
+
 identify_jobs = {}
 
 
@@ -2944,13 +2990,17 @@ def update_settings(body):
         if "fx" not in body:
             s["fx"] = {}                 # choisir un préréglage efface les réglages avancés
     if "fx" in body and isinstance(body["fx"], dict):
-        merged = dict(s.get("fx") or {})
-        for k, v in body["fx"].items():
-            if v is None:
-                merged.pop(k, None)      # None = revenir à la valeur du préréglage
-            else:
-                merged[k] = v
-        s["fx"] = hms.clean_fx(merged)
+        if not body["fx"]:
+            s["fx"] = {}                     # {} explicite = tout rétablir
+            merged = {}
+        else:
+            merged = dict(s.get("fx") or {})
+            for k, v in body["fx"].items():
+                if v is None:
+                    merged.pop(k, None)      # None = revenir à la valeur du préréglage
+                else:
+                    merged[k] = v
+            s["fx"] = hms.clean_fx(merged)
     if "mode" in body and body["mode"] in hms.MODES:
         s["mode"] = body["mode"]
     if "speed" in body:
@@ -4384,6 +4434,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, plan_eq(body))
             if path == "/api/plan/test":
                 return self._send(200, plan_test(body))
+            if path == "/api/fx/test":
+                return self._send(200, fx_test(body))
             if path == "/api/plan/identify":
                 try:
                     return self._send(200, identify_light(body))
@@ -4649,6 +4701,9 @@ body.locked{overflow:hidden}
 .srow .h{display:flex;justify-content:space-between;margin-bottom:2px}
 .srow .h span:last-child{color:var(--t2)}
 .hint{margin:2px 0 8px;color:var(--t3);font-size:13px;line-height:1.4}
+.mdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:7px;vertical-align:2px}
+.fxmsg{min-height:20px;margin:10px 4px 0;color:var(--t2);font-size:13px}
+.segreset{background:none;border:0;color:var(--blue);font-size:14px;font-weight:600;padding:8px 0}
 
 /* ---- cartes (écran TV, page Pièce) ---- */
 .tcard{background:var(--card);border-radius:18px;padding:14px 16px}
@@ -4964,6 +5019,8 @@ button:active{transform:scale(.96);opacity:.82}
       <div class="grid2" id="advEffects"></div>
       <div class="label in">Vitesse</div><div class="seg" id="advSpeed"></div><p class="hint" id="speedHint" style="margin:8px 4px 0"></p>
       <div id="advFolds"></div>
+      <button class="cta" id="fxTest" style="margin-top:16px">Tester sur mes lampes · 6 s</button>
+      <p class="fxmsg" id="fxMsg">Rejoue l'effet actuel sur tes vraies lampes, avec un rythme simulé — même sans musique.</p>
     </div>
   </section>
 
@@ -5203,7 +5260,16 @@ function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("s
 function save(patch, now) {
   Object.assign(pending, patch); Object.assign(S.settings, patch); lockUntil = Date.now() + 2500;
   clearTimeout(sendTimer);
-  sendTimer = setTimeout(async () => { const b = pending; pending = {}; try { await api("/api/settings", b); } catch (e) { toast("Échec : " + e.message); } }, now ? 0 : 280);
+  sendTimer = setTimeout(async () => { const b = pending; pending = {}; try { await api("/api/settings", b); fxApplied(b); } catch (e) { toast("Échec : " + e.message); } }, now ? 0 : 280);
+}
+let fxAppliedT = null;
+function fxApplied(b) {
+  if (!b || !Object.keys(b).some(k => ["fx", "mode", "speed", "layers", "intensity"].includes(k))) return;
+  clearTimeout(fxAppliedT);
+  fxAppliedT = setTimeout(() => {
+    const syncing = typeof live !== "undefined" && live.state === "syncing";
+    toast(syncing ? "Appliqué aux lampes" : "Enregistré · visible à la prochaine synchro");
+  }, 350);
 }
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -5671,8 +5737,20 @@ const ADV = {
 };
 const fxv = k => { const fx = S.settings.fx || {}; return k in fx ? fx[k] : S.presets[S.settings.intensity][k]; };
 function saveFx(k, v) { S.settings.fx = Object.assign({}, S.settings.fx, { [k]: v }); pending.fx = Object.assign({}, pending.fx, { [k]: v }); save({}); }
+const FX_SECTIONS = { rythme: ["source", "beat_k", "min_beat"], flash: ["beat", "tau", "base", "energy"], couleurs: ["every", "fade"], motif: ["pattern"], drops: ["strobe"] };
+const fxMod = k => (S.settings.fx || {}).hasOwnProperty(k);
+const secMod = ks => ks.filter(fxMod).length;
+function resetFx(keys) {
+  const fx = Object.assign({}, S.settings.fx), nulls = {};
+  keys.forEach(k => { delete fx[k]; nulls[k] = null; });
+  S.settings.fx = fx;
+  pending.fx = Object.assign({}, pending.fx, nulls);
+  save({});
+  renderAdv();
+  toast(keys.length > 1 ? "Section rétablie" : "Réglage rétabli");
+}
 let open = JSON.parse(load("advOpen") || "{}");
-function srow(k) { const a = ADV[k], v = fxv(k), t = (v - a.min) / (a.max - a.min); return `<div class="srow"><div class="h"><span>${a.n}</span><span data-vf="${k}">${a.f(v)}</span></div><div class="sl" data-sl="${k}"><div class="tr"></div><div class="fi" style="width:${(a.inv ? 1 - t : t) * 100}%"></div><div class="kn" style="left:${(a.inv ? 1 - t : t) * 100}%"></div></div></div>`; }
+function srow(k) { const a = ADV[k], v = fxv(k), t = (v - a.min) / (a.max - a.min); return `<div class="srow"><div class="h"><span>${a.n}${fxMod(k) ? '<i class="mdot"></i>' : ''}</span><span data-vf="${k}">${a.f(v)}</span></div><div class="sl" data-sl="${k}"><div class="tr"></div><div class="fi" style="width:${(a.inv ? 1 - t : t) * 100}%"></div><div class="kn" style="left:${(a.inv ? 1 - t : t) * 100}%"></div></div></div>`; }
 function renderAdv() {
   const st = S.settings, n = Object.keys(st.fx || {}).length, pal = palColors(st.palette);
   $("#advStatus").textContent = `Basé sur « ${INT[st.intensity]} »` + (n ? ` · ${n} modifié${n > 1 ? "s" : ""}` : "");
@@ -5681,21 +5759,22 @@ function renderAdv() {
   $("#speedHint").textContent = SPEED_D[effCur().mode] || "";
   const src = { full: "Tout", kick: "Grosse caisse", snare: "Caisse claire" }, pat = { all: "Ensemble", alt: "Alternance", chase: "Chenillard", wave: "Vague" };
   const folds = [
-    ["rythme", "Rythme", `${src[fxv("source")]} · sensibilité ${ADV.beat_k.f(fxv("beat_k"))} · écart ${ADV.min_beat.f(fxv("min_beat"))}`,
-      `<div class="seg" style="margin:8px 0 6px">${Object.entries(src).map(([k, v]) => `<button data-src="${k}" class="${fxv("source") === k ? "on" : ""}">${v}</button>`).join("")}</div>${srow("beat_k")}${srow("min_beat")}<p class="hint">Plus l'écart est grand, moins il y a de flashs : pratique pour calmer un morceau rapide.</p>`],
-    ["flash", "Flash", `Force ${ADV.beat.f(fxv("beat"))} · ${ADV.tau.f(fxv("tau"))} · fond ${ADV.base.f(fxv("base"))}`,
-      `<svg viewBox="0 0 300 100" preserveAspectRatio="none" style="display:block;width:100%;height:96px;margin:10px 0 2px;border-radius:12px;background:#0b0b0d" id="env"></svg>${srow("beat")}${srow("tau")}${srow("base")}${srow("energy")}`],
-    ["couleurs", "Couleurs", `${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"} · fondu ${ADV.fade.f(fxv("fade"))}`,
-      `<div id="cstrip" style="height:40px;border-radius:12px;margin:12px 0 10px"></div><div class="srow"><div class="h"><span>Changement de couleur</span><span>${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"}</span></div><div class="seg" style="margin-top:6px">${[1, 2, 4, 8].map(v => `<button data-every="${v}" class="${fxv("every") === v ? "on" : ""}">${v} temps</button>`).join("")}</div></div>${srow("fade")}`],
+    ["rythme", "Rythme", `${src[fxv("source")]} · sensibilité ${ADV.beat_k.f(fxv("beat_k"))} · écart ${ADV.min_beat.f(fxv("min_beat"))}${secMod(FX_SECTIONS.rythme) ? " · modifié" : ""}`,
+      `<div class="seg" style="margin:8px 0 6px">${Object.entries(src).map(([k, v]) => `<button data-src="${k}" class="${fxv("source") === k ? "on" : ""}">${v}${fxMod("source") && fxv("source") === k ? " •" : ""}</button>`).join("")}</div>${srow("beat_k")}${srow("min_beat")}<p class="hint">Plus l'écart est grand, moins il y a de flashs : pratique pour calmer un morceau rapide. La sensibilité et l'écart jouent sur le vrai rythme détecté — vérifie avec « Tester sur mes lampes ».</p>${secMod(FX_SECTIONS.rythme) ? `<button class="segreset" data-segreset="rythme">Rétablir cette section</button>` : ""}`],
+    ["flash", "Flash", `Force ${ADV.beat.f(fxv("beat"))} · ${ADV.tau.f(fxv("tau"))} · fond ${ADV.base.f(fxv("base"))} · suivi ${ADV.energy.f(fxv("energy"))}${secMod(FX_SECTIONS.flash) ? " · modifié" : ""}`,
+      `<svg viewBox="0 0 300 100" preserveAspectRatio="none" style="display:block;width:100%;height:96px;margin:10px 0 2px;border-radius:12px;background:#0b0b0d" id="env"></svg>${srow("beat")}${srow("tau")}${srow("base")}${srow("energy")}${secMod(FX_SECTIONS.flash) ? `<button class="segreset" data-segreset="flash">Rétablir cette section</button>` : ""}`],
+    ["couleurs", "Couleurs", `${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"} · fondu ${ADV.fade.f(fxv("fade"))}${secMod(FX_SECTIONS.couleurs) ? " · modifié" : ""}`,
+      `<div id="cstrip" style="height:40px;border-radius:12px;margin:12px 0 10px"></div><div class="srow"><div class="h"><span>Changement de couleur${fxMod("every") ? '<i class="mdot"></i>' : ''}</span><span>${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"}</span></div><div class="seg" style="margin-top:6px">${[1, 2, 4, 8].map(v => `<button data-every="${v}" class="${fxv("every") === v ? "on" : ""}">${v} temps</button>`).join("")}</div></div>${srow("fade")}${secMod(FX_SECTIONS.couleurs) ? `<button class="segreset" data-segreset="couleurs">Rétablir cette section</button>` : ""}`],
   ];
-  if (st.mode === "pulse") folds.push(["motif", "Motif des lampes", pat[fxv("pattern")],
-    `<div class="grid2" style="margin:10px 0 4px">${Object.entries(pat).map(([k, v]) => `<button class="tile ${fxv("pattern") === k ? "on" : ""}" data-pat="${k}" style="align-items:center;background:var(--card2)">${patDots(k, pal)}<span class="n" style="font-size:13px">${v}</span></button>`).join("")}</div>`]);
+  if (st.mode === "pulse") folds.push(["motif", "Motif des lampes", pat[fxv("pattern")] + (fxMod("pattern") ? " · modifié" : ""),
+    `<div class="grid2" style="margin:10px 0 4px">${Object.entries(pat).map(([k, v]) => `<button class="tile ${fxv("pattern") === k ? "on" : ""}" data-pat="${k}" style="align-items:center;background:var(--card2)">${patDots(k, pal)}<span class="n" style="font-size:13px">${v}</span></button>`).join("")}</div>${fxMod("pattern") ? `<button class="segreset" data-segreset="motif">Rétablir cette section</button>` : ""}`]);
   $("#advFolds").innerHTML = folds.map(([k, t, s, body]) => `<button class="fold ${open[k] ? "open" : ""}" data-fold="${k}"><span class="tx"><b>${t}</b><small>${s}</small></span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8d8e94" stroke-width="2.6" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></button>${open[k] ? `<div class="foldin">${body}</div>` : ""}`).join("") +
-    `<div class="list" style="border-radius:18px;margin-top:12px"><button class="row" id="strobeRow" role="switch" aria-checked="${!!fxv("strobe")}" style="min-height:70px"><span class="ic" style="width:64px"><span style="width:34px;height:34px;border-radius:10px;background:#fff;display:grid;place-items:center">${icon("sync", 18, "#1b1c20", 2.4).replace(IC.sync, "M13 2L4 14h7l-1 8 9-12h-7z")}</span></span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">Flash blanc sur les drops</span><span class="t2" style="font-size:13px">Toutes les lampes en blanc au moment fort</span></span><span class="sw ${fxv("strobe") ? "on" : ""}"><i></i></span></span></button></div><div style="height:20px"></div>`;
+    `<div class="list" style="border-radius:18px;margin-top:12px"><button class="row" id="strobeRow" role="switch" aria-checked="${!!fxv("strobe")}" style="min-height:70px"><span class="ic" style="width:64px"><span style="width:34px;height:34px;border-radius:10px;background:#fff;display:grid;place-items:center">${icon("sync", 18, "#1b1c20", 2.4).replace(IC.sync, "M13 2L4 14h7l-1 8 9-12h-7z")}</span></span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">Flash blanc sur les drops${fxMod("strobe") ? '<i class="mdot"></i>' : ''}</span><span class="t2" style="font-size:13px">Toutes les lampes en blanc au moment fort${fxMod("strobe") ? " · modifié" : ""}</span></span><span class="sw ${fxv("strobe") ? "on" : ""}"><i></i></span></span></button></div><div style="height:20px"></div>`;
   $$("[data-fold]").forEach(b => b.onclick = () => { open[b.dataset.fold] = !open[b.dataset.fold]; store("advOpen", JSON.stringify(open)); renderAdv(); });
   $$("[data-src]").forEach(b => b.onclick = () => { saveFx("source", b.dataset.src); renderAdv(); });
   $$("[data-every]").forEach(b => b.onclick = () => { saveFx("every", +b.dataset.every); renderAdv(); });
   $$("[data-pat]").forEach(b => b.onclick = () => { saveFx("pattern", b.dataset.pat); renderAdv(); });
+  $$("[data-segreset]").forEach(b => b.onclick = e => { e.stopPropagation(); resetFx(FX_SECTIONS[b.dataset.segreset]); });
   $("#strobeRow").onclick = () => { saveFx("strobe", !fxv("strobe")); renderAdv(); };
   $$("[data-sl]").forEach(el => { const k = el.dataset.sl, a = ADV[k]; slider(el, r => { const t = a.inv ? 1 - r : r, v = Math.round((a.min + t * (a.max - a.min)) * 1000) / 1000; saveFx(k, v); setSl(el, r); $(`[data-vf="${k}"]`).textContent = a.f(v); drawEnv(); drawCStrip(); renderPrev(); }, () => renderAdv()); });
   drawEnv(); drawCStrip(); renderPrev();
@@ -5728,18 +5807,50 @@ function livePrev() {   // pendant la synchro, l'aperçu montre les vraies coule
 function renderPrev() {
   if ($("#prev") && $("#prev").dataset.live) return;
   const pal = palColors(S.settings.palette), cur = effCur(), mode = cur.mode, n = 8;
-  const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3", per = .5 / sp;
-  const dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
-  const hi = Math.max(fxv("beat"), fxv("base") + .1), lo = Math.max(fxv("base"), .03);
+  const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3";
+  // Tous les réglages jouent sur l'aperçu (simulation d'un rythme à 120 BPM) :
+  // sensibilité -> flashs plus ou moins nombreux, écart -> tempo des flashs,
+  // source -> quelles pastilles mènent, suivi du volume -> amplitude, flash blanc -> éclairs.
+  const sens = (3.5 - fxv("beat_k")) / 2.7, gap = fxv("min_beat"), en = fxv("energy"), src = fxv("source");
+  const per = .5 / sp * (0.75 + gap * 1.1) / (0.65 + sens * 0.7);
+  let dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
+  if (src === "kick") dl = dl.map(() => 0);
+  if (src === "snare") dl = dl.map(v => 1 - v);
+  const every = fxv("every");
+  const hi = Math.min(1, Math.max(fxv("beat"), fxv("base") + .1) + en * .1), lo = Math.max(fxv("base") - en * .02, .03);
+  const strobe = !!fxv("strobe");
   $("#prev").innerHTML = Array.from({ length: n }, (_, i) => {
-    const c = boost(pal[(i + 1) % pal.length], 200);
-    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : mode === "pulse" ? `${anim} ${per}s ${(dl[i] || 0) * per}s infinite` : effAnim(mode, i, n, sp);
-    return `<i style="background:radial-gradient(circle at 35% 30%,#fff 0%,${c} 38%,${c} 100%);box-shadow:0 0 20px ${c};--hi:${hi};--lo:${lo};animation:${a}"></i>`;
-  }).join("");
+    const c = boost(pal[Math.floor(i / every) % pal.length], 200);
+    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : mode === "pulse" ? `${anim} ${per.toFixed(2)}s ${((dl[i] || 0) * per).toFixed(2)}s infinite` : effAnim(mode, i, n, sp);
+    return `<i style="background:radial-gradient(circle at 35% 30%,#fff 0%,${c} 38%,${c} 100%);box-shadow:0 0 20px ${c};--hi:${hi.toFixed(2)};--lo:${lo.toFixed(2)};animation:${a}"></i>`;
+  }).join("") + (strobe ? `<b style="position:absolute;inset:0;border-radius:16px;background:#fff;opacity:0;pointer-events:none;animation:fl 2.4s infinite"></b>` : "");
+  const pv = $("#prev"); pv.style.position = "relative";
   $("#stage").style.setProperty("--glow", boost(pal[1] || pal[0], 160) + "33");
-  $("#prevSub").textContent = (EFFECTS.find(e => e[0] === mode) || EFFECTS[0])[1] + " · " + INT[S.settings.intensity] + (sp !== 1 ? (sp > 1 ? " · ×2" : " · ×½") : "");
+  $("#prevSub").textContent = (EFFECTS.find(e => e[0] === mode) || EFFECTS[0])[1] + " · " + INT[S.settings.intensity] + (sp !== 1 ? (sp > 1 ? " · ×2" : " · ×½") : "") + (strobe ? " · flash blanc" : "") + " · simulation";
 }
 $("#advReset").onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: S.settings.intensity }, true); renderAdv(); toast("Préréglage rétabli"); };
+let fxTestT = null;
+const fxTestBtn = $("#fxTest");
+if (fxTestBtn) fxTestBtn.onclick = async () => {
+  const msg = $("#fxMsg");
+  fxTestBtn.disabled = true;
+  try {
+    const r = await api("/api/fx/test", { dur: 6 });
+    if (!r.running) {
+      if (msg) msg.textContent = "Synchro à l'arrêt : active-la dans Réglages → Synchro active, puis reteste.";
+      toast("Synchro à l'arrêt");
+    } else if (r.area_selected === false) {
+      if (msg) msg.textContent = "Aucune zone choisie : retourne sur Synchro pour choisir tes lampes.";
+      toast("Choisis d'abord une zone");
+    } else {
+      if (msg) msg.textContent = "Regarde tes lampes : l'effet actuel y joue pendant 6 s (rythme simulé).";
+      toast("Regarde tes lampes");
+      clearTimeout(fxTestT);
+      fxTestT = setTimeout(() => { if (msg) msg.textContent = "Rejoue l'effet actuel sur tes vraies lampes, avec un rythme simulé — même sans musique."; }, 7000);
+    }
+  } catch (e) { toast("Échec : " + e.message); }
+  fxTestBtn.disabled = false;
+};
 
 /* =================== LUMIÈRES =================== */
 let roomsTimer = null, roomsLock = 0, roomsSeq = 0;
