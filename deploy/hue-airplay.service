@@ -1,0 +1,18 @@
+[Unit]
+Description=Recepteur AirPlay 2 -> synchro musique Philips Hue
+After=network-online.target avahi-daemon.service nqptp.service bluetooth.service hue-bluealsa.service
+Wants=network-online.target avahi-daemon.service nqptp.service
+
+[Service]
+Environment=HUE_SYNC_CONFIG=/etc/hue-music-sync/config.json
+Environment="HUE_AIRPLAY_NAME=Hue Sync"
+EnvironmentFile=-/etc/default/hue-airplay
+RuntimeDirectory=hue-music-sync
+RuntimeDirectoryPreserve=yes
+ExecStartPre=-/usr/bin/rm -f /run/hue-music-sync/airplay-active
+ExecStart=/bin/bash -c 'set -o pipefail; /usr/local/bin/shairport-sync -c /etc/shairport-sync.conf -a "$$HUE_AIRPLAY_NAME" | /usr/bin/python3 -u /opt/hue-music-sync/hue_music_sync.py run --source stdin --channels 2 --rate 44100 --bluetooth --settings /etc/hue-music-sync/settings.json --status /run/hue-music-sync/status.json --airplay-flag /run/hue-music-sync/airplay-active'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
