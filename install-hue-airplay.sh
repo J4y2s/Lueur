@@ -1669,6 +1669,31 @@ def tv_frame(js):
     return out
 
 
+TV_SOURCES = ("processed", "measured")     # couleurs calculées par l'Ambilight, ou mesurées sur l'image
+TV_GAIN = {"processed": 1.0, "measured": 1.3}   # « measured » plafonne vers 190/255 : on le remonte
+
+
+def tv_black(fr):
+    """Vrai si tous les pixels de l'Ambilight sont (presque) noirs."""
+    return all(not len(a) or float(a.max()) < 0.02 for a in fr.values())
+
+
+def tv_read(client, src):
+    """Lit les couleurs de l'Ambilight. Sur certaines TV (ex. 55OLED707), « processed » reste
+    toujours à zéro et seule « measured » porte les couleurs de l'image : si « processed » est
+    noire, on essaie « measured », et on garde celle qui a des couleurs pour la suite.
+    Renvoie (image, source utilisée)."""
+    fr = tv_frame(client.request("GET", f"/6/ambilight/{src}"))
+    if src == "processed" and tv_black(fr):        # une fois sur « measured », on y reste (pas d'appel en double
+        fr2 = tv_frame(client.request("GET", "/6/ambilight/measured"))   # pendant les scènes noires)
+        if not tv_black(fr2):
+            fr, src = fr2, "measured"
+    g = TV_GAIN.get(src, 1.0)
+    if g != 1.0:
+        fr = {k: np.clip(v * g, 0, 1) for k, v in fr.items()}
+    return fr, src
+
+
 def tv_load(conf_dir):
     try:
         with open(os.path.join(conf_dir, TV_FILE)) as f:
@@ -1686,6 +1711,7 @@ class TvWatcher:
         self.conf_dir = conf_dir
         self.enabled, self.hz = False, 12
         self.frame, self.frame_t, self.power, self.error, self.rate = None, 0.0, None, "", 0.0
+        self.src = "processed"
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -1706,7 +1732,7 @@ class TvWatcher:
 
     def info(self):
         return {"on": self.enabled, "power": self.power, "rate": round(self.rate, 1), "error": self.error,
-                "active": self.active}
+                "active": self.active, "src": self.src}
 
     def _loop(self):
         client, creds, next_power, times = None, None, 0.0, collections.deque(maxlen=25)
@@ -1740,7 +1766,10 @@ class TvWatcher:
                     self.error = ""
                     time.sleep(1)
                     continue
-                fr = tv_frame(client.request("GET", "/6/ambilight/processed"))
+                fr, src = tv_read(client, self.src)
+                if src != self.src:
+                    log(f"TV : couleurs lues dans « {src} » (« {self.src} » reste noir sur cette TV).")
+                    self.src = src
                 with self.lock:
                     self.frame, self.frame_t = fr, time.time()
                 times.append(self.frame_t)
@@ -2661,11 +2690,13 @@ def tv_test():
             return {"ok": False, "power": power, "message": "Allume la TV (pas en veille) pour mesurer."}
         topo = cl.request("GET", "/6/ambilight/topology")
         mode = cl.request("GET", "/6/ambilight/mode").get("current")
+        black = {k: hms.tv_black(hms.tv_frame(cl.request("GET", f"/6/ambilight/{k}"))) for k in hms.TV_SOURCES}
+        src = next((k for k in hms.TV_SOURCES if not black[k]), "processed")
         times, last = [], None
         t0 = time.time()
         for _ in range(20):
             a = time.time()
-            last = hms.tv_frame(cl.request("GET", "/6/ambilight/processed"))
+            last, src = hms.tv_read(cl, src)
             times.append(time.time() - a)
         total = time.time() - t0
     except hms.TvError as e:
@@ -2677,6 +2708,7 @@ def tv_test():
     to_hex = lambda a: ["#%02x%02x%02x" % tuple(int(max(0, min(1, x)) * 255) for x in p) for p in a]
     return {"ok": True, "power": power, "hz": round(20 / total, 1), "ms": round(times[len(times) // 2] * 1000),
             "ms_max": round(times[-1] * 1000), "topology": topo, "mode": mode, "sides": sides,
+            "src": src, "black": black,
             "preview": {k: to_hex(v) for k, v in (last or {}).items() if len(v)}}
 
 
@@ -5840,6 +5872,7 @@ function renderTv(fromPoll) {
       <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Temps de réponse</span><span>${t.ms} ms (max ${t.ms_max} ms)</span></div>
       <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Pixels Ambilight</span><span>${Object.entries(t.sides).filter(([, n]) => n).map(([k, n]) => ({ left: "gauche", top: "haut", right: "droite", bottom: "bas" }[k] + " " + n)).join(" · ")}</span></div>
       ${["left", "top", "right"].filter(k => t.preview[k]).map(k => `<div style="display:flex;align-items:center;gap:8px;margin-top:8px"><small style="width:44px;color:var(--t3)">${{ left: "Gauche", top: "Haut", right: "Droite" }[k]}</small><div style="flex:1;height:14px;border-radius:7px;background:linear-gradient(90deg,${t.preview[k].join(",")})"></div></div>`).join("")}
+      <div style="display:flex;justify-content:space-between;font-size:15px;margin-top:6px;color:var(--t2)"><span>Couleurs lues</span><span>${t.black && t.black.processed && t.black.measured ? "aucune (image noire ou Ambilight éteint)" : t.src === "measured" ? "mesurées sur l'image" : "calculées par l'Ambilight"}</span></div>
       <p class="hint" style="margin:10px 0 0">${t.hz >= 10 ? "Liaison rapide : la synchro vidéo sera fluide." : t.hz >= 5 ? "Liaison correcte : choisis la fluidité « Douce » pour lisser." : "Liaison lente : la synchro suivra l'image avec du retard."}${t.mode && t.mode !== "internal" ? ` Mode Ambilight actuel : « ${esc(t.mode)} ».` : ""}</p></div></div>`
     : `<p class="note" style="color:var(--red)">${esc(t.message || "Mesure impossible.")}</p>`;
   h += `<div class="label">Placement dans la pièce</div><div class="pad" style="padding-top:4px"><div style="background:var(--card);border-radius:16px;padding:12px">${tvPlanSvg()}</div></div>
