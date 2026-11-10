@@ -1710,6 +1710,9 @@ class TvWatcher:
       (chaque côté prend la couleur des lampes voisines sur le plan), puis lui rend son état d'avant."""
 
     AMBI_HZ = 20                         # envois par seconde vers l'Ambilight (mesuré : ~50/s possibles)
+    AMBI_KEEP = 2.0                      # renvoi des mêmes couleurs au moins toutes les 2 s (la TV sait qu'on est là)
+    AMBI_POWER_EVERY = 10.0              # pendant la musique, l'état de la TV n'est relu que toutes les 10 s
+    AMBI_RETRIES = 6                     # coupures de connexion tolérées d'affilée avant d'abandonner
     AMBI_FLAG = ".ambilight-musique"     # présent tant que Lueur pilote l'Ambilight (restauration après un arrêt brutal)
 
     def __init__(self, conf_dir):
@@ -1719,9 +1722,45 @@ class TvWatcher:
         self.src = "processed"
         self.mapper = None               # VideoMapper : positions des lampes et de la TV sur le plan
         self.pushed, self.push_t = None, 0.0
-        self.ambi_on, self.ambi_prev, self.topo, self.ambi_last = False, None, None, None
+        self.ambi_on, self.ambi_prev, self.topo, self.ambi_last, self.ambi_sent = False, None, None, None, 0.0
+        self.fails = 0
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
+        threading.Thread(target=self._power_loop, daemon=True).start()
+
+    def _power_loop(self):
+        """État de la TV (allumée / veille), relu dans son propre fil avec sa propre connexion :
+        une TV en veille met parfois plusieurs secondes à répondre, ça ne doit jamais bloquer
+        les couleurs envoyées à l'Ambilight ni la lecture de l'image."""
+        client, creds, misses = None, None, 0
+        while True:
+            if not self.enabled:
+                if client:
+                    client.close()
+                client, creds, misses = None, None, 0
+                time.sleep(0.5)
+                continue
+            c = tv_load(self.conf_dir)
+            if c != creds:
+                creds = c
+                if client:
+                    client.close()
+                client = TvClient(c["ip"], c["user"], c["key"], timeout=4) if c else None
+            if not client:
+                time.sleep(2)
+                continue
+            try:
+                p = client.request("GET", "/6/powerstate").get("powerstate")
+                misses = 0
+                if (p == "On") != (self.power == "On") or self.power is None:
+                    log(f"TV : {'allumée' if p == 'On' else 'en veille' if p else 'état inconnu'}.")
+                self.power = p
+            except Exception:
+                client.close()
+                misses += 1
+                if misses >= 3 and not self.ambi_on:    # vraiment injoignable (et pas en pleine musique)
+                    self.power = None
+            time.sleep(self.AMBI_POWER_EVERY if self.ambi_on else 3)
 
     def configure(self, tv):
         self.video = bool(tv.get("on"))
@@ -1747,7 +1786,8 @@ class TvWatcher:
 
     def info(self):
         return {"on": self.video, "music": self.music, "power": self.power, "rate": round(self.rate, 1),
-                "error": self.error, "active": self.active, "src": self.src, "ambi": self.ambi_on}
+                "error": self.error, "active": self.active, "src": self.src, "ambi": self.ambi_on,
+                "fails": self.fails}
 
     # --- Ambilight piloté par la musique ---
     def _flag(self):
@@ -1843,12 +1883,9 @@ class TvWatcher:
                 log("TV : appairage trouvé.")
             t0 = time.time()
             try:
-                if t0 >= next_power:
-                    p = client.request("GET", "/6/powerstate").get("powerstate")
-                    if (p == "On") != (self.power == "On") or self.power is None:
-                        log(f"TV : {'allumée' if p == 'On' else 'en veille' if p else 'état inconnu'}.")
-                    self.power = p
-                    next_power = t0 + 3
+                if self.power is None:          # état pas encore connu (lu par _power_loop)
+                    time.sleep(0.3)
+                    continue
                 with self.lock:
                     pushed, push_t = self.pushed, self.push_t
                 music_now = self.music and pushed is not None and t0 - push_t < 1.5
@@ -1858,9 +1895,12 @@ class TvWatcher:
                         if not self.ambi_on:
                             self._ambi_start(client)
                         body = self.mapper.ambi(pushed, self.topo) if self.mapper else None
-                        if body and body != self.ambi_last:
+                        if body and (body != self.ambi_last or t0 - self.ambi_sent > self.AMBI_KEEP):
                             client.request("POST", "/6/ambilight/cached", body)
-                            self.ambi_last = body
+                            self.ambi_last, self.ambi_sent = body, t0
+                        if self.fails:
+                            log(f"TV : connexion rétablie après {self.fails} coupure(s).")
+                            self.fails = 0
                         time.sleep(max(0.0, 1.0 / self.AMBI_HZ - (time.time() - t0)))
                         continue
                     if self.ambi_on:
@@ -1883,18 +1923,24 @@ class TvWatcher:
                     self.rate = (len(times) - 1) / max(1e-3, times[-1] - times[0])
                 self.error = ""
             except TvError as e:
+                client.close()
+                if self.ambi_on and self.fails < self.AMBI_RETRIES:
+                    self.fails += 1          # coupure passagère pendant la musique : on reconnecte tout de suite,
+                    if self.fails == 1:      # l'Ambilight garde ses couleurs et rien n'est redémarré
+                        log(f"TV : coupure de connexion pendant la musique ({e}), reconnexion…")
+                    time.sleep(0.2 * self.fails)
+                    continue
                 if str(e) != self.error:
                     log(f"TV : {e}")
-                self.error, self.power = str(e), None
-                self.ambi_on = False             # la connexion est perdue ; le drapeau permettra de rendre l'Ambilight
-                client.close()
+                self.error = str(e)
+                self.ambi_on, self.fails = False, 0   # connexion perdue ; le drapeau permettra de rendre l'Ambilight
                 time.sleep(3)
                 continue
             except Exception as e:                  # réponse inattendue : on le note et on réessaie,
                 msg = f"Réponse inattendue de la TV ({e.__class__.__name__} : {str(e)[:120]})."   # le fil ne doit jamais s'arrêter
                 if msg != self.error:
                     log(f"TV : {msg}")
-                self.error, self.power = msg, None
+                self.error = msg
                 self.ambi_on = False
                 client.close()
                 time.sleep(3)
