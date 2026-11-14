@@ -22,6 +22,7 @@ Sert la page index.html et une petite API JSON :
   POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
   POST /api/area/from_room {"id", "rubans"?, "spots"?}    crée la zone de divertissement d'une pièce d'après son plan
   POST /api/plan/colortest {"id", "rubans", "spots", "dims", "stop"?}  test « couleurs par segment » d'une pièce
+  POST /api/fx/test {"dur"?, "stop"?}  rejoue l'effet actuel sur les lampes (rythme simulé)
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -290,6 +291,25 @@ def plan_test(body):
     return {"ok": True, "running": active, "area_selected": s.get("area") in ("", aid)}
 
 
+def fx_test(body):
+    """Réglages avancés : rejoue l'effet actuel sur les vraies lampes (rythme simulé)."""
+    s = get_settings()
+    if body.get("stop"):
+        if (s.get("test") or {}).get("mode") == "fx":
+            s["test"] = {}
+            write_json(SETTINGS_PATH, s)
+        return {"ok": True, "running": service_state()["active"]}
+    try:
+        dur = max(3, min(15, int(body.get("dur", 6))))
+    except (TypeError, ValueError):
+        dur = 6
+    aid = s.get("area", "")
+    s["test"] = {"area": aid, "until": time.time() + dur, "mode": "fx"}
+    write_json(SETTINGS_PATH, s)
+    active = service_state()["active"]
+    return {"ok": True, "running": active, "dur": dur, "area_selected": bool(aid)}
+
+
 identify_jobs = {}
 
 
@@ -545,13 +565,17 @@ def update_settings(body):
         if "fx" not in body:
             s["fx"] = {}                 # choisir un préréglage efface les réglages avancés
     if "fx" in body and isinstance(body["fx"], dict):
-        merged = dict(s.get("fx") or {})
-        for k, v in body["fx"].items():
-            if v is None:
-                merged.pop(k, None)      # None = revenir à la valeur du préréglage
-            else:
-                merged[k] = v
-        s["fx"] = hms.clean_fx(merged)
+        if not body["fx"]:
+            s["fx"] = {}                     # {} explicite = tout rétablir
+            merged = {}
+        else:
+            merged = dict(s.get("fx") or {})
+            for k, v in body["fx"].items():
+                if v is None:
+                    merged.pop(k, None)      # None = revenir à la valeur du préréglage
+                else:
+                    merged[k] = v
+            s["fx"] = hms.clean_fx(merged)
     if "mode" in body and body["mode"] in hms.MODES:
         s["mode"] = body["mode"]
     if "speed" in body:
@@ -1985,6 +2009,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, plan_eq(body))
             if path == "/api/plan/test":
                 return self._send(200, plan_test(body))
+            if path == "/api/fx/test":
+                return self._send(200, fx_test(body))
             if path == "/api/plan/identify":
                 try:
                     return self._send(200, identify_light(body))

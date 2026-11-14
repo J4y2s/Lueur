@@ -82,13 +82,13 @@ INTENSITY = {
     # every     : changement de couleur tous les N temps    fade : fondu de couleur (s)
     # pattern   : "all" toutes ensemble, "alt" lampes en alternance, "chase" chenillard
     # strobe    : flash blanc sur les drops        beat_k / min_beat : sensibilité de détection
-    "subtle":   dict(base=0.30, beat=0.22, tau=0.55, energy=0.35, every=4, fade=1.60,
+    "subtle":   dict(base=0.15, beat=0.10, tau=0.70, energy=0.25, every=4, fade=1.60,
                      pattern="all", strobe=False, beat_k=2.0, min_beat=0.40, source="full"),
-    "moderate": dict(base=0.22, beat=0.70, tau=0.28, energy=0.20, every=2, fade=0.45,
+    "moderate": dict(base=0.18, beat=0.45, tau=0.32, energy=0.18, every=2, fade=0.50,
                      pattern="all", strobe=False, beat_k=1.7, min_beat=0.28, source="full"),
-    "high":     dict(base=0.07, beat=0.93, tau=0.17, energy=0.12, every=1, fade=0.12,
+    "high":     dict(base=0.06, beat=0.75, tau=0.20, energy=0.12, every=1, fade=0.15,
                      pattern="alt", strobe=False, beat_k=1.5, min_beat=0.26, source="full"),
-    "intense":  dict(base=0.00, beat=1.00, tau=0.10, energy=0.05, every=1, fade=0.00,
+    "intense":  dict(base=0.00, beat=0.90, tau=0.12, energy=0.05, every=1, fade=0.00,
                      pattern="chase", strobe=True, beat_k=1.35, min_beat=0.22, source="full"),
 }
 
@@ -2267,6 +2267,32 @@ def cmd_run(args):
                     # celle du segment le plus proche sur le plan (pour vérifier où sont les spots).
                     cmap = test_color_map(plan_channels(area, settings["plans"]), kinds)
                     session.send([(cid, *(v * 0.85 for v in hex_to_rgb(hx))) for cid, hx in cmap.items()])
+                    continue
+                if test.get("mode") == "fx":
+                    # Test des réglages avancés : le moteur rejoue l'effet actuel avec un rythme
+                    # simulé (120 BPM), même sans musique. Tous les curseurs (force, durée,
+                    # fond, motif, couleurs, vitesse, couches, flash blanc) se voient en vrai.
+                    ph = (now % 0.5) / 0.5
+                    beat = ph < 0.05
+                    strength = 0.9
+                    sw = 0.5 + 0.5 * np.sin(2 * np.pi * now / 6.0)
+                    bands = {"bass": 0.9 if beat else 0.25 + 0.2 * sw,
+                             "mid": 0.5 + 0.3 * sw, "high": 0.6 if beat else 0.3,
+                             "on_bass": 1.0 if beat else 0.15, "on_mid": 0.7 if beat else 0.2,
+                             "on_high": 0.8 if beat else 0.25, "energy": 0.35 + 0.5 * sw,
+                             "lr": 0.0}
+                    colors = fx.update(0.3, bands, beat, strength)
+                    eq = plan_eq(area, settings["plans"])
+                    if eq:
+                        colors = [(c, r * f, g * f, b * f) for c, r, g, b in colors
+                                  for f in (eq.get(devs.get(c), 1.0),)]
+                    session.send(colors)
+                    status.write(state="syncing" if session.active else "waiting",
+                                 area=area_name, area_id=area["id"], level=0.3,
+                                 beats=beats, colors=fx.colors_hex() if session.active else [],
+                                 source="music",
+                                 tv=tv.info() if tv else None,
+                                 bt={"device": player.device, "playing": player.playing} if player else None)
                     continue
                 order = [c["channel_id"] for c in sorted(plan_channels(area, settings["plans"]),
                                                          key=lambda c: c["position"]["x"])]
