@@ -5701,10 +5701,14 @@ function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mu
   });
   const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100"); svg.innerHTML = h;
 }
-function drawRender() {   // la pièce éclairée, style maquette claire : parquet, murs crème, nappes douces
+function drawRender() {   // maquette claire : projection iso, parquet, murs creme, lumiere douce
   const cv = $("#planRender"), ctx = cv.getContext("2d"), W = cv.width = 480, H = cv.height = 480;
-  $("#planHint").textContent = "Rendu d'ambiance : à peu près ce que donne la pièce une fois éclairée.";
-  const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
+  $("#planHint").textContent = "Rendu d'ambiance : a peu pres ce que donne la piece une fois eclairee.";
+  const pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
+  const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0;
+  const kk = dw && dd ? Math.max(0.5, Math.min(1.25, dd / dw)) : 1;
+  const C30 = Math.cos(Math.PI / 6);
+  const P = (wx, wy, wz) => [50 + (wx - wy * kk) * 15 * C30, 62 + (wx + wy * kk) * 15 * 0.5 - wz * 17];
   const S4 = v => v * 4.8, P4 = (x, y, z) => { const A = P(x, y, z); return [A[0] * 4.8, A[1] * 4.8]; };
   const rgba = (hex, a) => { const c = hexRgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; };
   const path = pts => { const p = new Path2D(); pts.forEach((q, i) => { const A = P4(q[0], q[1], q[2]); i ? p.lineTo(A[0], A[1]) : p.moveTo(A[0], A[1]); }); p.closePath(); return p; };
@@ -5712,30 +5716,19 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
   const BACK = [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]];
   const RIGHT = [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]];
   const F_FLOOR = path(FLOOR), F_BACK = path(BACK), F_RIGHT = path(RIGHT);
-  const TT = 0.14;
-  const capB = path([[-1, 1, 1], [1, 1, 1], [1, 1 + TT, 1], [-1, 1 + TT, 1]]);
-  const capR = path([[1, -1, 1], [1, 1, 1], [1 + TT, 1, 1], [1 + TT, -1, 1]]);
-  const skirtF = path([[-1, -1, -1], [1, -1, -1], [1, -1, -1 - TT], [-1, -1, -1 - TT]]);
-  const skirtL = path([[-1, -1, -1], [-1, 1, -1], [-1, 1, -1 - TT], [-1, -1, -1 - TT]]);
-  let g = ctx.createRadialGradient(S4(50), S4(55), 40, S4(50), S4(55), S4(75));
-  g.addColorStop(0, "#f2eee7"); g.addColorStop(1, "#e3ded4");
+  let g = ctx.createRadialGradient(S4(50), S4(52), 40, S4(50), S4(52), S4(78));
+  g.addColorStop(0, "#f4f1ea"); g.addColorStop(1, "#e2ddd2");
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-  g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
-  g.addColorStop(0, "#f7f4ef"); g.addColorStop(1, "#e9e4d9");
+  ctx.fillStyle = "#d9bd97"; ctx.fill(F_FLOOR);
+  g = ctx.createLinearGradient(0, S4(30), 0, S4(96));
+  g.addColorStop(0, "#faf8f3"); g.addColorStop(1, "#ece5d7");
   ctx.fillStyle = g; ctx.fill(F_BACK);
-  g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
-  g.addColorStop(0, "#f1ece3"); g.addColorStop(1, "#e0d7c6");
+  g = ctx.createLinearGradient(0, S4(30), 0, S4(96));
+  g.addColorStop(0, "#f4f0e8"); g.addColorStop(1, "#e4dbc8");
   ctx.fillStyle = g; ctx.fill(F_RIGHT);
-  ctx.fillStyle = "#d8cfbe"; ctx.fill(capB); ctx.fill(capR);
-  ctx.fillStyle = "#a98d68"; ctx.fill(skirtF);
-  ctx.fillStyle = "#967950"; ctx.fill(skirtL);
-  ctx.fillStyle = "#d9c09c"; ctx.fill(F_FLOOR);
-  ctx.save(); ctx.clip(F_FLOOR); ctx.strokeStyle = "rgba(150,120,85,.5)"; ctx.lineWidth = 1;
+  ctx.save(); ctx.clip(F_FLOOR); ctx.strokeStyle = "rgba(150,120,85,.4)"; ctx.lineWidth = 1;
   for (let f = 0.15; f < 1; f += 0.15) { const A = P4(-1, -1 + 2 * f, -1), B = P4(1, -1 + 2 * f, -1); ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke(); }
   ctx.restore();
-  ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.lineWidth = 1;
-  ctx.stroke(F_FLOOR); ctx.stroke(F_BACK); ctx.stroke(F_RIGHT);
-  ctx.stroke(capB); ctx.stroke(capR); ctx.stroke(skirtF); ctx.stroke(skirtL);
   const { rub, single } = planDevs(), feux = [];
   rub.forEach(([d, cs]) => { const zh = chanZ(cs[0]);
     cs.forEach((c, i) => { const q = pos[c.id]; if (!q) return;
@@ -5743,63 +5736,65 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
                   fan: Math.min(q.p[1], 1 - q.p[0]) <= Math.min(1 - q.p[1], q.p[0]) }); }); });
   single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (!q) return;
     const x = q.p[0] * 2 - 1, y = 1 - q.p[1] * 2;
-    feux.push({ x, y, z: chanZ(c), col: (CT && CT.spots[c.light || c.id]) || pal[Math.min(pal.length - 1, Math.floor(q.p[0] * pal.length))], nom: c.name }); }));
+    feux.push({ x, y, z: chanZ(c), col: (CT && CT.spots[c.light || c.id]) || pal[Math.min(pal.length - 1, Math.floor(q.p[0] * pal.length))], nom: c.name, fan: true }); }));
   const wash = (face, x, y, z, col, r, a) => {
     const A = P4(x, y, z);
     ctx.save(); ctx.clip(face);
     const gg = ctx.createRadialGradient(A[0], A[1], 4, A[0], A[1], r);
-    gg.addColorStop(0, rgba(col, a)); gg.addColorStop(0.55, rgba(col, a * 0.3)); gg.addColorStop(1, rgba(col, 0));
-    ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
-    ctx.restore();
-  };
-  const ombre = (face, x, y, r, a) => {
-    const A = P4(x, y, -1);
-    ctx.save(); ctx.clip(face);
-    const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], r);
-    gg.addColorStop(0, `rgba(90,80,70,${a})`); gg.addColorStop(1, "rgba(90,80,70,0)");
+    gg.addColorStop(0, rgba(col, a)); gg.addColorStop(0.55, rgba(col, a * 0.28)); gg.addColorStop(1, rgba(col, 0));
     ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
     ctx.restore();
   };
   feux.forEach(fx => {
     if (fx.ruban && !fx.fan) return;
-    const r = S4(8 + (fx.z + 1) * 4);
-    wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.3);
-    wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.26);
-    wash(F_RIGHT, 1, fx.y, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.22);
+    const r = S4(6.5 + (fx.z + 1) * 3);
+    wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.28);
+    wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.3), fx.col, r * 0.8, 0.24);
+    wash(F_RIGHT, 1, fx.y, Math.max(fx.z, -0.3), fx.col, r * 0.8, 0.2);
   });
-  ombre(F_BACK, 0, 1, S4(9), 0.1); ombre(F_RIGHT, 1, 0, S4(9), 0.1); ombre(F_FLOOR, 0, 0, S4(14), 0.08);
-  const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
-  const T = P4(0, 1, 0);
   ctx.save(); ctx.clip(F_BACK);
+  const T = P4(0, 1, 0);
   const halo = ctx.createRadialGradient(T[0], T[1], 4, T[0], T[1], S4(20));
-  halo.addColorStop(0, rgba(pal[0], 0.3)); halo.addColorStop(1, rgba(pal[0], 0));
+  halo.addColorStop(0, rgba(pal[0], 0.22)); halo.addColorStop(1, rgba(pal[0], 0));
   ctx.fillStyle = halo; ctx.fillRect(0, 0, W, H);
   ctx.restore();
-  ctx.fillStyle = "#1e1e22"; ctx.fill(path(tv));
-  ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.stroke(path(tv));
+  const shade = (face, x, y, r, a) => {
+    const A = P4(x, y, -1);
+    ctx.save(); ctx.clip(face);
+    const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], r);
+    gg.addColorStop(0, `rgba(95,85,70,${a})`); gg.addColorStop(1, "rgba(95,85,70,0)");
+    ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  };
+  shade(F_BACK, -0.4, 1, S4(10), 0.1); shade(F_BACK, 0.4, 1, S4(10), 0.1);
+  shade(F_RIGHT, 1, -0.4, S4(10), 0.1); shade(F_RIGHT, 1, 0.4, S4(10), 0.1);
+  shade(F_FLOOR, 0, 0, S4(16), 0.07);
+  const tv = [[-0.3, 1, -0.42], [0.3, 1, -0.42], [0.3, 1, 0.45], [-0.3, 1, 0.45]];
+  ctx.fillStyle = "#202024"; ctx.fill(path(tv));
+  ctx.strokeStyle = "rgba(140,135,128,.7)"; ctx.lineWidth = 1; ctx.stroke(path(tv));
   rub.forEach(([d, cs]) => { const r = PED.rubans[d];
     stripRuns(r, 60, chanZ(cs[0])).forEach(run => {
-      ctx.strokeStyle = run.solid ? "rgba(255,253,248,.55)" : "rgba(120,110,100,.4)";
+      ctx.strokeStyle = run.solid ? "rgba(255,253,248,.6)" : "rgba(150,142,132,.45)";
       ctx.lineWidth = run.solid ? 2 : 1.5; ctx.lineJoin = "round";
       ctx.beginPath(); run.pts.forEach((p, i) => { const A = P4(p[0], p[1], p[2]); i ? ctx.lineTo(A[0], A[1]) : ctx.moveTo(A[0], A[1]); }); ctx.stroke(); }); });
   feux.forEach(fx => {
     if (!fx.ruban) {
       const A = P4(fx.x, fx.y, fx.z), G = P4(fx.x, fx.y, -1);
-      ctx.fillStyle = "rgba(90,80,70,.12)";
-      ctx.beginPath(); ctx.ellipse(G[0], G[1], 13, 5, 0, 0, 7); ctx.fill();
-      const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], 24);
-      gg.addColorStop(0, rgba(fx.col, 0.35)); gg.addColorStop(1, rgba(fx.col, 0));
+      ctx.fillStyle = "rgba(95,85,70,.14)";
+      ctx.beginPath(); ctx.ellipse(G[0], G[1], 12, 5, 0, 0, 7); ctx.fill();
+      const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], 20);
+      gg.addColorStop(0, rgba(fx.col, 0.3)); gg.addColorStop(1, rgba(fx.col, 0));
       ctx.fillStyle = gg;
-      ctx.beginPath(); ctx.arc(A[0], A[1], 24, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(A[0], A[1], 20, 0, 7); ctx.fill();
       ctx.fillStyle = fx.col;
-      ctx.beginPath(); ctx.arc(A[0], A[1], 7, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(A[0], A[1], 5.5, 0, 7); ctx.fill();
       ctx.fillStyle = "#fff";
-      ctx.beginPath(); ctx.arc(A[0], A[1], 3, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(A[0], A[1], 2.2, 0, 7); ctx.fill();
     } else {
       const A = P4(fx.x, fx.y, fx.z);
       ctx.globalAlpha = fx.fan === false ? 0.45 : 1;
       ctx.fillStyle = fx.col;
-      ctx.beginPath(); ctx.arc(A[0], A[1], 6, 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(A[0], A[1], 5, 0, 7); ctx.fill();
       ctx.globalAlpha = 1;
     }
   });
@@ -5808,10 +5803,25 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
     if (fx.ruban) return;
     const A = P4(fx.x, fx.y, fx.z);
     ctx.lineWidth = 4; ctx.strokeStyle = "rgba(255,255,255,.9)";
-    ctx.strokeText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+    ctx.strokeText(fx.nom.slice(0, 14), A[0], A[1] - 20);
     ctx.fillStyle = "#57534e";
-    ctx.fillText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+    ctx.fillText(fx.nom.slice(0, 14), A[0], A[1] - 20);
   });
+  const band = (a, b, t, fill) => { const A = P(a[0], a[1], a[2]), B = P(b[0], b[1], b[2]);
+    const dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy) || 1;
+    const nx = -dy / L * t, ny = dx / L * t;
+    ctx.fillStyle = fill; ctx.beginPath();
+    [[A[0], A[1]], [B[0], B[1]], [B[0] + nx, B[1] + ny], [A[0] + nx, A[1] + ny]].forEach((p, i) => { const X = p[0] * 4.8, Y = p[1] * 4.8; i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+    ctx.closePath(); ctx.fill(); ctx.strokeStyle = "rgba(150,142,130,.7)"; ctx.lineWidth = 1; ctx.stroke(); };
+  band([-1, 1, 1], [1, 1, 1], 3.2, "#f2ece0");
+  band([1, -1, 1], [1, 1, 1], 3.2, "#e8e0d2");
+  const slab = pts => { ctx.fillStyle = "#c2a37e"; ctx.beginPath();
+    pts.forEach((p, i) => { const A = P4(p[0], p[1], p[2]); i ? ctx.lineTo(A[0], A[1]) : ctx.moveTo(A[0], A[1]); });
+    ctx.closePath(); ctx.fill(); ctx.strokeStyle = "rgba(150,142,130,.7)"; ctx.stroke(); };
+  slab([[-1, -1, -1], [1, -1, -1], [1, -1, -1.12], [-1, -1, -1.12]]);
+  slab([[-1, -1, -1], [-1, 1, -1], [-1, 1, -1.12], [-1, -1, -1.12]]);
+  ctx.strokeStyle = "rgba(150,142,130,.8)"; ctx.lineWidth = 1;
+  [F_FLOOR, F_BACK, F_RIGHT].forEach(p => ctx.stroke(p));
 }
 function drawPlan() {
   $("#planSvg").classList.toggle("hidden", planView === "render");
