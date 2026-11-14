@@ -5633,7 +5633,19 @@ function chanZ(c) {   // hauteur d'un canal : réglage de sa lampe (pièce) ou p
   const q = (PLAN.plan.ch || {})[c.id], z = q ? +q.z : NaN;
   return z >= -1 && z <= 1 ? z : 0;
 }
-function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mur gauche, lampes à leur hauteur
+function stripRuns(r, n, zh) {   // tronçons du ruban : solides sur les murs dessinés (fond, droite), fantômes ailleurs
+  const runs = [];
+  let cur = null, prev = null;
+  for (let j = 0; j <= n; j++) {
+    const q = alongP(r, j / n, PED.dims), u = q[0], v = q[1];
+    const solid = Math.min(v, 1 - u) <= Math.min(1 - v, u);
+    const p = [u * 2 - 1, 1 - v * 2, zh];
+    if (!cur || cur.solid !== solid) { cur = { pts: prev ? [prev] : [], solid }; runs.push(cur); }
+    cur.pts.push(p); prev = p;
+  }
+  return runs.filter(run => run.pts.length > 1);
+}
+function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mur droit, lampes à leur hauteur
   const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
   $("#planHint").textContent = "Vue 3D : chaque lampe à sa hauteur. Reviens en vue de dessus pour les déplacer.";
   const f = v => v.toFixed(1);
@@ -5645,25 +5657,31 @@ function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mu
     + `<linearGradient id="isowall" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b2c33"/><stop offset="1" stop-color="#17181c"/></linearGradient>`
     + `<radialGradient id="isoglow"><stop offset="0" stop-color="#fff" stop-opacity=".85"/><stop offset=".45" stop-color="#fff" stop-opacity=".22"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>`
     + `<linearGradient id="isobeam" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".3"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>`;
+  const T = 0.14;   // épaisseur des murs et du sol (dessus de murs, plinthes)
   h += `<polygon points="${poly([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]])}" fill="url(#isofloor)" stroke="#3a3b40" stroke-width=".5"/>`;
   h += seg2([-1, 0, -1], [1, 0, -1], ` stroke="#33333a" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
   h += seg2([0, -1, -1], [0, 1, -1], ` stroke="#33333a" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
   h += `<polygon points="${poly([[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]])}" fill="url(#isowall)" opacity=".55" stroke="#3a3b40" stroke-width=".5"/>`;
-  h += `<polygon points="${poly([[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]])}" fill="url(#isowall)" opacity=".32" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += `<polygon points="${poly([[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]])}" fill="url(#isowall)" opacity=".32" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += `<polygon points="${poly([[-1, 1, 1], [1, 1, 1], [1, 1 + T, 1], [-1, 1 + T, 1]])}" fill="url(#isowall)" opacity=".8" stroke="#3a3b40" stroke-width=".4"/>`;
+  h += `<polygon points="${poly([[1, -1, 1], [1, 1, 1], [1 + T, 1, 1], [1 + T, -1, 1]])}" fill="url(#isowall)" opacity=".8" stroke="#3a3b40" stroke-width=".4"/>`;
+  h += `<polygon points="${poly([[-1, -1, -1], [1, -1, -1], [1, -1, -1 - T], [-1, -1, -1 - T]])}" fill="#0e0f12" stroke="#3a3b40" stroke-width=".4"/>`;
+  h += `<polygon points="${poly([[-1, -1, -1], [-1, 1, -1], [-1, 1, -1 - T], [-1, -1, -1 - T]])}" fill="#0e0f12" stroke="#3a3b40" stroke-width=".4"/>`;
   const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
   h += `<polygon points="${poly(tv)}" fill="#0b0b0d" stroke="#4a4b52" stroke-width=".6"/>`;
   h += `<polygon points="${poly(inset(tv, 0.22))}" fill="${pal[0]}" opacity=".3"/>`;
   const { rub, single } = planDevs();
-  const dot = (A, col, r) => `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="${(r + 1.6).toFixed(1)}" fill="${col}" opacity=".26"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="${r}" fill="${col}"/>`;
+  const dot = (A, col, r, op) => `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="${(r + 1.6).toFixed(1)}" fill="${col}" opacity="${(0.26 * op).toFixed(2)}"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="${r}" fill="${col}" opacity="${op}"/>`;
   rub.forEach(([d, cs]) => {
-    const r = PED.rubans[d], zh = chanZ(cs[0]), pts = [];
-    for (let j = 0; j <= 60; j++) { const q = alongP(r, j / 60, PED.dims); pts.push([q[0] * 2 - 1, 1 - q[1] * 2, zh]); }
-    h += `<polyline points="${poly(pts)}" fill="none" stroke="#fff" stroke-width="7" opacity=".1" stroke-linecap="round"/>`;
-    h += `<polyline points="${poly(pts)}" fill="none" stroke="#fff" stroke-width="3.5" opacity=".18" stroke-linecap="round"/>`;
-    h += `<polyline points="${poly(pts)}" fill="none" stroke="#fff" stroke-width="1.2" opacity=".9" stroke-linecap="round"/>`;
+    const r = PED.rubans[d], zh = chanZ(cs[0]);
+    stripRuns(r, 60, zh).forEach(run => {
+      h += `<polyline points="${poly(run.pts)}" fill="none" stroke="#fff" stroke-width="${run.solid ? 3.5 : 1.5}" opacity="${run.solid ? 0.18 : 0.1}" stroke-linecap="round"/>`;
+      if (run.solid) h += `<polyline points="${poly(run.pts)}" fill="none" stroke="#fff" stroke-width="1.2" opacity=".9" stroke-linecap="round"/>`;
+    });
     cs.forEach((c, i) => { const q = pos[c.id]; if (!q) return; const A = P(q.p[0] * 2 - 1, 1 - q.p[1] * 2, zh);
       const col = (CT && CT.segments[i]) || (i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade");
-      h += dot(A, col, 1.6) + `<text x="${f(A[0])}" y="${f(A[1] - 3.4)}" text-anchor="middle" font-size="2.8" font-weight="700" fill="#fff" stroke="#000" stroke-width=".7" style="paint-order:stroke">${i + 1}</text>`; });
+      const fan = Math.min(q.p[1], 1 - q.p[0]) <= Math.min(1 - q.p[1], q.p[0]) ? 1 : 0.4;
+      h += dot(A, col, 1.6, fan) + `<text x="${f(A[0])}" y="${f(A[1] - 3.4)}" text-anchor="middle" font-size="2.8" font-weight="700" fill="#fff" stroke="#000" stroke-width=".7" style="paint-order:stroke" opacity="${fan}">${i + 1}</text>`; });
   });
   const lamps = [];
   single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (q) lamps.push([c, q.p[0] * 2 - 1, 1 - q.p[1] * 2, chanZ(c)]); }));
@@ -5692,8 +5710,13 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
   const path = pts => { const p = new Path2D(); pts.forEach((q, i) => { const A = P4(q[0], q[1], q[2]); i ? p.lineTo(A[0], A[1]) : p.moveTo(A[0], A[1]); }); p.closePath(); return p; };
   const FLOOR = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]];
   const BACK = [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]];
-  const LEFT = [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]];
-  const F_FLOOR = path(FLOOR), F_BACK = path(BACK), F_LEFT = path(LEFT);
+  const RIGHT = [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]];
+  const F_FLOOR = path(FLOOR), F_BACK = path(BACK), F_RIGHT = path(RIGHT);
+  const TT = 0.14;
+  const capB = path([[-1, 1, 1], [1, 1, 1], [1, 1 + TT, 1], [-1, 1 + TT, 1]]);
+  const capR = path([[1, -1, 1], [1, 1, 1], [1 + TT, 1, 1], [1 + TT, -1, 1]]);
+  const skirtF = path([[-1, -1, -1], [1, -1, -1], [1, -1, -1 - TT], [-1, -1, -1 - TT]]);
+  const skirtL = path([[-1, -1, -1], [-1, 1, -1], [-1, 1, -1 - TT], [-1, -1, -1 - TT]]);
   let g = ctx.createRadialGradient(S4(50), S4(55), 40, S4(50), S4(55), S4(75));
   g.addColorStop(0, "#f2eee7"); g.addColorStop(1, "#e3ded4");
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
@@ -5702,16 +5725,22 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
   ctx.fillStyle = g; ctx.fill(F_BACK);
   g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
   g.addColorStop(0, "#f1ece3"); g.addColorStop(1, "#e0d7c6");
-  ctx.fillStyle = g; ctx.fill(F_LEFT);
+  ctx.fillStyle = g; ctx.fill(F_RIGHT);
+  ctx.fillStyle = "#d8cfbe"; ctx.fill(capB); ctx.fill(capR);
+  ctx.fillStyle = "#a98d68"; ctx.fill(skirtF);
+  ctx.fillStyle = "#967950"; ctx.fill(skirtL);
   ctx.fillStyle = "#d9c09c"; ctx.fill(F_FLOOR);
   ctx.save(); ctx.clip(F_FLOOR); ctx.strokeStyle = "rgba(150,120,85,.5)"; ctx.lineWidth = 1;
   for (let f = 0.15; f < 1; f += 0.15) { const A = P4(-1, -1 + 2 * f, -1), B = P4(1, -1 + 2 * f, -1); ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke(); }
   ctx.restore();
   ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.lineWidth = 1;
-  ctx.stroke(F_FLOOR); ctx.stroke(F_BACK); ctx.stroke(F_LEFT);
+  ctx.stroke(F_FLOOR); ctx.stroke(F_BACK); ctx.stroke(F_RIGHT);
+  ctx.stroke(capB); ctx.stroke(capR); ctx.stroke(skirtF); ctx.stroke(skirtL);
   const { rub, single } = planDevs(), feux = [];
   rub.forEach(([d, cs]) => { const zh = chanZ(cs[0]);
-    cs.forEach((c, i) => { const q = pos[c.id]; if (q) feux.push({ x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2, z: zh, col: (CT && CT.segments[i]) || pal[i % pal.length], ruban: true }); }); });
+    cs.forEach((c, i) => { const q = pos[c.id]; if (!q) return;
+      feux.push({ x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2, z: zh, col: (CT && CT.segments[i]) || pal[i % pal.length], ruban: true,
+                  fan: Math.min(q.p[1], 1 - q.p[0]) <= Math.min(1 - q.p[1], q.p[0]) }); }); });
   single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (!q) return;
     const x = q.p[0] * 2 - 1, y = 1 - q.p[1] * 2;
     feux.push({ x, y, z: chanZ(c), col: (CT && CT.spots[c.light || c.id]) || pal[Math.min(pal.length - 1, Math.floor(q.p[0] * pal.length))], nom: c.name }); }));
@@ -5732,12 +5761,13 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
     ctx.restore();
   };
   feux.forEach(fx => {
+    if (fx.ruban && !fx.fan) return;
     const r = S4(8 + (fx.z + 1) * 4);
     wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.3);
     wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.26);
-    wash(F_LEFT, -1, fx.y, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.22);
+    wash(F_RIGHT, 1, fx.y, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.22);
   });
-  ombre(F_BACK, 0, 1, S4(9), 0.1); ombre(F_LEFT, -1, 0, S4(9), 0.1); ombre(F_FLOOR, 0, 0, S4(14), 0.08);
+  ombre(F_BACK, 0, 1, S4(9), 0.1); ombre(F_RIGHT, 1, 0, S4(9), 0.1); ombre(F_FLOOR, 0, 0, S4(14), 0.08);
   const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
   const T = P4(0, 1, 0);
   ctx.save(); ctx.clip(F_BACK);
@@ -5747,10 +5777,11 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
   ctx.restore();
   ctx.fillStyle = "#1e1e22"; ctx.fill(path(tv));
   ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.stroke(path(tv));
-  rub.forEach(([d, cs]) => { const r = PED.rubans[d], pts = [];
-    for (let j = 0; j <= 60; j++) { const q = alongP(r, j / 60, PED.dims); pts.push(P4(q[0] * 2 - 1, 1 - q[1] * 2, chanZ(cs[0]))); }
-    ctx.strokeStyle = "rgba(255,253,248,.55)"; ctx.lineWidth = 2; ctx.lineJoin = "round";
-    ctx.beginPath(); pts.forEach((A, i) => i ? ctx.lineTo(A[0], A[1]) : ctx.moveTo(A[0], A[1])); ctx.stroke(); });
+  rub.forEach(([d, cs]) => { const r = PED.rubans[d];
+    stripRuns(r, 60, chanZ(cs[0])).forEach(run => {
+      ctx.strokeStyle = run.solid ? "rgba(255,253,248,.55)" : "rgba(120,110,100,.4)";
+      ctx.lineWidth = run.solid ? 2 : 1.5; ctx.lineJoin = "round";
+      ctx.beginPath(); run.pts.forEach((p, i) => { const A = P4(p[0], p[1], p[2]); i ? ctx.lineTo(A[0], A[1]) : ctx.moveTo(A[0], A[1]); }); ctx.stroke(); }); });
   feux.forEach(fx => {
     if (!fx.ruban) {
       const A = P4(fx.x, fx.y, fx.z), G = P4(fx.x, fx.y, -1);
@@ -5766,8 +5797,10 @@ function drawRender() {   // la pièce éclairée, style maquette claire : parqu
       ctx.beginPath(); ctx.arc(A[0], A[1], 3, 0, 7); ctx.fill();
     } else {
       const A = P4(fx.x, fx.y, fx.z);
+      ctx.globalAlpha = fx.fan === false ? 0.45 : 1;
       ctx.fillStyle = fx.col;
       ctx.beginPath(); ctx.arc(A[0], A[1], 6, 0, 7); ctx.fill();
+      ctx.globalAlpha = 1;
     }
   });
   ctx.font = "600 15px system-ui"; ctx.textAlign = "center";
