@@ -91,13 +91,13 @@ INTENSITY = {
     # every     : changement de couleur tous les N temps    fade : fondu de couleur (s)
     # pattern   : "all" toutes ensemble, "alt" lampes en alternance, "chase" chenillard
     # strobe    : flash blanc sur les drops        beat_k / min_beat : sensibilité de détection
-    "subtle":   dict(base=0.15, beat=0.10, tau=0.70, energy=0.25, every=4, fade=1.60,
+    "subtle":   dict(base=0.30, beat=0.22, tau=0.55, energy=0.35, every=4, fade=1.60,
                      pattern="all", strobe=False, beat_k=2.0, min_beat=0.40, source="full"),
-    "moderate": dict(base=0.18, beat=0.45, tau=0.32, energy=0.18, every=2, fade=0.50,
+    "moderate": dict(base=0.22, beat=0.70, tau=0.28, energy=0.20, every=2, fade=0.45,
                      pattern="all", strobe=False, beat_k=1.7, min_beat=0.28, source="full"),
-    "high":     dict(base=0.06, beat=0.75, tau=0.20, energy=0.12, every=1, fade=0.15,
+    "high":     dict(base=0.07, beat=0.93, tau=0.17, energy=0.12, every=1, fade=0.12,
                      pattern="alt", strobe=False, beat_k=1.5, min_beat=0.26, source="full"),
-    "intense":  dict(base=0.00, beat=0.90, tau=0.12, energy=0.05, every=1, fade=0.00,
+    "intense":  dict(base=0.00, beat=1.00, tau=0.10, energy=0.05, every=1, fade=0.00,
                      pattern="chase", strobe=True, beat_k=1.35, min_beat=0.22, source="full"),
 }
 
@@ -348,7 +348,8 @@ def channel_kinds(cfg, area):
 
 def plan_channels(area, plans):
     """Applique le plan de la pièce (s'il existe) : chaque canal reçoit son ordre de parcours
-    (le long du ruban, ou de gauche à droite) et sa vraie position gauche / droite."""
+    (le long du ruban, ou de gauche à droite), sa vraie position gauche / droite et sa hauteur
+    (z de -1 au sol à +1 au plafond, 0 par défaut pour les plans d'avant l'axe Z)."""
     plan = (plans or {}).get(area.get("id"), {}) if isinstance(plans, dict) else {}
     pts = plan.get("ch", {}) if isinstance(plan, dict) else {}
     try:                                   # proportions de la pièce : profondeur / largeur
@@ -363,7 +364,8 @@ def plan_channels(area, plans):
         if isinstance(q, dict):
             try:
                 t, x, y = (max(-1.0, min(1.0, float(q[k]))) for k in ("t", "x", "y"))
-                c["position"] = {"x": t * 2 - 1, "y": y, "z": 0, "sx": x, "sy": y * ratio}
+                z = max(-1.0, min(1.0, float(q.get("z", 0))))
+                c["position"] = {"x": t * 2 - 1, "y": y, "z": z, "sx": x, "sy": y * ratio}
             except (KeyError, TypeError, ValueError):
                 pass
         out.append(c)
@@ -403,33 +405,33 @@ TEST_COLORS = ["#ff0000", "#ff7a00", "#ffe600", "#00d000", "#00e5ff", "#0030ff",
                "#ff00a8", "#ffffff", "#7a3b00"]
 
 
-def _pos2(c):
-    """Position réelle d'un canal dans la pièce (gauche-droite, avant-fond à l'échelle)."""
+def _pos3(c):
+    """Position réelle d'un canal dans la pièce : gauche-droite, avant-fond à l'échelle, hauteur."""
     p = c["position"]
-    return p.get("sx", p["x"]), p.get("sy", p.get("y", 0))
+    return p.get("sx", p["x"]), p.get("sy", p.get("y", 0)), p.get("z", 0)
 
 
 def strip_anchor(strip, o):
-    """Point du ruban le plus proche d'une lampe : (canal a, canal b, f). La lampe prend la couleur
+    """Point du ruban le plus proche d'une lampe (distances 3D) : (canal a, canal b, f). La lampe prend la couleur
     a et b mélangées (f = 0 : tout a, f = 1 : tout b). `strip` est trié dans l'ordre du ruban."""
     if len(strip) == 1:
         c = strip[0]["channel_id"]
         return c, c, 0.0
-    pts = [_pos2(c) for c in strip]
-    ox, oy = _pos2(o)
-    steps = [((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2) ** 0.5 for i in range(len(pts) - 1)]
+    pts = [_pos3(c) for c in strip]
+    ox, oy, oz = _pos3(o)
+    steps = [((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2 + (pts[i + 1][2] - pts[i][2]) ** 2) ** 0.5 for i in range(len(pts) - 1)]
     pairs = list(range(len(pts) - 1))
-    close = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2) ** 0.5
+    close = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2 + (pts[0][2] - pts[-1][2]) ** 2) ** 0.5
     if len(pts) > 2 and close <= 1.6 * sorted(steps)[len(steps) // 2]:
         pairs.append(-1)                   # le ruban fait le tour : le dernier segment touche le premier
     best = None
     for i in pairs:
         a, b = (len(pts) - 1, 0) if i == -1 else (i, i + 1)
-        (ax, ay), (bx, by) = pts[a], pts[b]
-        dx, dy = bx - ax, by - ay
-        L = dx * dx + dy * dy
-        f = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy) / L))
-        d = (ax + dx * f - ox) ** 2 + (ay + dy * f - oy) ** 2
+        (ax, ay, az), (bx, by, bz) = pts[a], pts[b]
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        L = dx * dx + dy * dy + dz * dz
+        f = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy + (oz - az) * dz) / L))
+        d = (ax + dx * f - ox) ** 2 + (ay + dy * f - oy) ** 2 + (az + dz * f - oz) ** 2
         if best is None or d < best[0]:
             best = (d, strip[a]["channel_id"], strip[b]["channel_id"], f)
     return best[1], best[2], best[3]
@@ -887,6 +889,8 @@ class Effects:
         self.sparks = None
         self.vu = 0.0
         self.vu_peak = 0.0
+        self.vuz = 0.0
+        self.vuz_peak = 0.0
         self.phase = 0.0
         self.push = 0.0                  # élan donné par la grosse caisse (effet Glissé)
         self.lr_ref = 1e-3
@@ -1043,6 +1047,29 @@ class Effects:
                 if abs(x - self.vu_peak) < 0.5 / n + 1e-6 and self.vu_peak > 0.08:
                     b = max(b, 0.85)
                 res.append((self.palette_at(x * 0.75), b, True))
+
+        elif mode == "colonne":
+            # Vu-mètre vertical : les lampes s'allument de bas en haut avec le niveau.
+            # Chaque lampe joue selon sa hauteur (z = -1 au sol, +1 au plafond, 0 par défaut) ;
+            # sans hauteurs renseignées, tout respire ensemble avec le niveau.
+            target = min(1.0, max(dyn["all"], 0.85 * dyn["bass"], 0.7 * dyn["mid"]) ** 0.9)
+            rise = 1 - np.exp(-dt / 0.04)
+            fall = 1 - np.exp(-dt / (0.35 / sp))
+            self.vuz += (target - self.vuz) * (rise if target > self.vuz else fall)
+            self.vuz_peak = max(self.vuz, self.vuz_peak - dt * 0.35 * sp)
+            zs = sorted({round(float(ch["position"].get("z", 0)), 3) for ch in self.channels})
+            if len(zs) == 1:
+                res.append((self.palette_at(self.vuz * 0.75), 0.05 + 0.95 * self.vuz, True))
+            else:
+                rk = {z: i / (len(zs) - 1) for i, z in enumerate(zs)}
+                m = len(zs)
+                for ch in self.channels:
+                    r = rk[round(float(ch["position"].get("z", 0)), 3)]
+                    fill = max(0.0, min(1.0, (self.vuz * 1.1 - r) * m))
+                    b = 0.03 + 0.97 * fill
+                    if abs(r - self.vuz_peak) < 0.5 / m + 1e-6 and self.vuz_peak > 0.08:
+                        b = max(b, 0.85)
+                    res.append((self.palette_at(r * 0.75), b, True))
 
         elif mode == "stereo":
             l, r = bands.get("lr", (0.0, 0.0))
@@ -1932,15 +1959,17 @@ class VideoMapper:
         for c in channels:
             p = c.get("position", {})
             # Plan Lueur comme repères du pont : x et y de -1 à 1, y = +1 du côté de la TV.
-            # « sx » est la vraie position gauche-droite (« x » sert à l'ordre de parcours).
+            # « sx » est la vraie position gauche-droite (« x » sert à l'ordre de parcours),
+            # « z » la hauteur (-1 au sol, +1 au plafond).
             x = float(p["sx"]) if "sx" in p else float(p.get("x", 0))
             u, v = (x + 1) / 2, (1 - float(p.get("y", 0))) / 2   # u : 0 à gauche, 1 à droite ; v : 0 au mur de la TV
+            z = max(-1.0, min(1.0, float(p.get("z", 0))))
             du = (u - xc) * W
             if abs(du) <= hw:
                 spec = ("top", (du / hw + 1) / 2, 0.0)
             else:
                 spec = ("left" if du < 0 else "right", 0.0, min(1.0, (abs(du) - hw) / 0.6))
-            self.pos[c["channel_id"]] = (u, v, kinds.get(c["channel_id"]))
+            self.pos[c["channel_id"]] = (u, v, z, kinds.get(c["channel_id"]))
             bri = 1 - (1 - back) * _smooth(0.1, 0.9, v)
             if kinds.get(c["channel_id"]) == "spots":
                 bri *= spots
@@ -1986,14 +2015,15 @@ class VideoMapper:
         if not colors or not self.pos:
             return None
         xc, hu, W, D = self.geo
-        lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors and k != "spots"]
+        H = 2.5                       # hauteur de pièce supposée : la TV est à mi-hauteur (z = 0)
+        lamps = [(u, v, z, colors[c]) for c, (u, v, z, k) in self.pos.items() if c in colors and k != "spots"]
         if not lamps:
-            lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors]
+            lamps = [(u, v, z, colors[c]) for c, (u, v, z, k) in self.pos.items() if c in colors]
         if not lamps:
             return None
 
         def at(u):
-            near = sorted(((math.hypot((u - lu) * W, lv * D), col) for lu, lv, col in lamps), key=lambda x: x[0])[:2]
+            near = sorted(((math.hypot((u - lu) * W, lv * D, lz * H / 2), col) for lu, lv, lz, col in lamps), key=lambda x: x[0])[:2]
             ws = [1 / (d + 0.05) for d, _ in near]
             return [sum(w * col[i] for w, (_, col) in zip(ws, near)) / sum(ws) for i in range(3)]
 
@@ -2022,9 +2052,11 @@ class VideoMapper:
 # ---------------------------------------------------------------------------
 # Commande "run"
 # ---------------------------------------------------------------------------
-MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
+MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "colonne", "stereo", "etincelles", "respiration")
 SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
 ALONG = ("glisse", "comete", "vague", "vumetre", "etincelles", "respiration")   # effets qui suivent le ruban
+# (« colonne » n'en fait pas partie : chaque lampe joue selon sa propre hauteur,
+# la recopier sur le ruban casserait le sens vertical)
 
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
                      "layers": {}, "plans": {}, "test": {},
@@ -2277,32 +2309,6 @@ def cmd_run(args):
                     cmap = test_color_map(plan_channels(area, settings["plans"]), kinds)
                     session.send([(cid, *(v * 0.85 for v in hex_to_rgb(hx))) for cid, hx in cmap.items()])
                     continue
-                if test.get("mode") == "fx":
-                    # Test des réglages avancés : le moteur rejoue l'effet actuel avec un rythme
-                    # simulé (120 BPM), même sans musique. Tous les curseurs (force, durée,
-                    # fond, motif, couleurs, vitesse, couches, flash blanc) se voient en vrai.
-                    ph = (now % 0.5) / 0.5
-                    beat = ph < 0.05
-                    strength = 0.9
-                    sw = 0.5 + 0.5 * np.sin(2 * np.pi * now / 6.0)
-                    bands = {"bass": 0.9 if beat else 0.25 + 0.2 * sw,
-                             "mid": 0.5 + 0.3 * sw, "high": 0.6 if beat else 0.3,
-                             "on_bass": 1.0 if beat else 0.15, "on_mid": 0.7 if beat else 0.2,
-                             "on_high": 0.8 if beat else 0.25, "energy": 0.35 + 0.5 * sw,
-                             "lr": 0.0}
-                    colors = fx.update(0.3, bands, beat, strength)
-                    eq = plan_eq(area, settings["plans"])
-                    if eq:
-                        colors = [(c, r * f, g * f, b * f) for c, r, g, b in colors
-                                  for f in (eq.get(devs.get(c), 1.0),)]
-                    session.send(colors)
-                    status.write(state="syncing" if session.active else "waiting",
-                                 area=area_name, area_id=area["id"], level=0.3,
-                                 beats=beats, colors=fx.colors_hex() if session.active else [],
-                                 source="music",
-                                 tv=tv.info() if tv else None,
-                                 bt={"device": player.device, "playing": player.playing} if player else None)
-                    continue
                 order = [c["channel_id"] for c in sorted(plan_channels(area, settings["plans"]),
                                                          key=lambda c: c["position"]["x"])]
                 n = len(order)
@@ -2447,7 +2453,6 @@ Sert la page index.html et une petite API JSON :
   POST /api/plan/eq      {"id", "eq": {lampe: 0.1-1}}      équilibre de luminosité d'une zone de synchro
   POST /api/area/from_room {"id", "rubans"?, "spots"?}    crée la zone de divertissement d'une pièce d'après son plan
   POST /api/plan/colortest {"id", "rubans", "spots", "dims", "stop"?}  test « couleurs par segment » d'une pièce
-  POST /api/fx/test {"dur"?, "stop"?}  rejoue l'effet actuel sur les lampes (rythme simulé)
   GET  /api/plan?area=ID  canaux de la zone et plan enregistré ; POST /api/plan l'enregistre
   GET  /api/now        morceau AirPlay en cours (titre, artiste, album, progression, couleurs)
   GET  /api/cover      pochette du morceau en cours
@@ -2656,6 +2661,18 @@ def room_plan_info(rid):
     return {"id": rid, "type": "room", "name": room["name"], "channels": chs, "plan": plan}
 
 
+def default_height(lamp):
+    """Hauteur par défaut d'une lampe (-1 au sol, 0 au milieu, +1 au plafond) d'après son type."""
+    a = ((lamp or {}).get("archetype") or "").lower()
+    if any(k in a for k in ("ceiling", "recessed", "spot")):
+        return 1
+    if (lamp or {}).get("has_gradient"):
+        return 1
+    if any(k in a for k in ("play", "bloom", "go")):
+        return -1
+    return 0
+
+
 def save_plan(body):
     """Plan d'une pièce : réglages de l'éditeur + position calculée de chaque canal."""
     aid = str(body.get("id", ""))[:64]
@@ -2668,12 +2685,19 @@ def save_plan(body):
         if body.get("reset"):
             plans.pop(aid, None)
         else:
+            heights = {}
+            for k, v in (body.get("heights") or {}).items():
+                try:
+                    heights[str(k)[:64]] = max(-1, min(1, int(round(float(v)))))
+                except (TypeError, ValueError):
+                    pass
             plans[aid] = {
                 "dims": dict(zip("wd", dims_of(body.get("dims")))),
                 "spots": {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()},
                 "rubans": {str(d)[:64]: {"walls": int(num(r.get("walls", 1), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                          "dir": 1 if r.get("dir", 1) >= 0 else -1}
-                           for d, r in (body.get("rubans") or {}).items()}}
+                           for d, r in (body.get("rubans") or {}).items()},
+                "heights": heights}
         s["room_plans"] = plans
         write_json(SETTINGS_PATH, s)
         rooms_cache["t"] = 0
@@ -2683,16 +2707,21 @@ def save_plan(body):
             except Exception as e:              # pas de zone, pont injoignable… : le plan reste enregistré
                 print(f"Plan de synchro non recopié : {e}", flush=True)
         return {"ok": True}
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    old_ch = (plans.get(aid) or {}).get("ch") if isinstance(plans.get(aid), dict) else {}
+    old_ch = old_ch if isinstance(old_ch, dict) else {}
     ch = {}
     for k, q in (body.get("ch") or {}).items():
-        ch[str(int(k))] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1)}
+        ck = str(int(k))
+        zq = q.get("z", (old_ch.get(ck) or {}).get("z", 0) if isinstance(old_ch.get(ck), dict) else 0)
+        ch[ck] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1),
+                  "z": num(zq, -1, 1)}
     rubans = {}
     for dev, r in (body.get("rubans") or {}).items():
         rubans[str(dev)[:64]] = {"walls": int(num(r.get("walls", 4), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                  "dir": 1 if r.get("dir", 1) >= 0 else -1}
     spots = {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
-    s = get_settings()
-    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
     eq = (plans.get(aid) or {}).get("eq") if isinstance(plans.get(aid), dict) else None
     if body.get("reset"):
         plans.pop(aid, None)                # positions de l'app Hue, mais on garde l'équilibre
@@ -2714,25 +2743,6 @@ def plan_test(body):
     write_json(SETTINGS_PATH, s)
     active = service_state()["active"]
     return {"ok": True, "running": active, "area_selected": s.get("area") in ("", aid)}
-
-
-def fx_test(body):
-    """Réglages avancés : rejoue l'effet actuel sur les vraies lampes (rythme simulé)."""
-    s = get_settings()
-    if body.get("stop"):
-        if (s.get("test") or {}).get("mode") == "fx":
-            s["test"] = {}
-            write_json(SETTINGS_PATH, s)
-        return {"ok": True, "running": service_state()["active"]}
-    try:
-        dur = max(3, min(15, int(body.get("dur", 6))))
-    except (TypeError, ValueError):
-        dur = 6
-    aid = s.get("area", "")
-    s["test"] = {"area": aid, "until": time.time() + dur, "mode": "fx"}
-    write_json(SETTINGS_PATH, s)
-    active = service_state()["active"]
-    return {"ok": True, "running": active, "dur": dur, "area_selected": bool(aid)}
 
 
 identify_jobs = {}
@@ -2990,17 +3000,13 @@ def update_settings(body):
         if "fx" not in body:
             s["fx"] = {}                 # choisir un préréglage efface les réglages avancés
     if "fx" in body and isinstance(body["fx"], dict):
-        if not body["fx"]:
-            s["fx"] = {}                     # {} explicite = tout rétablir
-            merged = {}
-        else:
-            merged = dict(s.get("fx") or {})
-            for k, v in body["fx"].items():
-                if v is None:
-                    merged.pop(k, None)      # None = revenir à la valeur du préréglage
-                else:
-                    merged[k] = v
-            s["fx"] = hms.clean_fx(merged)
+        merged = dict(s.get("fx") or {})
+        for k, v in body["fx"].items():
+            if v is None:
+                merged.pop(k, None)      # None = revenir à la valeur du préréglage
+            else:
+                merged[k] = v
+        s["fx"] = hms.clean_fx(merged)
     if "mode" in body and body["mode"] in hms.MODES:
         s["mode"] = body["mode"]
     if "speed" in body:
@@ -3691,31 +3697,43 @@ STRIP_SPOT = hms.STRIP_SPOT
 
 def room_sync_plan(cfg, room, area, plan, lights, strips=None):
     """Plan de la zone de synchro d'une pièce, recopié de son plan Lueur (mêmes conventions que
-    l'éditeur) : ordre et place de chaque segment du ruban, place de chaque spot."""
+    l'éditeur) : ordre et place de chaque segment du ruban, place et hauteur de chaque spot."""
     if strips is None:
         strips = {l["id"]: dict({"walls": 1, "corner": 0, "dir": 1}, **((plan.get("rubans") or {}).get(l["id"]) or {}))
                   for l in room["lights"] if l.get("has_gradient")}
     rows = hms.channel_info(cfg, area)
     light_of_dev = {lights.get(l["id"], {}).get("owner", {}).get("rid"): l["id"] for l in room["lights"]}
+    by_lamp = {l["id"]: l for l in room["lights"]}
+    heights = plan.get("heights") if isinstance(plan.get("heights"), dict) else {}
+
+    def height_of(lid):
+        try:
+            return max(-1, min(1, int(round(float(heights[lid])))))
+        except (KeyError, TypeError, ValueError):
+            return default_height(by_lamp.get(lid))
+
     ch, rubans, spots, by_dev = {}, {}, {}, {}
     for r in rows:
         by_dev.setdefault(r["dev"], []).append(r)
     for dev, rs in by_dev.items():
         lid = light_of_dev.get(dev)
         rb = strips.get(lid)
+        zh = height_of(lid)
         if rb and len(rs) > 1:
             rubans[dev] = rb
             rs.sort(key=lambda r: r["idx"])
             for k, r in enumerate(rs):
                 u = (k + 0.5) / len(rs)
                 px, py = along(rb, u, plan.get("dims"))
-                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
+                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4),
+                                    "z": zh}
         else:
             for r in rs:
                 q = (plan.get("spots") or {}).get(lid) or [(r["x"] + 1) / 2, (1 - r["y"]) / 2]
                 q = [max(PM, min(1 - PM, float(q[0]))), max(PM, min(1 - PM, float(q[1])))]
                 spots[str(r["id"])] = q
-                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4)}
+                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4),
+                                    "z": zh}
     return rows, ch, rubans, spots, light_of_dev, by_dev
 
 
@@ -3754,7 +3772,7 @@ def color_test(body):
         write_json(SETTINGS_PATH, s)
         return {"ok": True, "stopped": True}
     save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
-               "dims": body.get("dims")})
+               "dims": body.get("dims"), "heights": body.get("heights")})
     got = refresh_room_zone(rid)
     if not got:
         raise ValueError("Crée d'abord la zone de synchro de cette pièce.")
@@ -3786,9 +3804,9 @@ def area_from_room(body):
     dans la zone de synchro (ordre des segments, spots), et la zone est choisie pour la musique."""
     cfg = _cfg()
     rid = str(body.get("id", ""))[:64]
-    if "rubans" in body or "spots" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
+    if "rubans" in body or "spots" in body or "heights" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
         save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
-                   "dims": body.get("dims")})
+                   "dims": body.get("dims"), "heights": body.get("heights")})
     room = next((r for r in rooms_state() if r["id"] == rid), None)
     if not room:
         raise ValueError("Pièce introuvable.")
@@ -4434,8 +4452,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, plan_eq(body))
             if path == "/api/plan/test":
                 return self._send(200, plan_test(body))
-            if path == "/api/fx/test":
-                return self._send(200, fx_test(body))
             if path == "/api/plan/identify":
                 try:
                     return self._send(200, identify_light(body))
@@ -4523,7 +4539,6 @@ button{cursor:pointer;border:0;background:none;padding:0}
 a{color:var(--blue);text-decoration:none}
 .hidden{display:none!important}
 .app{max-width:520px;margin:0 auto;min-height:100vh;position:relative;padding-bottom:calc(92px + var(--safe-b))}
-.syncamb{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.85;background:radial-gradient(100% 46% at 50% -6%,var(--amb1,transparent) 0%,transparent 70%),radial-gradient(75% 36% at 4% 44%,var(--amb2,transparent) 0%,transparent 72%),radial-gradient(75% 36% at 96% 64%,var(--amb2,transparent) 0%,transparent 72%)}
 .view{display:none}.view.on{display:block}
 :focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:8px}
 
@@ -4574,25 +4589,23 @@ a{color:var(--blue);text-decoration:none}
 .sl.pink .fi{background:#ff6482}
 
 /* ---- segments ---- */
-.seg{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);background:var(--card);border-radius:14px;padding:4px}
-.seg button{padding:10px 4px;border-radius:11px;color:#c7c7cc;font-size:14px}
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);background:var(--card);border-radius:12px;padding:3px}
+.seg button{padding:9px 4px;border-radius:10px;color:#c7c7cc;font-size:14px}
 .seg button.on{background:var(--sel);color:#fff;font-weight:600}
 
 /* ---- tuiles ---- */
 .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-.tile{position:relative;background:var(--card);border-radius:16px;border:2px solid transparent;padding:14px 12px 12px;display:flex;flex-direction:column;gap:8px;text-align:left;color:#fff;transition:transform .12s ease,filter .12s}
-.tile:active,.orb:active,.ctrl:active{transform:scale(.96)}
-.tile.on{border-color:transparent;background:var(--card2);box-shadow:0 0 0 1.5px rgba(255,255,255,.55),0 10px 26px rgba(0,0,0,.35)}
-.tile.on::after{content:"✓";position:absolute;top:8px;right:8px;width:22px;height:22px;border-radius:50%;background:#fff;color:#1b1c20;font-size:13px;font-weight:700;display:grid;place-items:center}
+.tile{background:var(--card);border-radius:16px;border:2px solid transparent;padding:14px 12px 12px;display:flex;flex-direction:column;gap:8px;text-align:left;color:#fff}
+.tile.on{border-color:#fff}
 .tile:disabled{opacity:.45;cursor:default}
 .tile .n{font-size:15px;font-weight:700}
 .tile .d{color:var(--t2);font-size:12px;line-height:1.35}
 .tile .soon{color:var(--orange)}
 
 /* tuile orbe (scènes / palettes) */
-.orb{background:#2a2b30;border-radius:18px;height:120px;border:2px solid transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#fff;padding:8px 4px;transition:transform .12s ease,filter .12s}
-.orb.on{border-color:transparent;background:var(--card2);box-shadow:0 0 0 1.5px rgba(255,255,255,.55),0 8px 22px rgba(0,0,0,.35)}
+.orb{background:#2a2b30;border-radius:18px;height:120px;border:2px solid transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#fff;padding:8px 4px}
+.orb.on{border-color:#fff}
 .orb .o{width:58px;height:58px;border-radius:50%}
 .orb .o.dash{border:2px dashed #636366;display:grid;place-items:center;color:#a9aab0;font-size:28px}
 .orb span{font-size:13px;font-weight:600;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -4603,11 +4616,6 @@ a{color:var(--blue);text-decoration:none}
 .lamp .top{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 6px 10px;color:inherit;text-align:center}
 .lamp .top span{font-size:15px;font-weight:600;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lamp .pw{display:flex;justify-content:center;padding:6px 0 14px}
-.lampsec{padding:0 16px 4px;margin-top:10px}
-.lcar{overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;display:flex;gap:10px;padding:2px 2px 10px}
-.lcar::-webkit-scrollbar{display:none}
-.lcar .lamp{scroll-snap-align:start;flex:none;width:calc((100% - 20px)/3)}
-.lcount{text-align:center;color:var(--t3);font-size:12px;margin-top:2px;font-variant-numeric:tabular-nums}
 .pwbtn{width:46px;height:46px;border-radius:50%;display:grid;place-items:center}
 .pwbtn svg{width:20px;height:20px}
 
@@ -4672,7 +4680,7 @@ body.locked{overflow:hidden}
 .dot{width:8px;height:8px;border-radius:50%;background:#636366}
 .dot.on{background:var(--green);box-shadow:0 0 10px var(--green)}
 .ctrls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:26px 16px 0}
-.ctrl{display:flex;flex-direction:column;align-items:center;gap:7px;color:#fff;transition:transform .12s ease}
+.ctrl{display:flex;flex-direction:column;align-items:center;gap:7px;color:#fff}
 .ctrl .ci{width:58px;height:58px;border-radius:50%;background:var(--card);display:grid;place-items:center}
 .ctrl .ci svg{width:26px;height:26px}
 .ctrl small{color:var(--t2);font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase}
@@ -4687,8 +4695,7 @@ body.locked{overflow:hidden}
 
 /* ---- aperçu des réglages avancés ---- */
 .stagebox{margin:14px 16px 0;border-radius:22px;background:radial-gradient(120% 90% at 50% 100%,var(--glow,#ff375f33) 0%,#0b0b0d 62%);box-shadow:inset 0 0 0 1px #1f1f22;padding:14px}
-.stagebox .h{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:0 2px 10px}
-.stagebox .h span:last-child{font-size:12px;max-width:64%;text-align:right}
+.stagebox .h{display:flex;justify-content:space-between;align-items:center;margin:0 2px 10px}
 .prev{display:flex;justify-content:space-between;align-items:center;height:64px;padding:0 6px}
 .prev i{width:30px;height:30px;border-radius:50%}
 .prev.live{gap:4px;justify-content:center}.prev.live i{width:auto;flex:1;max-width:30px;height:auto;aspect-ratio:1;transition:opacity .06s,transform .06s,box-shadow .06s}
@@ -4710,15 +4717,6 @@ body.locked{overflow:hidden}
 .srow .h{display:flex;justify-content:space-between;margin-bottom:2px}
 .srow .h span:last-child{color:var(--t2)}
 .hint{margin:2px 0 8px;color:var(--t3);font-size:13px;line-height:1.4}
-.lumprev{display:flex;flex-direction:column;align-items:center;gap:12px;padding:12px 0 6px}
-.lumorb{width:72px;height:72px;border-radius:50%}
-.lumbig{font-size:32px;font-weight:800;letter-spacing:-.5px;font-variant-numeric:tabular-nums}
-.minipop{position:fixed;left:16px;right:16px;bottom:calc(100px + var(--safe-b));z-index:60;max-width:488px;margin:0 auto;background:rgba(40,41,46,.94);-webkit-backdrop-filter:blur(22px);backdrop-filter:blur(22px);border-radius:26px;padding:20px 20px 22px;box-shadow:0 20px 55px rgba(0,0,0,.55);transform:translateY(14px) scale(.98);opacity:0;pointer-events:none;transition:transform .22s cubic-bezier(.2,.8,.2,1),opacity .18s}
-.minipop.open{transform:none;opacity:1;pointer-events:auto}
-.lumrow{display:flex;align-items:center;gap:16px;margin-bottom:16px}
-.mdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--blue);margin-left:7px;vertical-align:2px}
-.fxmsg{min-height:20px;margin:10px 4px 0;color:var(--t2);font-size:13px}
-.segreset{background:none;border:0;color:var(--blue);font-size:14px;font-weight:600;padding:8px 0}
 
 /* ---- cartes (écran TV, page Pièce) ---- */
 .tcard{background:var(--card);border-radius:18px;padding:14px 16px}
@@ -4747,16 +4745,12 @@ body.locked{overflow:hidden}
 
 /* ---- pièces ---- */
 .rooms{display:flex;flex-direction:column;gap:12px;padding:0 16px}
-.room{border-radius:22px;padding:16px;display:flex;flex-direction:column;gap:14px;position:relative;isolation:isolate}
-.room::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--pbg);opacity:var(--popf,0);transition:opacity .7s ease;pointer-events:none}
-.room>*{position:relative;z-index:1}
+.room{border-radius:22px;padding:16px;display:flex;flex-direction:column;gap:14px;transition:background .3s}
 .room .r1{display:flex;align-items:center;gap:14px}
 .room .ri{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;flex:none}
 .room .ri svg{width:26px;height:26px}
 .room .rn{flex:1;font-size:19px;font-weight:700;text-align:left;color:inherit}
-.rhead{border-radius:0 0 28px 28px;padding:calc(14px + var(--safe-t)) 16px 20px;position:relative;isolation:isolate}
-.rhead::before{content:"";position:absolute;inset:0;border-radius:inherit;background:var(--pbg);opacity:var(--popf,0);transition:opacity .7s ease;pointer-events:none}
-.rhead>*{position:relative;z-index:1}
+.rhead{border-radius:0 0 28px 28px;padding:calc(14px + var(--safe-t)) 16px 20px;transition:background .3s}
 .plan{margin:18px 16px 0;border-radius:20px;background:#0b0b0d;box-shadow:inset 0 0 0 1px #1f1f22;overflow:hidden}
 .plan svg{display:block;width:100%;height:auto}
 .spr{display:flex;align-items:center;justify-content:space-between;margin:12px 20px 0}
@@ -4830,18 +4824,6 @@ button:active{transform:scale(.96);opacity:.82}
   .coverwrap{width:min(62vw,240px,27vh)}.syhead{padding-top:calc(10px + var(--safe-t))}.leds{margin-top:8px}
   .stage{margin-top:10px}.stitle{margin-top:12px;font-size:20px}.pbar{margin-top:10px}.pchip{margin-top:8px}
   .ctrls{margin-top:16px}.ctrl .ci{width:52px;height:52px}.dock{margin-top:16px}.power{width:78px!important;height:78px!important}
-}
-@media (max-width:959px){
-  /* Synchro : l'ecran fait toujours la hauteur dispo, vide reparti pareil entre les 4 blocs */
-  .view[data-view=sync].on{display:flex;flex-direction:column;justify-content:space-between;row-gap:12px;min-height:calc(100vh - 92px - var(--safe-b));min-height:calc(100dvh - 92px - var(--safe-b))}
-  .view[data-view=sync].on .stage{margin-top:0}
-  .view[data-view=sync].on .ctrls{margin:0 16px}
-  .view[data-view=sync].on .dock{margin:0 22px}
-}
-@media (max-width:959px) and (min-height:800px){
-  /* Grand ecran : la pochette grandit au lieu de laisser du vide */
-  .view[data-view=sync].on .coverwrap{width:min(64vw,260px,31vh);width:min(64vw,260px,31dvh)}
-  .view[data-view=sync].on .stitle{font-size:24px}
 }
 
 /* =================== ORDINATEUR (écran large) =================== */
@@ -4918,7 +4900,7 @@ button:active{transform:scale(.96);opacity:.82}
   .pgrid .plan{margin:0}
   .pgrid .spr{margin:14px 2px 0}
   .pgrid .pr .label.in:first-child{padding-top:0}
-  .pcards{padding:0}.pgrid .pcard:first-child{margin-top:0}.lampsec{padding:0}
+  .pcards{padding:0}.pgrid .pcard:first-child{margin-top:0}
   .tplace{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:28px;align-items:center}.pgrid .pl .pcard:first-child{margin-top:14px}
   .grid3{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
   .grid2{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
@@ -4987,7 +4969,6 @@ button:active{transform:scale(.96);opacity:.82}
 
 <!-- ============ APPLICATION ============ -->
 <div id="app" class="app hidden">
-<div class="syncamb" id="syncAmb" hidden></div>
 
   <!-- SYNCHRO -->
   <section class="view" data-view="sync">
@@ -5010,7 +4991,7 @@ button:active{transform:scale(.96);opacity:.82}
       <button class="ctrl" data-sheet="shEffet"><span class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 11v2"/></svg></span><small>Effet</small><em id="cEffet">—</em></button>
       <button class="ctrl" data-sheet="shInt"><span class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></span><small>Intensité</small><em id="cInt">—</em></button>
       <button class="ctrl" data-sheet="shCouleur"><span class="ci" id="cPalOrb"></span><small>Couleur</small><em id="cPal">—</em></button>
-      <button class="ctrl" id="lumCtrl"><span class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span><small>Luminosité</small><em id="cLum">—</em></button>
+      <button class="ctrl" data-sheet="shLum"><span class="ci"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></span><small>Luminosité</small><em id="cLum">—</em></button>
     </div>
     <div class="dock">
       <button class="side" id="advOpen"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>AVANCÉS</button>
@@ -5051,8 +5032,6 @@ button:active{transform:scale(.96);opacity:.82}
       <div class="grid2" id="advEffects"></div>
       <div class="label in">Vitesse</div><div class="seg" id="advSpeed"></div><p class="hint" id="speedHint" style="margin:8px 4px 0"></p>
       <div id="advFolds"></div>
-      <button class="cta" id="fxTest" style="margin-top:16px">Tester sur mes lampes · 6 s</button>
-      <p class="fxmsg" id="fxMsg">Rejoue l'effet actuel sur tes vraies lampes, avec un rythme simulé — même sans musique.</p>
     </div>
   </section>
 
@@ -5119,10 +5098,10 @@ button:active{transform:scale(.96);opacity:.82}
   <button class="row" id="effAdv" style="margin-top:14px;background:var(--card2);border-radius:16px;min-height:62px"><span class="ic" style="width:60px" data-i="sliders"></span><span class="bd" style="border:0"><span class="tx"><span class="t1" style="font-size:16px">Réglages avancés</span><span class="t2" style="font-size:13px">Rythme, flashs, couleurs, motif</span></span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></span></button></div>
 <div class="sheet" id="shInt"><div class="grab"></div><div class="sh"><b>Intensité</b><button class="txtbtn" data-close>OK</button></div><div id="intList" class="list" style="border-radius:18px;background:var(--card2)"></div><p class="note" style="padding:12px 4px 0" id="intNote"></p></div>
 <div class="sheet" id="shCouleur"><div class="grab"></div><div class="sh"><b>Couleur</b><button class="txtbtn" data-close>OK</button></div><div class="grid3" id="palList"></div><p class="note" style="padding:12px 4px 0">« Créer » : depuis une photo ou en choisissant les couleurs. La palette peut aussi servir de scène dans tes pièces.</p></div>
-<div class="minipop" id="lumPop" hidden>
-  <div class="lumrow"><span class="lumorb" id="lumOrb"></span><span class="lumbig" id="lumBig">100 %</span></div>
-  <div class="sl" id="lumSl"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>
-</div>
+<div class="sheet" id="shLum"><div class="grab"></div><div class="sh"><b>Luminosité</b><button class="txtbtn" data-close>OK</button></div>
+  <div style="display:flex;justify-content:space-between;margin:0 4px"><span>Luminosité maximale</span><span id="lumPct" style="color:var(--t2)">100 %</span></div>
+  <div class="sl" id="lumSl" style="margin:12px 4px 4px"><div class="tr"></div><div class="fi"></div><div class="kn"></div></div>
+  <p class="note" style="padding:8px 4px 0">Plafond de luminosité pendant la synchro. Les flashs ne dépassent jamais cette valeur.</p></div>
 <div class="sheet" id="shZone"><div class="grab"></div><div class="sh"><b>Synchroniser</b><button class="txtbtn" data-close>OK</button></div><div class="list" id="zoneList" style="border-radius:18px;background:var(--card2)"></div>
   <button class="cta ghost" id="zoneFromRoom" style="margin-top:14px">Créer la zone d'une pièce…</button>
   <button class="cta ghost" id="zoneLamps" style="margin-top:10px">Choisir mes lampes…</button>
@@ -5218,10 +5197,7 @@ function mix(pal, t, cyc) {
   return rgbHex([0, 1, 2].map(j => a[j] + (b[j] - a[j]) * k));
 }
 function boost(h, floor = 170) { const c = hexRgb(h), m = Math.max(...c, 1), k = Math.max(1, floor / m); return rgbHex(c.map(v => v * k)); }
-const orbWheel = c => {
-  const p = c.map(x => boost(x, 150)), at = i => p[i % p.length];
-  return `radial-gradient(circle at 28% 26%, ${at(0)} 0%, transparent 62%), radial-gradient(circle at 74% 30%, ${at(1)} 0%, transparent 62%), radial-gradient(circle at 30% 74%, ${at(2)} 0%, transparent 62%), radial-gradient(circle at 72% 72%, ${at(3)} 0%, transparent 62%), linear-gradient(135deg, ${p[0]}, ${p[p.length - 1]}), radial-gradient(circle at 35% 30%, rgba(255,255,255,.6) 0%, transparent 45%)`;
-};
+const orbBg = c => { const p = c.concat(c, c).slice(0, 4).map(x => boost(x, 140)); return `radial-gradient(circle at 35% 30%, ${lighten(p[0], .45)} 0%, ${p[1]} 32%, ${p[2]} 68%, ${p[3]} 100%)`; };
 
 /* =================== ÉTAT & API =================== */
 let S = null, live = { state: "offline", colors: [] }, zones = null, ROOMS = null, BT = null;
@@ -5236,6 +5212,7 @@ const EFFECTS = [
   ["comete", "Comète", "Une traînée tourne sur le ruban, poussée par le rythme", true],
   ["vague", "Vague", "La palette défile, sans flash", true],
   ["vumetre", "Vu-mètre", "Se remplit avec le volume", true],
+  ["colonne", "Colonne", "Se remplit de bas en haut avec le volume", true],
   ["stereo", "Stéréo", "Gauche et droite séparées", true],
   ["etincelles", "Étincelles", "Éclats au hasard sur les aigus", true],
   ["respiration", "Respiration", "Monte et descend doucement", true]
@@ -5243,7 +5220,7 @@ const EFFECTS = [
 
 const SPEEDS = [[0.5, "Demi-temps"], [1, "Normale"], [2, "Double"]];
 const SPEED_D = { pulse: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.", spectrum: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.",
-  comete: "Vitesse à laquelle la comète fait le tour du ruban.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
+  comete: "Vitesse à laquelle la comète fait le tour du ruban.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.", colonne: "Vitesse à laquelle le niveau redescend.",
   stereo: "Durée des éclats sur les temps.", etincelles: "Durée des éclats.", respiration: "Demi-temps : 16 s par souffle. Double : 4 s." };
 const KIND_N = { ruban: "Ruban", spots: "Spots", play: "Play", lampes: "Lampes" };
 let effTarget = "all";
@@ -5295,16 +5272,7 @@ function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("s
 function save(patch, now) {
   Object.assign(pending, patch); Object.assign(S.settings, patch); lockUntil = Date.now() + 2500;
   clearTimeout(sendTimer);
-  sendTimer = setTimeout(async () => { const b = pending; pending = {}; try { await api("/api/settings", b); fxApplied(b); } catch (e) { toast("Échec : " + e.message); } }, now ? 0 : 280);
-}
-let fxAppliedT = null;
-function fxApplied(b) {
-  if (!b || !Object.keys(b).some(k => ["fx", "mode", "speed", "layers", "intensity"].includes(k))) return;
-  clearTimeout(fxAppliedT);
-  fxAppliedT = setTimeout(() => {
-    const syncing = typeof live !== "undefined" && live.state === "syncing";
-    toast(syncing ? "Appliqué aux lampes" : "Enregistré · visible à la prochaine synchro");
-  }, 350);
+  sendTimer = setTimeout(async () => { const b = pending; pending = {}; try { await api("/api/settings", b); } catch (e) { toast("Échec : " + e.message); } }, now ? 0 : 280);
 }
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -5339,7 +5307,6 @@ function go(v, arg = "", push = true) {
   $$(".view").forEach(x => x.classList.toggle("on", x.dataset.view === v));
   $$(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.tab === TAB_OF[v]));
   if (["sync", "lumieres", "reglages"].includes(v)) store("tab", v);
-  const sa = $("#syncAmb"); if (sa) sa.hidden = v !== "sync";
   window.scrollTo(0, 0);
   render();
 }
@@ -5412,7 +5379,7 @@ async function renderPlan() {
     $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
-    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) } };
+    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) }, heights: { ...(pl.heights || {}) } };
     COLORTEST = null;
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
@@ -5430,7 +5397,7 @@ async function renderPlan() {
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
     <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}
-    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? areaCard() : eqCard());
+    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? heightsCard() + areaCard() : eqCard());
   $$("[data-ord]").forEach(b => b.onclick = async () => {
     try { await api("/api/light/order", { light: b.dataset.ol, order: b.dataset.ord }); PLAN.channels.forEach(c => { if (c.light === b.dataset.ol) c.order = b.dataset.ord; }); renderPlan(); toast("Sens changé : refais « Montrer le début »"); }
     catch (e) { toast(e.message); }
@@ -5438,13 +5405,14 @@ async function renderPlan() {
   if ($("#planArea")) $("#planArea").onclick = async () => {
     const b = $("#planArea"); b.disabled = true; b.textContent = "Création sur le pont…";
     try {
-      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
+      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights });
       toast(`« ${r.name} » ${r.created ? "créée" : "mise à jour"} : ${r.channels} canaux${r.segments ? `, ruban en ${r.segments} segments` : ""}`);
       zones = null; roomsLock = 0; loadRooms(); await refresh(true); PLAN = null; renderPlan();
     } catch (e) { toast("Échec : " + e.message); b.disabled = false; b.textContent = "Réessayer"; }
   };
   $$("[data-eq]").forEach(el => slider(el, t => { const v = Math.round((0.1 + t * 0.9) * 100) / 100; setSl(el, t); PED.eq[el.dataset.eq] = v; el.parentElement.querySelector("[data-eqv]").textContent = Math.round(v * 100) + " %"; clearTimeout(eqTimer); eqTimer = setTimeout(sendEq, 250); }, sendEq));
   $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); colorTestSoon(); });
+  $$("[data-hz]").forEach(b => b.onclick = () => { PED.heights[b.dataset.hl] = +b.dataset.hz; renderPlan(); colorTestSoon(); });
   $$("[data-dim]").forEach(el => el.onchange = () => { const v = parseFloat(String(el.value).replace(",", ".")); PED.dims[el.dataset.dim] = v > 0 ? Math.min(40, v) : 0; renderPlan(); colorTestSoon(); });
   $$("[data-ctest]").forEach(b => b.onclick = () => colorTest(!!COLORTEST));
   $$("[data-ident]").forEach(b => b.onclick = async () => {
@@ -5460,6 +5428,28 @@ async function renderPlan() {
       toast("Un point blanc parcourt les segments pendant 15 s");
     } catch (e) { toast(e.message); }
   });
+}
+function defaultHeight(c) {   // hauteur auto d'une lampe : -1 bas, 0 milieu, +1 haut
+  const a = (c.archetype || "").toLowerCase();
+  if (/ceiling|recessed|spot/.test(a)) return 1;
+  if (c.grad_points) return 1;
+  if (/play|bloom|\bgo\b/.test(a)) return -1;
+  return 0;
+}
+function lampById(id) {
+  const { rub, single } = planDevs();
+  for (const [, cs] of rub.concat(single)) { const f = cs.find(c => c.dev === id || c.id === id); if (f) return f; }
+  return {};
+}
+const heightOf = id => PED.heights[id] ?? defaultHeight(lampById(id));
+const HZ_N = ["Bas", "Milieu", "Haut"];
+function heightsCard() {   // hauteur de chaque lampe de la pièce (éditeur de plan)
+  const { rub, single } = planDevs();
+  const row = (id, name) => { const v = heightOf(id), auto = PED.heights[id] == null;
+    return `<div class="srow"><div class="h"><span>${esc(name)}${auto ? ' <small style="color:var(--t3)">auto</small>' : ""}</span><span>${HZ_N[v + 1]}</span></div><div class="seg">${[[-1, "Bas"], [0, "Milieu"], [1, "Haut"]].map(([h, n]) => `<button data-hz="${h}" data-hl="${esc(id)}" class="${v === h ? "on" : ""}">${n}</button>`).join("")}</div></div>`; };
+  return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon("sliders", 22)}</span><span><b>Hauteur des lampes</b><br><small>Sol, milieu ou plafond</small></span></div>`
+    + rub.map(([d, cs]) => row(d, cs[0].name)).join("") + single.map(([, cs]) => row(cs[0].id, cs[0].name)).join("")
+    + `<p class="hint" style="margin:8px 2px 0">Plafond et spots en haut, lampes de table en bas. Utilisé par l'effet Colonne, la couleur des spots près du ruban et la synchro vidéo.</p></div>`;
 }
 function areaCard() {    // zone de divertissement de la pièce, créée d'après ce plan
   const name = ("Lueur · " + PLAN.name).slice(0, 32), z = zones && !zones.error ? zones.find(x => x.name === name) : null;
@@ -5478,7 +5468,7 @@ async function colorTest(stop) {   // test « couleurs par segment » (plan d'un
   clearTimeout(ctTimer);
   if (stop) { COLORTEST = null; clearTimeout(ctEnd); try { await api("/api/plan/colortest", { id: PLAN.id, stop: true }); } catch (e) {} if (route.v === "plan") renderPlan(); return; }
   try {
-    const r = await api("/api/plan/colortest", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
+    const r = await api("/api/plan/colortest", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights });
     const first = !COLORTEST; COLORTEST = { segments: r.segments || [], spots: r.spots || {} };
     if (first) toast(r.started ? "Synchro démarrée : chaque segment s'allume de sa couleur" : "Chaque segment s'allume de sa couleur (2 min)");
     clearTimeout(ctEnd); ctEnd = setTimeout(() => { COLORTEST = null; if (route.v === "plan") renderPlan(); }, (r.seconds || 120) * 1000);
@@ -5560,8 +5550,8 @@ function drawPlan() {
     const a = alongP(r, .02, PED.dims), b = alongP(r, .12, PED.dims), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = alongP(r, 0, PED.dims);
     h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
   });
-  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && (fieldAt ? fieldAt(X(q), Y(q)) : CT.spots[c.light || c.id]), col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
-    h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && (fieldAt ? fieldAt(X(q), Y(q)) : CT.spots[c.light || c.id]), col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190), hz = heightOf(c.light || c.id);
+    h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 12))}${hz > 0 ? " ↑" : hz < 0 ? " ↓" : ""}</text></g>`; }));
   const svg = $("#planSvg"); svg.setAttribute("viewBox", `0 0 ${W} ${H.toFixed(1)}`); svg.innerHTML = h;
   svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
   svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
@@ -5577,7 +5567,7 @@ $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
   try {
-    if (PLAN.type === "room") { if (COLORTEST) colorTest(true); await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); roomsLock = 0; loadRooms(); }
+    if (PLAN.type === "room") { if (COLORTEST) colorTest(true); await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights }); roomsLock = 0; loadRooms(); }
     else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } }; }
     toast("Plan enregistré"); PLAN = null; back();
   }
@@ -5590,24 +5580,7 @@ $("#planReset").onclick = async () => {
 
 /* =================== FEUILLES =================== */
 function openSheet(id) { closeSheets(); $("#sheetBg").classList.add("open"); const el = $("#" + id); el.classList.add("open"); el.scrollTop = 0; document.body.classList.add("locked"); renderSheets(); }
-function closeSheets() { $("#sheetBg").classList.remove("open"); $$(".sheet").forEach(s => { s.classList.remove("open"); s.style.transform = ""; }); closeLumPop(); document.body.classList.remove("locked"); }
-function openLumPop() {
-  closeSheets();
-  $("#sheetBg").classList.add("open");
-  const p = $("#lumPop");
-  p.hidden = false;
-  requestAnimationFrame(() => p.classList.add("open"));
-  document.body.classList.add("locked");
-  drawLum(S.settings.brightness);
-}
-function closeLumPop() {
-  const p = $("#lumPop");
-  if (!p || p.hidden) return;
-  p.classList.remove("open");
-  setTimeout(() => { p.hidden = true; }, 200);
-  if (!document.querySelector(".sheet.open")) { $("#sheetBg").classList.remove("open"); document.body.classList.remove("locked"); }
-}
-$("#lumCtrl").onclick = openLumPop;
+function closeSheets() { $("#sheetBg").classList.remove("open"); $$(".sheet").forEach(s => { s.classList.remove("open"); s.style.transform = ""; }); document.body.classList.remove("locked"); }
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeSheets(); });
 $$(".sheet").forEach(sh => {   // tirer la feuille vers le bas (depuis son en-tête) pour la fermer
   let y0 = null, dy = 0;
@@ -5629,14 +5602,14 @@ function renderSheets() {
   $("#palList").innerHTML = allPalettes().filter(p => p.synchro).map(p => orbTile(p.name, p.colors, p.id === st.palette, `data-pal="${p.id}"`, p.auto ? "AUTO" : "")).join("") + orbTile("Créer", null, false, 'data-newpal="sync"');
   $$("[data-pal]").forEach(b => b.onclick = () => { save({ palette: b.dataset.pal }, true); renderSheets(); renderSync(); });
   $$("[data-newpal]").forEach(b => b.onclick = () => { closeSheets(); openCreer(b.dataset.newpal); });
-  setSl($("#lumSl"), (st.brightness - 0.05) / 0.95); drawLum(st.brightness);
+  setSl($("#lumSl"), (st.brightness - 0.05) / 0.95); $("#lumPct").textContent = Math.round(st.brightness * 100) + " %";
   renderZoneMenu();
 }
-slider($("#lumSl"), t => { const v = Math.round((0.05 + t * 0.95) * 100) / 100; setSl($("#lumSl"), t); drawLum(v); save({ brightness: v }); renderSync(); });
+slider($("#lumSl"), t => { const v = Math.round((0.05 + t * 0.95) * 100) / 100; setSl($("#lumSl"), t); $("#lumPct").textContent = Math.round(v * 100) + " %"; save({ brightness: v }); renderSync(); });
 $("#effAdv").onclick = () => { closeSheets(); go("avances"); };
 
 function orbTile(name, colors, on, attrs, badge) {
-  const o = colors ? `<span class="o" style="background:${orbWheel(colors)};box-shadow:0 6px 18px ${boost(colors[Math.min(2, colors.length - 1)])}66"></span>` : `<span class="o dash">+</span>`;
+  const o = colors ? `<span class="o" style="background:${orbBg(colors)};box-shadow:0 6px 18px ${boost(colors[Math.min(2, colors.length - 1)])}66"></span>` : `<span class="o dash">+</span>`;
   return `<button class="orb ${on ? "on" : ""}" ${attrs}>${badge ? `<b class="auto">${badge}</b>` : ""}${o}<span>${esc(name)}</span></button>`;
 }
 
@@ -5648,6 +5621,7 @@ function effAnim(fx, i, n, sp) {
   if (fx === "glisse") return `br ${f(1.6)}s ease-in-out ${f(-i * .16)}s infinite`;
   if (fx === "vague") return `br ${f(2.4)}s ease-in-out ${f(-i * .22)}s infinite`;
   if (fx === "vumetre") return `fl ${f(1.6)}s ${f(i * .06)}s infinite`;
+  if (fx === "colonne") return `fl ${f(1.6)}s ${f((n - 1 - i) * .09)}s infinite`;
   if (fx === "stereo") return `fl ${f(.9)}s ${i < n / 2 ? 0 : f(.45)}s infinite`;
   if (fx === "etincelles") return `fl ${f(1.3)}s ${f(rnd[i % 12] * 1.3)}s infinite`;
   if (fx === "respiration") return `br ${f(3.2)}s ease-in-out ${f(-i * .12)}s infinite`;
@@ -5679,15 +5653,8 @@ function renderSync() {
   $("#cEffet").textContent = lk.length ? [...new Set([st.mode, ...lk.map(k => st.layers[k].mode)])].map(effName).join(" + ") : effName(st.mode) + spTag(st.speed);
   $("#cInt").textContent = INT[st.intensity] + (Object.keys(st.fx || {}).length ? " *" : "");
   $("#cPal").textContent = palName(st.palette);
-  $("#cPalOrb").style.background = orbWheel(palColors(st.palette));
-  if (st.palette !== renderSync._amb) {
-    renderSync._amb = st.palette;
-    const pc = palColors(st.palette), amb = c => boost(c, 120) + "4d";
-    document.documentElement.style.setProperty("--amb1", amb(pc[0]));
-    document.documentElement.style.setProperty("--amb2", amb(pc[1] || pc[0]));
-  }
+  $("#cPalOrb").style.background = orbBg(palColors(st.palette));
   $("#cLum").textContent = Math.round(st.brightness * 100) + " %";
-  if (!$("#lumPop").hidden) drawLum(st.brightness);
   $("#powerBtn").classList.toggle("on", active);
   $("#powerBtn").setAttribute("aria-label", active ? "Arrêter la synchro" : "Démarrer la synchro");
   $("#sDot").classList.toggle("on", syncing);
@@ -5797,28 +5764,8 @@ const ADV = {
 };
 const fxv = k => { const fx = S.settings.fx || {}; return k in fx ? fx[k] : S.presets[S.settings.intensity][k]; };
 function saveFx(k, v) { S.settings.fx = Object.assign({}, S.settings.fx, { [k]: v }); pending.fx = Object.assign({}, pending.fx, { [k]: v }); save({}); }
-function drawLum(v) {
-  const big = $("#lumBig"); if (big) big.textContent = Math.round(v * 100) + " %";
-  const o = $("#lumOrb"); if (!o || !S) return;
-  const c = boost(palColors(S.settings.palette)[0], 200);
-  o.style.background = `radial-gradient(circle at 35% 30%,#fff 0%,${c} ${Math.round(15 + v * 45)}%,${c} 100%)`;
-  o.style.opacity = .3 + .7 * v;
-  o.style.boxShadow = `0 0 ${Math.round(6 + v * 38)}px ${c}`;
-}
-const FX_SECTIONS = { rythme: ["source", "beat_k", "min_beat"], flash: ["beat", "tau", "base", "energy"], couleurs: ["every", "fade"], motif: ["pattern"], drops: ["strobe"] };
-const fxMod = k => (S.settings.fx || {}).hasOwnProperty(k);
-const secMod = ks => ks.filter(fxMod).length;
-function resetFx(keys) {
-  const fx = Object.assign({}, S.settings.fx), nulls = {};
-  keys.forEach(k => { delete fx[k]; nulls[k] = null; });
-  S.settings.fx = fx;
-  pending.fx = Object.assign({}, pending.fx, nulls);
-  save({});
-  renderAdv();
-  toast(keys.length > 1 ? "Section rétablie" : "Réglage rétabli");
-}
 let open = JSON.parse(load("advOpen") || "{}");
-function srow(k) { const a = ADV[k], v = fxv(k), t = (v - a.min) / (a.max - a.min); return `<div class="srow"><div class="h"><span>${a.n}${fxMod(k) ? '<i class="mdot"></i>' : ''}</span><span data-vf="${k}">${a.f(v)}</span></div><div class="sl" data-sl="${k}"><div class="tr"></div><div class="fi" style="width:${(a.inv ? 1 - t : t) * 100}%"></div><div class="kn" style="left:${(a.inv ? 1 - t : t) * 100}%"></div></div></div>`; }
+function srow(k) { const a = ADV[k], v = fxv(k), t = (v - a.min) / (a.max - a.min); return `<div class="srow"><div class="h"><span>${a.n}</span><span data-vf="${k}">${a.f(v)}</span></div><div class="sl" data-sl="${k}"><div class="tr"></div><div class="fi" style="width:${(a.inv ? 1 - t : t) * 100}%"></div><div class="kn" style="left:${(a.inv ? 1 - t : t) * 100}%"></div></div></div>`; }
 function renderAdv() {
   const st = S.settings, n = Object.keys(st.fx || {}).length, pal = palColors(st.palette);
   $("#advStatus").textContent = `Basé sur « ${INT[st.intensity]} »` + (n ? ` · ${n} modifié${n > 1 ? "s" : ""}` : "");
@@ -5827,22 +5774,21 @@ function renderAdv() {
   $("#speedHint").textContent = SPEED_D[effCur().mode] || "";
   const src = { full: "Tout", kick: "Grosse caisse", snare: "Caisse claire" }, pat = { all: "Ensemble", alt: "Alternance", chase: "Chenillard", wave: "Vague" };
   const folds = [
-    ["rythme", "Rythme", `${src[fxv("source")]} · sensibilité ${ADV.beat_k.f(fxv("beat_k"))} · écart ${ADV.min_beat.f(fxv("min_beat"))}${secMod(FX_SECTIONS.rythme) ? " · modifié" : ""}`,
-      `<div class="seg" style="margin:8px 0 6px">${Object.entries(src).map(([k, v]) => `<button data-src="${k}" class="${fxv("source") === k ? "on" : ""}">${v}${fxMod("source") && fxv("source") === k ? " •" : ""}</button>`).join("")}</div>${srow("beat_k")}${srow("min_beat")}<p class="hint">Plus l'écart est grand, moins il y a de flashs : pratique pour calmer un morceau rapide. La sensibilité et l'écart jouent sur le vrai rythme détecté — vérifie avec « Tester sur mes lampes ».</p>${secMod(FX_SECTIONS.rythme) ? `<button class="segreset" data-segreset="rythme">Rétablir cette section</button>` : ""}`],
-    ["flash", "Flash", `Force ${ADV.beat.f(fxv("beat"))} · ${ADV.tau.f(fxv("tau"))} · fond ${ADV.base.f(fxv("base"))} · suivi ${ADV.energy.f(fxv("energy"))}${secMod(FX_SECTIONS.flash) ? " · modifié" : ""}`,
-      `<svg viewBox="0 0 300 100" preserveAspectRatio="none" style="display:block;width:100%;height:96px;margin:10px 0 2px;border-radius:12px;background:#0b0b0d" id="env"></svg>${srow("beat")}${srow("tau")}${srow("base")}${srow("energy")}${secMod(FX_SECTIONS.flash) ? `<button class="segreset" data-segreset="flash">Rétablir cette section</button>` : ""}`],
-    ["couleurs", "Couleurs", `${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"} · fondu ${ADV.fade.f(fxv("fade"))}${secMod(FX_SECTIONS.couleurs) ? " · modifié" : ""}`,
-      `<div id="cstrip" style="height:40px;border-radius:12px;margin:12px 0 10px"></div><div class="srow"><div class="h"><span>Changement de couleur${fxMod("every") ? '<i class="mdot"></i>' : ''}</span><span>${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"}</span></div><div class="seg" style="margin-top:6px">${[1, 2, 4, 8].map(v => `<button data-every="${v}" class="${fxv("every") === v ? "on" : ""}">${v} temps</button>`).join("")}</div></div>${srow("fade")}${secMod(FX_SECTIONS.couleurs) ? `<button class="segreset" data-segreset="couleurs">Rétablir cette section</button>` : ""}`],
+    ["rythme", "Rythme", `${src[fxv("source")]} · sensibilité ${ADV.beat_k.f(fxv("beat_k"))} · écart ${ADV.min_beat.f(fxv("min_beat"))}`,
+      `<div class="seg" style="margin:8px 0 6px">${Object.entries(src).map(([k, v]) => `<button data-src="${k}" class="${fxv("source") === k ? "on" : ""}">${v}</button>`).join("")}</div>${srow("beat_k")}${srow("min_beat")}<p class="hint">Plus l'écart est grand, moins il y a de flashs : pratique pour calmer un morceau rapide.</p>`],
+    ["flash", "Flash", `Force ${ADV.beat.f(fxv("beat"))} · ${ADV.tau.f(fxv("tau"))} · fond ${ADV.base.f(fxv("base"))}`,
+      `<svg viewBox="0 0 300 100" preserveAspectRatio="none" style="display:block;width:100%;height:96px;margin:10px 0 2px;border-radius:12px;background:#0b0b0d" id="env"></svg>${srow("beat")}${srow("tau")}${srow("base")}${srow("energy")}`],
+    ["couleurs", "Couleurs", `${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"} · fondu ${ADV.fade.f(fxv("fade"))}`,
+      `<div id="cstrip" style="height:40px;border-radius:12px;margin:12px 0 10px"></div><div class="srow"><div class="h"><span>Changement de couleur</span><span>${fxv("every") === 1 ? "À chaque temps" : "Tous les " + fxv("every") + " temps"}</span></div><div class="seg" style="margin-top:6px">${[1, 2, 4, 8].map(v => `<button data-every="${v}" class="${fxv("every") === v ? "on" : ""}">${v} temps</button>`).join("")}</div></div>${srow("fade")}`],
   ];
-  if (st.mode === "pulse") folds.push(["motif", "Motif des lampes", pat[fxv("pattern")] + (fxMod("pattern") ? " · modifié" : ""),
-    `<div class="grid2" style="margin:10px 0 4px">${Object.entries(pat).map(([k, v]) => `<button class="tile ${fxv("pattern") === k ? "on" : ""}" data-pat="${k}" style="align-items:center;background:var(--card2)">${patDots(k, pal)}<span class="n" style="font-size:13px">${v}</span></button>`).join("")}</div>${fxMod("pattern") ? `<button class="segreset" data-segreset="motif">Rétablir cette section</button>` : ""}`]);
+  if (st.mode === "pulse") folds.push(["motif", "Motif des lampes", pat[fxv("pattern")],
+    `<div class="grid2" style="margin:10px 0 4px">${Object.entries(pat).map(([k, v]) => `<button class="tile ${fxv("pattern") === k ? "on" : ""}" data-pat="${k}" style="align-items:center;background:var(--card2)">${patDots(k, pal)}<span class="n" style="font-size:13px">${v}</span></button>`).join("")}</div>`]);
   $("#advFolds").innerHTML = folds.map(([k, t, s, body]) => `<button class="fold ${open[k] ? "open" : ""}" data-fold="${k}"><span class="tx"><b>${t}</b><small>${s}</small></span><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#8d8e94" stroke-width="2.6" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></button>${open[k] ? `<div class="foldin">${body}</div>` : ""}`).join("") +
-    `<div class="list" style="border-radius:18px;margin-top:12px"><button class="row" id="strobeRow" role="switch" aria-checked="${!!fxv("strobe")}" style="min-height:70px"><span class="ic" style="width:64px"><span style="width:34px;height:34px;border-radius:10px;background:#fff;display:grid;place-items:center">${icon("sync", 18, "#1b1c20", 2.4).replace(IC.sync, "M13 2L4 14h7l-1 8 9-12h-7z")}</span></span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">Flash blanc sur les drops${fxMod("strobe") ? '<i class="mdot"></i>' : ''}</span><span class="t2" style="font-size:13px">Toutes les lampes en blanc au moment fort${fxMod("strobe") ? " · modifié" : ""}</span></span><span class="sw ${fxv("strobe") ? "on" : ""}"><i></i></span></span></button></div><div style="height:20px"></div>`;
+    `<div class="list" style="border-radius:18px;margin-top:12px"><button class="row" id="strobeRow" role="switch" aria-checked="${!!fxv("strobe")}" style="min-height:70px"><span class="ic" style="width:64px"><span style="width:34px;height:34px;border-radius:10px;background:#fff;display:grid;place-items:center">${icon("sync", 18, "#1b1c20", 2.4).replace(IC.sync, "M13 2L4 14h7l-1 8 9-12h-7z")}</span></span><span class="bd"><span class="tx"><span class="t1" style="font-size:17px">Flash blanc sur les drops</span><span class="t2" style="font-size:13px">Toutes les lampes en blanc au moment fort</span></span><span class="sw ${fxv("strobe") ? "on" : ""}"><i></i></span></span></button></div><div style="height:20px"></div>`;
   $$("[data-fold]").forEach(b => b.onclick = () => { open[b.dataset.fold] = !open[b.dataset.fold]; store("advOpen", JSON.stringify(open)); renderAdv(); });
   $$("[data-src]").forEach(b => b.onclick = () => { saveFx("source", b.dataset.src); renderAdv(); });
   $$("[data-every]").forEach(b => b.onclick = () => { saveFx("every", +b.dataset.every); renderAdv(); });
   $$("[data-pat]").forEach(b => b.onclick = () => { saveFx("pattern", b.dataset.pat); renderAdv(); });
-  $$("[data-segreset]").forEach(b => b.onclick = e => { e.stopPropagation(); resetFx(FX_SECTIONS[b.dataset.segreset]); });
   $("#strobeRow").onclick = () => { saveFx("strobe", !fxv("strobe")); renderAdv(); };
   $$("[data-sl]").forEach(el => { const k = el.dataset.sl, a = ADV[k]; slider(el, r => { const t = a.inv ? 1 - r : r, v = Math.round((a.min + t * (a.max - a.min)) * 1000) / 1000; saveFx(k, v); setSl(el, r); $(`[data-vf="${k}"]`).textContent = a.f(v); drawEnv(); drawCStrip(); renderPrev(); }, () => renderAdv()); });
   drawEnv(); drawCStrip(); renderPrev();
@@ -5875,54 +5821,21 @@ function livePrev() {   // pendant la synchro, l'aperçu montre les vraies coule
 function renderPrev() {
   if ($("#prev") && $("#prev").dataset.live) return;
   const pal = palColors(S.settings.palette), cur = effCur(), mode = cur.mode, n = 8;
-  const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3";
-  // Tous les réglages jouent sur l'aperçu (simulation d'un rythme à 120 BPM) :
-  // sensibilité -> flashs plus ou moins nombreux, écart -> tempo des flashs,
-  // source -> quelles pastilles mènent, suivi du volume -> amplitude, flash blanc -> éclairs.
-  const sens = (3.5 - fxv("beat_k")) / 2.7, gap = fxv("min_beat"), en = fxv("energy"), src = fxv("source");
-  const per = .5 / sp * (0.75 + gap * 1.1) / (0.65 + sens * 0.7);
-  let dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
-  if (src === "kick") dl = dl.map(() => 0);
-  if (src === "snare") dl = dl.map(v => 1 - v);
-  const every = fxv("every");
-  const hi = Math.min(1, Math.max(fxv("beat"), fxv("base") + .1) + en * .1), lo = Math.max(fxv("base") - en * .02, .03);
-  const strobe = !!fxv("strobe");
+  const sp = cur.speed || 1, tau = fxv("tau"), anim = tau < .14 ? "f1" : tau < .32 ? "f2" : "f3", per = .5 / sp;
+  const dl = { all: [0, 0, 0, 0, 0, 0, 0, 0], alt: [0, .5, 0, .5, 0, .5, 0, .5], chase: [0, .55, .25, .8, .4, .95, .15, .65], wave: [0, .12, .24, .36, .48, .6, .72, .84] }[fxv("pattern")] || [];
+  const hi = Math.max(fxv("beat"), fxv("base") + .1), lo = Math.max(fxv("base"), .03);
   $("#prev").innerHTML = Array.from({ length: n }, (_, i) => {
-    const c = boost(pal[Math.floor(i / every) % pal.length], 200);
-    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : mode === "pulse" ? `${anim} ${per.toFixed(2)}s ${((dl[i] || 0) * per).toFixed(2)}s infinite` : effAnim(mode, i, n, sp);
-    return `<i style="background:radial-gradient(circle at 35% 30%,#fff 0%,${c} 38%,${c} 100%);box-shadow:0 0 20px ${c};--hi:${hi.toFixed(2)};--lo:${lo.toFixed(2)};animation:${a}"></i>`;
-  }).join("") + (strobe ? `<b style="position:absolute;inset:0;border-radius:16px;background:#fff;opacity:0;pointer-events:none;animation:fl 2.4s infinite"></b>` : "");
-  const pv = $("#prev"); pv.style.position = "relative";
+    const c = boost(pal[(i + 1) % pal.length], 200);
+    const a = mode === "spectrum" ? `bar ${(.4 + i * .06).toFixed(2)}s ease-in-out infinite alternate` : mode === "pulse" ? `${anim} ${per}s ${(dl[i] || 0) * per}s infinite` : effAnim(mode, i, n, sp);
+    return `<i style="background:radial-gradient(circle at 35% 30%,#fff 0%,${c} 38%,${c} 100%);box-shadow:0 0 20px ${c};--hi:${hi};--lo:${lo};animation:${a}"></i>`;
+  }).join("");
   $("#stage").style.setProperty("--glow", boost(pal[1] || pal[0], 160) + "33");
-  $("#prevSub").textContent = (EFFECTS.find(e => e[0] === mode) || EFFECTS[0])[1] + " · " + INT[S.settings.intensity] + (sp !== 1 ? (sp > 1 ? " · ×2" : " · ×½") : "") + (strobe ? " · flash blanc" : "") + " · simulation";
+  $("#prevSub").textContent = (EFFECTS.find(e => e[0] === mode) || EFFECTS[0])[1] + " · " + INT[S.settings.intensity] + (sp !== 1 ? (sp > 1 ? " · ×2" : " · ×½") : "");
 }
 $("#advReset").onclick = () => { S.settings.fx = {}; delete pending.fx; save({ intensity: S.settings.intensity }, true); renderAdv(); toast("Préréglage rétabli"); };
-let fxTestT = null;
-const fxTestBtn = $("#fxTest");
-if (fxTestBtn) fxTestBtn.onclick = async () => {
-  const msg = $("#fxMsg");
-  fxTestBtn.disabled = true;
-  try {
-    const r = await api("/api/fx/test", { dur: 6 });
-    if (!r.running) {
-      if (msg) msg.textContent = "Synchro à l'arrêt : active-la dans Réglages → Synchro active, puis reteste.";
-      toast("Synchro à l'arrêt");
-    } else if (r.area_selected === false) {
-      if (msg) msg.textContent = "Aucune zone choisie : retourne sur Synchro pour choisir tes lampes.";
-      toast("Choisis d'abord une zone");
-    } else {
-      if (msg) msg.textContent = "Regarde tes lampes : l'effet actuel y joue pendant 6 s (rythme simulé).";
-      toast("Regarde tes lampes");
-      clearTimeout(fxTestT);
-      fxTestT = setTimeout(() => { if (msg) msg.textContent = "Rejoue l'effet actuel sur tes vraies lampes, avec un rythme simulé — même sans musique."; }, 7000);
-    }
-  } catch (e) { toast("Échec : " + e.message); }
-  fxTestBtn.disabled = false;
-};
 
 /* =================== LUMIÈRES =================== */
-let roomsTimer = null, roomsLock = 0, roomsSeq = 0, lastRoomsSig = "";
-const roomsSig = r => Array.isArray(r) ? r.map(x => [x.id, x.on, x.bri, x.type, x.group, (x.lights || []).map(l => [l.id, l.on, l.bri, l.effect, l.color, (l.gradient || []).join(",")].join(":")).join(";")].join("|")).join("~") : JSON.stringify(r);
+let roomsTimer = null, roomsLock = 0, roomsSeq = 0;
 let held = false;   // doigt posé (curseur, roue des couleurs…) : on ne redessine pas sous le doigt
 document.addEventListener("pointerdown", () => held = true, true);
 ["pointerup", "pointercancel"].forEach(t => document.addEventListener(t, () => { held = false; }, true));
@@ -5934,21 +5847,14 @@ async function loadRooms() {
     const my = ++roomsSeq, lk = roomsLock;
     let r; try { r = await api("/api/rooms"); } catch (e) { r = { error: e.message }; }
     if (my === roomsSeq && lk === roomsLock && Date.now() > roomsLock && !held) {
-      const sig = roomsSig(r);
       ROOMS = r;
-      // Données identiques : on ne reconstruit rien (pas de scintillement, curseurs stables)
-      if (sig !== lastRoomsSig) {
-        lastRoomsSig = sig;
-        if (["lumieres", "piece", "lampe", "plans"].includes(route.v)) render();
-      }
+      if (["lumieres", "piece", "lampe", "plans"].includes(route.v)) render();
     }
   }
   const near = ["lumieres", "piece", "lampe", "plans"].includes(route.v) && !document.hidden;
   roomsTimer = setTimeout(loadRooms, Date.now() < roomsLock ? Math.max(200, roomsLock - Date.now() + 50) : near ? 1500 : 10000);
 }
-const LASTBG = {};   // dernier fond affiché (cartes pièces) : le précédent fond en douceur au lieu de sauter
-function swapBg(sel) { $$(sel).forEach(el => { if (el.style.getPropertyValue("--popf") === "1") requestAnimationFrame(() => requestAnimationFrame(() => el.style.setProperty("--popf", 0))); }); }
-function roomColors(r) { const on = r.lights.filter(l => l.on); return (on.length ? on : r.lights).map(l => l.color); }
+const roomColors = r => { const on = r.lights.filter(l => l.on); return (on.length ? on : r.lights).map(l => l.color); };
 function renderRooms() {
   const g = $("#rooms");
   if (!ROOMS) return;
@@ -5957,15 +5863,12 @@ function renderRooms() {
     const rb = roomBg(r), c1 = boost(rb.colors[rb.colors.length - 1], 190);
     const dark = rb.colors.reduce((a, c) => a + lum(boost(c, 190)), 0) / rb.colors.length > .5, fg = r.on ? (dark ? "#1b1c20" : "#fff") : "#fff";
     const head = r.type === "zone" && (i === 0 || ROOMS[i - 1].type !== "zone") ? `<div class="label" style="padding-left:6px">Zones</div>` : "";
-    const css = r.on ? rb.css : "var(--card)", prev = LASTBG[r.id] || css;
-    LASTBG[r.id] = css;
-    return head + `<div class="room" style="--pbg:${prev};--popf:${prev !== css ? 1 : 0};background:${css};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
+    return head + `<div class="room" style="background:${r.on ? rb.css : "var(--card)"};color:${fg};box-shadow:${r.on ? `0 8px 28px ${c1}38` : "none"}">
       <div class="r1"><button class="rn" data-room="${r.id}" style="display:flex;align-items:center;gap:14px"><span class="ri" style="background:${r.on ? "rgba(255,255,255,.35)" : "var(--card2)"}">${icon(roomKind(r.archetype, r.name), 26)}</span>${esc(r.name)}</button>
       <button class="pwbtn" data-rpow="${r.id}" aria-label="${r.on ? "Éteindre" : "Allumer"} ${esc(r.name)}" style="background:${r.on ? "rgba(255,255,255,.75)" : "var(--card2)"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 20, "currentColor", 2.4)}</button></div>
       ${r.on ? `<div class="sl" data-rbri="${r.id}"><div class="tr" style="background:rgba(0,0,0,.15)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>`;
   }).join("") || `<p class="note" style="padding:0 8px">Aucune pièce sur le pont.</p>`;
   bindRoomControls();
-  swapBg("#rooms .room");
 }
 function bindRoomControls() {
   $$("[data-room]").forEach(b => b.onclick = () => go("piece", b.dataset.room));
@@ -6031,20 +5934,17 @@ function roomBg(r, angle = 135) {   // dégradé d'une pièce : les couleurs ré
 function planSvg(r, tv) {
   const ls = r.lights, pos = ls.map((l, i) => l.pos ? [179 + l.pos.x * 140, 100 - l.pos.y * 64] : [60 + (ls.length > 1 ? i / (ls.length - 1) : .5) * 238, 100]);
   const shapes = ls.map((l, i) => {
-    const [x, y] = pos[i], k = lampKind(l.archetype), c = l.on ? boost(l.color, 200) : "#3a3a3c", glow = "";
+    const [x, y] = pos[i], k = lampKind(l.archetype), c = l.on ? boost(l.color, 200) : "#3a3a3c", glow = l.on ? `filter:drop-shadow(0 0 8px ${c})` : "";
     if ((l.line || l.path) && (l.line || l.path).length > 1) {   // ruban placé sur le plan : on suit son tracé
       const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? x : "#3a3a3c");
       const P = (l.line || l.path).map(q => [179 + q.x * 140, 100 - q.y * 64]), col = j => gradAt(gr, j / (P.length - 1));
-      const segs = P.slice(1).map((q, j) => { const d = Math.hypot(q[0] - P[j][0], q[1] - P[j][1]);
-        if (d < .5) return "";   // boucle fermée : le retour au point de départ ne se redessine pas (bouts ronds)
-        return `<linearGradient id="g${i}_${j}" gradientUnits="userSpaceOnUse" x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}"><stop offset="0" stop-color="${col(j)}"/><stop offset="1" stop-color="${col(j + 1)}"/></linearGradient>|<line x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}" stroke="url(#g${i}_${j})" stroke-width="3.5" stroke-linecap="round"/>`; });
-      const core = segs.map(x => x.split("|")[1]).join("");
-      const hit = segs.map(x => { const m = x.split("|")[1].match(/x1="([^"]+)" y1="([^"]+)" x2="([^"]+)" y2="([^"]+)"/); return m ? `<line x1="${m[1]}" y1="${m[2]}" x2="${m[3]}" y2="${m[4]}" stroke="rgba(0,0,0,0)" stroke-width="26" stroke-linecap="round" fill="none"/>` : ""; }).join("");
-      return `<defs>${segs.map(x => x.split("|")[0]).join("")}</defs><g data-planlamp="${l.id}" style="cursor:pointer">${hit}${core}</g>`;
+      const segs = P.slice(1).map((q, j) => { const dx = q[0] - P[j][0], dy = q[1] - P[j][1], d = Math.hypot(dx, dy) || 1, e = .6 / d;   // léger chevauchement : pas de jointure visible
+        return `<linearGradient id="g${i}_${j}" gradientUnits="userSpaceOnUse" x1="${P[j][0]}" y1="${P[j][1]}" x2="${q[0]}" y2="${q[1]}"><stop offset="0" stop-color="${col(j)}"/><stop offset="1" stop-color="${col(j + 1)}"/></linearGradient>|<line x1="${P[j][0] - dx * e}" y1="${P[j][1] - dy * e}" x2="${q[0] + dx * e}" y2="${q[1] + dy * e}" stroke="url(#g${i}_${j})" stroke-width="7" stroke-linecap="butt"/>`; });
+      return `<defs>${segs.map(x => x.split("|")[0]).join("")}</defs><g style="${l.on ? `filter:drop-shadow(0 0 6px ${gr[0]}aa)` : ""}">${segs.map(x => x.split("|")[1]).join("")}</g>`;
     }
-    if (k === "strip") { const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c"); return `<defs><linearGradient id="g${i}">${gr.map((x, j) => `<stop offset="${gr.length > 1 ? j / (gr.length - 1) : 0}" stop-color="${x}"/>`).join("")}</linearGradient></defs><g data-planlamp="${l.id}" style="cursor:pointer"><rect x="${x - 50}" y="${y - 14}" width="100" height="28" fill="rgba(0,0,0,0)"/><rect x="${x - 50}" y="${y - 4}" width="100" height="8" rx="4" fill="url(#g${i})"/></g>`; }
-    if (k === "bar") return `<g data-planlamp="${l.id}" style="cursor:pointer"><rect x="${x - 26}" y="${y - 14}" width="52" height="28" fill="rgba(0,0,0,0)"/><rect x="${x - 26}" y="${y - 6}" width="52" height="12" rx="6" fill="${c}"/></g>`;
-    return `<g data-planlamp="${l.id}" style="cursor:pointer"><circle cx="${x}" cy="${y}" r="18" fill="rgba(0,0,0,0)"/><circle cx="${x}" cy="${y}" r="${k === "bloom" ? 9 : 7}" fill="${c}"/></g>`;
+    if (k === "strip") { const gr = (l.gradient && l.gradient.length ? l.gradient : [l.color]).map(x => l.on ? boost(x, 200) : "#3a3a3c"); return `<defs><linearGradient id="g${i}">${gr.map((x, j) => `<stop offset="${gr.length > 1 ? j / (gr.length - 1) : 0}" stop-color="${x}"/>`).join("")}</linearGradient></defs><rect x="${x - 50}" y="${y - 4}" width="100" height="8" rx="4" fill="url(#g${i})" style="${glow}"/>`; }
+    if (k === "bar") return `<rect x="${x - 26}" y="${y - 6}" width="52" height="12" rx="6" fill="${c}" style="${glow}"/>`;
+    return `<circle cx="${x}" cy="${y}" r="${k === "bloom" ? 13 : 10}" fill="${c}" style="${glow}"/>`;
   }).join("");
   return `<svg viewBox="0 0 358 200" role="img" aria-label="Plan de ${esc(r.name)}"><rect x="18" y="18" width="322" height="164" rx="16" fill="#141416" stroke="#2c2c2e"/>${shapes}${tv ? tvOnPlan(r) : ""}</svg>`;
 }
@@ -6061,8 +5961,8 @@ function tvOfRoom(r) {   // la TV est rattachée à la zone de synchro de cette 
 }
 function tvOnPlan(r) {   // la TV dessinée en haut du plan de la pièce
   const c = tvCfg(), W = +(((S.settings.room_plans || {})[r.id] || {}).dims || {}).w || 4;
-  const cx = 179 + (c.x * 2 - 1) * 140, hw = Math.max(12, Math.min(70, c.w / W * 140)), e = (TV && TV.engine) || {};
-  const glow = e.power === "On" ? "" : e.ambi ? "filter:drop-shadow(0 0 4px #ff9f0aaa)" : "";
+  const cx = 179 + (c.x * 2 - 1) * 140, hw = Math.max(14, Math.min(150, c.w / W * 140)), e = (TV && TV.engine) || {};
+  const glow = e.power === "On" ? "filter:drop-shadow(0 0 6px #ffffffaa)" : e.ambi ? "filter:drop-shadow(0 0 6px #ff9f0aaa)" : "";
   return `<g data-gotv style="cursor:pointer"><rect x="${(cx - hw).toFixed(1)}" y="21" width="${(2 * hw).toFixed(1)}" height="6" rx="3" fill="${e.power === "On" ? "#f2f2f7" : "#8d8e94"}" style="${glow}"/><text x="${cx.toFixed(1)}" y="13" text-anchor="middle" font-size="9" font-weight="700" fill="#8d8e94" letter-spacing="1">TV</text></g>`;
 }
 function renderPiece() {
@@ -6078,16 +5978,13 @@ function renderPiece() {
     renderPiece.tvBusy = true; renderPiece.tvAt = Date.now();
     api("/api/tv").then(x => { const was = JSON.stringify((TV || {}).engine || {}); TV = x; if (route.v === "piece" && JSON.stringify(x.engine || {}) !== was) renderPiece(); }).catch(() => {}).finally(() => { renderPiece.tvBusy = false; });
   }
-  const hcss = r.on ? rb.css : "#232326", hprev = LASTBG["head:" + r.id] || hcss;
-  LASTBG["head:" + r.id] = hcss;
-  const lleft = ($("#piece #lcar") || {}).scrollLeft || 0;   // le carrousel garde sa position entre deux rendus
-  $("#piece").innerHTML = `<div class="rhead" style="--pbg:${hprev};--popf:${hprev !== hcss ? 1 : 0};background:${hcss};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
+  $("#piece").innerHTML = `<div class="rhead" style="background:${r.on ? rb.css : "#232326"};color:${fg};box-shadow:${r.on ? `0 10px 34px ${c1}44` : "none"}">
     <div style="display:flex;align-items:center;gap:16px"><button class="rb" data-back aria-label="Retour" style="background:${r.on ? (dark ? "rgba(0,0,0,.12)" : "rgba(255,255,255,.18)") : "#3a3b40"};color:inherit">${icon("plus", 22, "currentColor", 2.6).replace(IC.plus, "M20 12H5M11 5l-7 7 7 7")}</button>
     <span style="flex:1;font-size:22px;font-weight:700">${esc(r.name)}</span>
     <button class="pwbtn" id="pPow" aria-label="${r.on ? "Éteindre" : "Allumer"}" style="width:48px;height:48px;background:${r.on ? "rgba(255,255,255,.75)" : "#34353a"};color:${r.on ? "#1b1c20" : "#8d8e94"}">${icon("power", 22, "currentColor", 2.4)}</button></div>
     ${r.on ? `<div class="sl" id="pBri" style="margin:18px 4px 2px"><div class="tr" style="background:rgba(0,0,0,.12)"></div><div class="fi" style="width:${r.bri}%;background:rgba(0,0,0,.3)"></div><div class="kn" style="left:${r.bri}%"></div></div>` : ""}</div>
     <div class="pgrid"><div class="pl">
-    <div class="plan">${planSvg(r, tvz)}</div>
+    <div class="plan" style="position:relative">${planSvg(r, tvz)}<button class="txtbtn" data-editplan style="position:absolute;right:26px;bottom:24px;font-size:13px;background:rgba(27,28,32,.8);padding:6px 10px;border-radius:10px">Modifier le plan</button></div>
     <div class="pcards">
     ${pcard("reglages", "Réglages des scènes", `${{ lr: "Gauche → droite", fb: "Avant → arrière", tour: "Autour de la pièce", centre: "Centre → murs" }[spread] || ""} · ${(ANIMS.find(a => a[0] === (ANIM[r.id] || 0)) || ANIMS[0])[1]}${gmodes.length > 1 ? " · " + ((GMODES.find(g => g[0] === gmodeOf(r)) || [, ""])[1]) : ""}`, `
     <div class="spr"><span>Couleurs selon la position</span><div class="seg">${[["lr", "M4 12h16M15 7l5 5-5 5", "De gauche à droite"], ["fb", "M12 4v16M7 15l5 5 5-5", "De l'avant vers l'arrière"], ["tour", "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4", "Autour de la pièce"], ["centre", "M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4M12 3v3M12 18v3M3 12h3M18 12h3", "Du centre vers les murs"]].map(([k, d, t]) => `<button data-spr="${k}" class="${spread === k ? "on" : ""}" aria-label="${t}" title="${t}"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg></button>`).join("")}</div></div>
@@ -6098,7 +5995,7 @@ function renderPiece() {
     </div><div class="pr"><div class="pcards">
     ${pcard("scenes", "Scènes", scenePick[r.id] && r.on ? esc(palName(scenePick[r.id])) : "Couleurs selon la place de chaque lampe", `<div class="grid3">${scenes.map(p => orbTile(p.name, p.colors, scenePick[r.id] === p.id && r.on, `data-scene="${p.id}"`)).join("")}${orbTile("Créer", null, false, 'data-newpal="scene"')}</div>`)}
     ${effs.length ? pcard("effets", "Effets", r.lights.some(l => l.effect && l.effect !== "no_effect") ? "Un effet est en cours" : "Joués par le pont", `<div class="grid2">${effs.map(k => { const on = r.on && r.lights.some(l => l.effect === k); return `<button class="tile ${on ? "on" : ""}" data-fx="${k}">${fxIcon(k)}<span class="n">${FX_N[k][0]}</span><span class="d">${FX_N[k][1]}</span></button>`; }).join("")}</div>${r.lights.some(l => l.effect && l.effect !== "no_effect") ? `<button class="cta ghost" data-fx="no_effect" style="margin-top:10px">Arrêter l'effet</button>` : ""}<p class="hint" style="margin:8px 4px 0">Joués par le pont lui-même, sur la couleur actuelle de chaque lampe. La vitesse suit « Animation des scènes ».</p>`) : ""}
-    <div id="lampBlock"><div class="label in" style="padding-bottom:0">Lampes · ${r.lights.filter(l => l.on).length}/${r.lights.length}${tvz ? " · Ambilight" : ""}</div><div class="lampsec"><div class="lcar" id="lcar">${r.lights.map(l => lampTile(l)).join("")}${tvz ? lampTile(tvLamp()) : ""}</div><div class="lcount" id="lcount"></div></div></div>
+    ${pcard("lampes", "Lampes", `${r.lights.filter(l => l.on).length} allumée${r.lights.filter(l => l.on).length > 1 ? "s" : ""} sur ${r.lights.length}${tvz ? " · Ambilight" : ""}`, `<div class="grid3">${r.lights.map(l => lampTile(l)).join("")}${tvz ? lampTile(tvLamp()) : ""}</div>`)}
     <div style="height:24px"></div></div></div></div>`;
   $("#pPow").onclick = () => roomPower(r.id);
   if ($("#pBri")) slider($("#pBri"), t => { setSl($("#pBri"), t); r.bri = Math.max(1, Math.round(t * 100)); }, () => { roomsLock = Date.now() + 1200; api("/api/room", { group: r.group, bri: r.bri }).catch(e => toast(e.message)); });
@@ -6113,22 +6010,6 @@ function renderPiece() {
   $$("[data-lamp]").forEach(b => b.onclick = () => go("lampe", r.id + "|" + b.dataset.lamp));
   $$("[data-pck]").forEach(b => b.onclick = () => { const k = b.dataset.pck; PCARD[k] = !PCARD[k]; store("pcard", JSON.stringify(PCARD)); b.parentElement.classList.toggle("open", PCARD[k]); });
   $$("[data-gotv]").forEach(b => b.onclick = () => { tvTest = null; go("tv"); });
-  $$("#piece [data-planlamp]").forEach(b => b.onclick = () => lightPower(r, b.dataset.planlamp));
-  // Ordre des cartes : aperçu (plan), lampes, scènes, effets, réglages (déplacées, pas reconstruites)
-  const plc = $("#piece .pl .pcards"), prc = $("#piece .pr .pcards");
-  if (plc && prc) {
-    const card = k => document.querySelector(`#piece [data-pcard="${k}"]`);
-    const lampes = $("#piece #lampBlock"), reglages = card("reglages");
-    if (lampes) plc.appendChild(lampes);
-    if (reglages) prc.appendChild(reglages);
-  }
-  const lcar = $("#piece #lcar");
-  if (lcar) {
-    lcar.scrollLeft = lleft;
-    const updCount = () => { const n = lcar.querySelectorAll(".lamp").length, i = Math.min(n, Math.round(lcar.scrollLeft / (lcar.scrollWidth / Math.max(1, n))) + 1); const el = $("#piece #lcount"); if (el) el.textContent = n ? `${i} / ${n}` : ""; };
-    lcar.onscroll = updCount; updCount();
-  }
-  swapBg("#piece .rhead");
 
 }
 function tvLamp() {   // l'Ambilight présenté comme une lampe de la pièce
@@ -6558,7 +6439,6 @@ async function refresh(forceZones) {
   if (!S.paired && $("#welcome").classList.contains("hidden")) { showWelcome(false); return; }
   if (S.paired && !forcedWelcome) { $("#welcome").classList.add("hidden"); $("#app").classList.remove("hidden"); }
   if (S.paired && (zones === null || forceZones)) api("/api/areas" + (forceZones ? "?refresh" : "")).then(z => { zones = z; render(); renderSheets(); }).catch(e => { zones = { error: e.message }; render(); });
-  if (held) return;   // doigt posé (curseur…) : on ne reconstruit rien sous le geste
   render();
   if ($(".sheet.open")) renderSheets();
 }
