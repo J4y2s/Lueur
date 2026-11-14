@@ -230,6 +230,18 @@ def room_plan_info(rid):
     return {"id": rid, "type": "room", "name": room["name"], "channels": chs, "plan": plan}
 
 
+def default_height(lamp):
+    """Hauteur par défaut d'une lampe (-1 au sol, 0 au milieu, +1 au plafond) d'après son type."""
+    a = ((lamp or {}).get("archetype") or "").lower()
+    if any(k in a for k in ("ceiling", "recessed", "spot")):
+        return 1
+    if (lamp or {}).get("has_gradient"):
+        return 1
+    if any(k in a for k in ("play", "bloom", "go")):
+        return -1
+    return 0
+
+
 def save_plan(body):
     """Plan d'une pièce : réglages de l'éditeur + position calculée de chaque canal."""
     aid = str(body.get("id", ""))[:64]
@@ -242,12 +254,19 @@ def save_plan(body):
         if body.get("reset"):
             plans.pop(aid, None)
         else:
+            heights = {}
+            for k, v in (body.get("heights") or {}).items():
+                try:
+                    heights[str(k)[:64]] = max(-1, min(1, int(round(float(v)))))
+                except (TypeError, ValueError):
+                    pass
             plans[aid] = {
                 "dims": dict(zip("wd", dims_of(body.get("dims")))),
                 "spots": {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()},
                 "rubans": {str(d)[:64]: {"walls": int(num(r.get("walls", 1), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                          "dir": 1 if r.get("dir", 1) >= 0 else -1}
-                           for d, r in (body.get("rubans") or {}).items()}}
+                           for d, r in (body.get("rubans") or {}).items()},
+                "heights": heights}
         s["room_plans"] = plans
         write_json(SETTINGS_PATH, s)
         rooms_cache["t"] = 0
@@ -257,16 +276,21 @@ def save_plan(body):
             except Exception as e:              # pas de zone, pont injoignable… : le plan reste enregistré
                 print(f"Plan de synchro non recopié : {e}", flush=True)
         return {"ok": True}
+    s = get_settings()
+    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
+    old_ch = (plans.get(aid) or {}).get("ch") if isinstance(plans.get(aid), dict) else {}
+    old_ch = old_ch if isinstance(old_ch, dict) else {}
     ch = {}
     for k, q in (body.get("ch") or {}).items():
-        ch[str(int(k))] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1)}
+        ck = str(int(k))
+        zq = q.get("z", (old_ch.get(ck) or {}).get("z", 0) if isinstance(old_ch.get(ck), dict) else 0)
+        ch[ck] = {"t": num(q["t"], 0, 1), "x": num(q["x"], -1, 1), "y": num(q["y"], -1, 1),
+                  "z": num(zq, -1, 1)}
     rubans = {}
     for dev, r in (body.get("rubans") or {}).items():
         rubans[str(dev)[:64]] = {"walls": int(num(r.get("walls", 4), 1, 4)), "corner": int(num(r.get("corner", 0), 0, 3)),
                                  "dir": 1 if r.get("dir", 1) >= 0 else -1}
     spots = {str(k)[:64]: [num(v[0], 0, 1), num(v[1], 0, 1)] for k, v in (body.get("spots") or {}).items()}
-    s = get_settings()
-    plans = s.get("plans") if isinstance(s.get("plans"), dict) else {}
     eq = (plans.get(aid) or {}).get("eq") if isinstance(plans.get(aid), dict) else None
     if body.get("reset"):
         plans.pop(aid, None)                # positions de l'app Hue, mais on garde l'équilibre
@@ -1242,31 +1266,43 @@ STRIP_SPOT = hms.STRIP_SPOT
 
 def room_sync_plan(cfg, room, area, plan, lights, strips=None):
     """Plan de la zone de synchro d'une pièce, recopié de son plan Lueur (mêmes conventions que
-    l'éditeur) : ordre et place de chaque segment du ruban, place de chaque spot."""
+    l'éditeur) : ordre et place de chaque segment du ruban, place et hauteur de chaque spot."""
     if strips is None:
         strips = {l["id"]: dict({"walls": 1, "corner": 0, "dir": 1}, **((plan.get("rubans") or {}).get(l["id"]) or {}))
                   for l in room["lights"] if l.get("has_gradient")}
     rows = hms.channel_info(cfg, area)
     light_of_dev = {lights.get(l["id"], {}).get("owner", {}).get("rid"): l["id"] for l in room["lights"]}
+    by_lamp = {l["id"]: l for l in room["lights"]}
+    heights = plan.get("heights") if isinstance(plan.get("heights"), dict) else {}
+
+    def height_of(lid):
+        try:
+            return max(-1, min(1, int(round(float(heights[lid])))))
+        except (KeyError, TypeError, ValueError):
+            return default_height(by_lamp.get(lid))
+
     ch, rubans, spots, by_dev = {}, {}, {}, {}
     for r in rows:
         by_dev.setdefault(r["dev"], []).append(r)
     for dev, rs in by_dev.items():
         lid = light_of_dev.get(dev)
         rb = strips.get(lid)
+        zh = height_of(lid)
         if rb and len(rs) > 1:
             rubans[dev] = rb
             rs.sort(key=lambda r: r["idx"])
             for k, r in enumerate(rs):
                 u = (k + 0.5) / len(rs)
                 px, py = along(rb, u, plan.get("dims"))
-                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4)}
+                ch[str(r["id"])] = {"t": round(u, 4), "x": round(px * 2 - 1, 4), "y": round(1 - py * 2, 4),
+                                    "z": zh}
         else:
             for r in rs:
                 q = (plan.get("spots") or {}).get(lid) or [(r["x"] + 1) / 2, (1 - r["y"]) / 2]
                 q = [max(PM, min(1 - PM, float(q[0]))), max(PM, min(1 - PM, float(q[1])))]
                 spots[str(r["id"])] = q
-                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4)}
+                ch[str(r["id"])] = {"t": round(q[0], 4), "x": round(q[0] * 2 - 1, 4), "y": round(1 - q[1] * 2, 4),
+                                    "z": zh}
     return rows, ch, rubans, spots, light_of_dev, by_dev
 
 
@@ -1305,7 +1341,7 @@ def color_test(body):
         write_json(SETTINGS_PATH, s)
         return {"ok": True, "stopped": True}
     save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
-               "dims": body.get("dims")})
+               "dims": body.get("dims"), "heights": body.get("heights")})
     got = refresh_room_zone(rid)
     if not got:
         raise ValueError("Crée d'abord la zone de synchro de cette pièce.")
@@ -1337,9 +1373,9 @@ def area_from_room(body):
     dans la zone de synchro (ordre des segments, spots), et la zone est choisie pour la musique."""
     cfg = _cfg()
     rid = str(body.get("id", ""))[:64]
-    if "rubans" in body or "spots" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
+    if "rubans" in body or "spots" in body or "heights" in body:          # on enregistre d'abord le plan tel qu'il est à l'écran
         save_plan({"type": "room", "id": rid, "rubans": body.get("rubans") or {}, "spots": body.get("spots") or {},
-                   "dims": body.get("dims")})
+                   "dims": body.get("dims"), "heights": body.get("heights")})
     room = next((r for r in rooms_state() if r["id"] == rid), None)
     if not room:
         raise ValueError("Pièce introuvable.")

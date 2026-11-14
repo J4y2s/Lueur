@@ -698,6 +698,7 @@ const EFFECTS = [
   ["comete", "Comète", "Une traînée tourne sur le ruban, poussée par le rythme", true],
   ["vague", "Vague", "La palette défile, sans flash", true],
   ["vumetre", "Vu-mètre", "Se remplit avec le volume", true],
+  ["colonne", "Colonne", "Se remplit de bas en haut avec le volume", true],
   ["stereo", "Stéréo", "Gauche et droite séparées", true],
   ["etincelles", "Étincelles", "Éclats au hasard sur les aigus", true],
   ["respiration", "Respiration", "Monte et descend doucement", true]
@@ -705,7 +706,7 @@ const EFFECTS = [
 
 const SPEEDS = [[0.5, "Demi-temps"], [1, "Normale"], [2, "Double"]];
 const SPEED_D = { pulse: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.", spectrum: "Demi-temps : un temps sur deux. Double : un flash entre deux temps.",
-  comete: "Vitesse à laquelle la comète fait le tour du ruban.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.",
+  comete: "Vitesse à laquelle la comète fait le tour du ruban.", glisse: "Vitesse de glisse et force de l'élan sur chaque temps.", vague: "Vitesse de défilement des couleurs.", vumetre: "Vitesse à laquelle le niveau redescend.", colonne: "Vitesse à laquelle le niveau redescend.",
   stereo: "Durée des éclats sur les temps.", etincelles: "Durée des éclats.", respiration: "Demi-temps : 16 s par souffle. Double : 4 s." };
 const KIND_N = { ruban: "Ruban", spots: "Spots", play: "Play", lampes: "Lampes" };
 let effTarget = "all";
@@ -864,7 +865,7 @@ async function renderPlan() {
     $("#planTitle").textContent = "Plan"; $("#planSvg").innerHTML = ""; $("#planRubans").innerHTML = "";
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
-    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) } };
+    PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) }, heights: { ...(pl.heights || {}) } };
     COLORTEST = null;
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
@@ -882,7 +883,7 @@ async function renderPlan() {
     <div class="lb">Longueur</div>${seg("walls", d, [[1, "1 mur"], [2, "2 murs"], [3, "3 murs"], [4, "Tour complet"]], r.walls)}
     <div class="lb">Départ</div>${seg("corner", d, [[0, "↖ Avant gauche"], [1, "↗ Avant droit"], [2, "↘ Fond droit"], [3, "↙ Fond gauche"]], r.corner)}
     <div class="lb">Sens</div>${seg("dir", d, [[1, "↻ Horaire"], [-1, "↺ Antihoraire"]], r.dir)}
-    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? areaCard() : eqCard());
+    ${cs[0].order && cs[0].light ? `<div class="lb">Sens des effets du pont</div><div class="seg">${[["forward", "Normal"], ["reversed", "Inversé"]].map(([v, n]) => `<button data-ord="${v}" data-ol="${esc(cs[0].light)}" class="${cs[0].order === v ? "on" : ""}">${n}</button>`).join("")}</div><p class="hint" style="margin:6px 2px 0">Sens dans lequel le pont déroule ses effets intégrés et ses dégradés. Après un changement, refais « Montrer le début ».</p>` : ""}</div>`; }).join("") + (PLAN.type === "room" ? heightsCard() + areaCard() : eqCard());
   $$("[data-ord]").forEach(b => b.onclick = async () => {
     try { await api("/api/light/order", { light: b.dataset.ol, order: b.dataset.ord }); PLAN.channels.forEach(c => { if (c.light === b.dataset.ol) c.order = b.dataset.ord; }); renderPlan(); toast("Sens changé : refais « Montrer le début »"); }
     catch (e) { toast(e.message); }
@@ -890,13 +891,14 @@ async function renderPlan() {
   if ($("#planArea")) $("#planArea").onclick = async () => {
     const b = $("#planArea"); b.disabled = true; b.textContent = "Création sur le pont…";
     try {
-      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
+      const r = await api("/api/area/from_room", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights });
       toast(`« ${r.name} » ${r.created ? "créée" : "mise à jour"} : ${r.channels} canaux${r.segments ? `, ruban en ${r.segments} segments` : ""}`);
       zones = null; roomsLock = 0; loadRooms(); await refresh(true); PLAN = null; renderPlan();
     } catch (e) { toast("Échec : " + e.message); b.disabled = false; b.textContent = "Réessayer"; }
   };
   $$("[data-eq]").forEach(el => slider(el, t => { const v = Math.round((0.1 + t * 0.9) * 100) / 100; setSl(el, t); PED.eq[el.dataset.eq] = v; el.parentElement.querySelector("[data-eqv]").textContent = Math.round(v * 100) + " %"; clearTimeout(eqTimer); eqTimer = setTimeout(sendEq, 250); }, sendEq));
   $$("[data-rk]").forEach(b => b.onclick = () => { PED.rubans[b.dataset.rd][b.dataset.rk] = +b.dataset.rv; renderPlan(); colorTestSoon(); });
+  $$("[data-hz]").forEach(b => b.onclick = () => { PED.heights[b.dataset.hl] = +b.dataset.hz; renderPlan(); colorTestSoon(); });
   $$("[data-dim]").forEach(el => el.onchange = () => { const v = parseFloat(String(el.value).replace(",", ".")); PED.dims[el.dataset.dim] = v > 0 ? Math.min(40, v) : 0; renderPlan(); colorTestSoon(); });
   $$("[data-ctest]").forEach(b => b.onclick = () => colorTest(!!COLORTEST));
   $$("[data-ident]").forEach(b => b.onclick = async () => {
@@ -912,6 +914,28 @@ async function renderPlan() {
       toast("Un point blanc parcourt les segments pendant 15 s");
     } catch (e) { toast(e.message); }
   });
+}
+function defaultHeight(c) {   // hauteur auto d'une lampe : -1 bas, 0 milieu, +1 haut
+  const a = (c.archetype || "").toLowerCase();
+  if (/ceiling|recessed|spot/.test(a)) return 1;
+  if (c.grad_points) return 1;
+  if (/play|bloom|\bgo\b/.test(a)) return -1;
+  return 0;
+}
+function lampById(id) {
+  const { rub, single } = planDevs();
+  for (const [, cs] of rub.concat(single)) { const f = cs.find(c => c.dev === id || c.id === id); if (f) return f; }
+  return {};
+}
+const heightOf = id => PED.heights[id] ?? defaultHeight(lampById(id));
+const HZ_N = ["Bas", "Milieu", "Haut"];
+function heightsCard() {   // hauteur de chaque lampe de la pièce (éditeur de plan)
+  const { rub, single } = planDevs();
+  const row = (id, name) => { const v = heightOf(id), auto = PED.heights[id] == null;
+    return `<div class="srow"><div class="h"><span>${esc(name)}${auto ? ' <small style="color:var(--t3)">auto</small>' : ""}</span><span>${HZ_N[v + 1]}</span></div><div class="seg">${[[-1, "Bas"], [0, "Milieu"], [1, "Haut"]].map(([h, n]) => `<button data-hz="${h}" data-hl="${esc(id)}" class="${v === h ? "on" : ""}">${n}</button>`).join("")}</div></div>`; };
+  return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon("sliders", 22)}</span><span><b>Hauteur des lampes</b><br><small>Sol, milieu ou plafond</small></span></div>`
+    + rub.map(([d, cs]) => row(d, cs[0].name)).join("") + single.map(([, cs]) => row(cs[0].id, cs[0].name)).join("")
+    + `<p class="hint" style="margin:8px 2px 0">Plafond et spots en haut, lampes de table en bas. Utilisé par l'effet Colonne, la couleur des spots près du ruban et la synchro vidéo.</p></div>`;
 }
 function areaCard() {    // zone de divertissement de la pièce, créée d'après ce plan
   const name = ("Lueur · " + PLAN.name).slice(0, 32), z = zones && !zones.error ? zones.find(x => x.name === name) : null;
@@ -930,7 +954,7 @@ async function colorTest(stop) {   // test « couleurs par segment » (plan d'un
   clearTimeout(ctTimer);
   if (stop) { COLORTEST = null; clearTimeout(ctEnd); try { await api("/api/plan/colortest", { id: PLAN.id, stop: true }); } catch (e) {} if (route.v === "plan") renderPlan(); return; }
   try {
-    const r = await api("/api/plan/colortest", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims });
+    const r = await api("/api/plan/colortest", { id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights });
     const first = !COLORTEST; COLORTEST = { segments: r.segments || [], spots: r.spots || {} };
     if (first) toast(r.started ? "Synchro démarrée : chaque segment s'allume de sa couleur" : "Chaque segment s'allume de sa couleur (2 min)");
     clearTimeout(ctEnd); ctEnd = setTimeout(() => { COLORTEST = null; if (route.v === "plan") renderPlan(); }, (r.seconds || 120) * 1000);
@@ -1012,8 +1036,8 @@ function drawPlan() {
     const a = alongP(r, .02, PED.dims), b = alongP(r, .12, PED.dims), ang = Math.atan2(Y(b) - Y(a), X(b) - X(a)) * 180 / Math.PI, s0 = alongP(r, 0, PED.dims);
     h += `<g transform="translate(${X(s0)},${Y(s0)}) rotate(${ang})"><circle r="3.2" fill="#fff"/><path d="M-1.4 -1.6 L1.6 0 L-1.4 1.6Z" fill="#1b1c20"/></g>`;
   });
-  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && (fieldAt ? fieldAt(X(q), Y(q)) : CT.spots[c.light || c.id]), col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190);
-    h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 14))}</text></g>`; }));
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id].p, tc = CT && (fieldAt ? fieldAt(X(q), Y(q)) : CT.spots[c.light || c.id]), col = tc || boost(pal[Math.min(pal.length - 1, Math.floor(q[0] * pal.length))], 190), hz = heightOf(c.light || c.id);
+    h += `<g class="spot" data-spot="${c.id}" transform="translate(${X(q)},${Y(q)})"><circle r="6" fill="transparent"/><circle r="3.6" fill="${col}" stroke="#fff" stroke-width=".7"/><text y="8.6" text-anchor="middle" font-size="3.4" fill="#a9aab0">${esc(c.name.slice(0, 12))}${hz > 0 ? " ↑" : hz < 0 ? " ↓" : ""}</text></g>`; }));
   const svg = $("#planSvg"); svg.setAttribute("viewBox", `0 0 ${W} ${H.toFixed(1)}`); svg.innerHTML = h;
   svg.querySelectorAll("[data-spot]").forEach(g => g.onpointerdown = e => { e.preventDefault(); planDrag = g.dataset.spot; svg.setPointerCapture(e.pointerId); });
   svg.onpointermove = e => { if (planDrag === null) return; const r = svg.getBoundingClientRect(); PED.spots[planDrag] = [Math.max(PM, Math.min(1 - PM, (e.clientX - r.left) / r.width)), Math.max(PM, Math.min(1 - PM, (e.clientY - r.top) / r.height))]; drawPlan(); };
@@ -1029,7 +1053,7 @@ $("#planSave").onclick = async () => {
   const pos = planLayout(), ch = {};
   PLAN.channels.forEach(c => { const q = pos[c.id]; if (q) ch[c.id] = { t: q.t, x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2 }; });
   try {
-    if (PLAN.type === "room") { if (COLORTEST) colorTest(true); await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); roomsLock = 0; loadRooms(); }
+    if (PLAN.type === "room") { if (COLORTEST) colorTest(true); await api("/api/plan", { type: "room", id: PLAN.id, rubans: PED.rubans, spots: PED.spots, dims: PED.dims, heights: PED.heights }); roomsLock = 0; loadRooms(); }
     else { await api("/api/plan", { id: PLAN.id, ch, rubans: PED.rubans, spots: PED.spots, dims: PED.dims }); S.settings.plans = { ...(S.settings.plans || {}), [PLAN.id]: { ch, eq: { ...PED.eq } } }; }
     toast("Plan enregistré"); PLAN = null; back();
   }
@@ -1083,6 +1107,7 @@ function effAnim(fx, i, n, sp) {
   if (fx === "glisse") return `br ${f(1.6)}s ease-in-out ${f(-i * .16)}s infinite`;
   if (fx === "vague") return `br ${f(2.4)}s ease-in-out ${f(-i * .22)}s infinite`;
   if (fx === "vumetre") return `fl ${f(1.6)}s ${f(i * .06)}s infinite`;
+  if (fx === "colonne") return `fl ${f(1.6)}s ${f((n - 1 - i) * .09)}s infinite`;
   if (fx === "stereo") return `fl ${f(.9)}s ${i < n / 2 ? 0 : f(.45)}s infinite`;
   if (fx === "etincelles") return `fl ${f(1.3)}s ${f(rnd[i % 12] * 1.3)}s infinite`;
   if (fx === "respiration") return `br ${f(3.2)}s ease-in-out ${f(-i * .12)}s infinite`;

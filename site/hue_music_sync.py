@@ -339,7 +339,8 @@ def channel_kinds(cfg, area):
 
 def plan_channels(area, plans):
     """Applique le plan de la pièce (s'il existe) : chaque canal reçoit son ordre de parcours
-    (le long du ruban, ou de gauche à droite) et sa vraie position gauche / droite."""
+    (le long du ruban, ou de gauche à droite), sa vraie position gauche / droite et sa hauteur
+    (z de -1 au sol à +1 au plafond, 0 par défaut pour les plans d'avant l'axe Z)."""
     plan = (plans or {}).get(area.get("id"), {}) if isinstance(plans, dict) else {}
     pts = plan.get("ch", {}) if isinstance(plan, dict) else {}
     try:                                   # proportions de la pièce : profondeur / largeur
@@ -354,7 +355,8 @@ def plan_channels(area, plans):
         if isinstance(q, dict):
             try:
                 t, x, y = (max(-1.0, min(1.0, float(q[k]))) for k in ("t", "x", "y"))
-                c["position"] = {"x": t * 2 - 1, "y": y, "z": 0, "sx": x, "sy": y * ratio}
+                z = max(-1.0, min(1.0, float(q.get("z", 0))))
+                c["position"] = {"x": t * 2 - 1, "y": y, "z": z, "sx": x, "sy": y * ratio}
             except (KeyError, TypeError, ValueError):
                 pass
         out.append(c)
@@ -394,33 +396,33 @@ TEST_COLORS = ["#ff0000", "#ff7a00", "#ffe600", "#00d000", "#00e5ff", "#0030ff",
                "#ff00a8", "#ffffff", "#7a3b00"]
 
 
-def _pos2(c):
-    """Position réelle d'un canal dans la pièce (gauche-droite, avant-fond à l'échelle)."""
+def _pos3(c):
+    """Position réelle d'un canal dans la pièce : gauche-droite, avant-fond à l'échelle, hauteur."""
     p = c["position"]
-    return p.get("sx", p["x"]), p.get("sy", p.get("y", 0))
+    return p.get("sx", p["x"]), p.get("sy", p.get("y", 0)), p.get("z", 0)
 
 
 def strip_anchor(strip, o):
-    """Point du ruban le plus proche d'une lampe : (canal a, canal b, f). La lampe prend la couleur
+    """Point du ruban le plus proche d'une lampe (distances 3D) : (canal a, canal b, f). La lampe prend la couleur
     a et b mélangées (f = 0 : tout a, f = 1 : tout b). `strip` est trié dans l'ordre du ruban."""
     if len(strip) == 1:
         c = strip[0]["channel_id"]
         return c, c, 0.0
-    pts = [_pos2(c) for c in strip]
-    ox, oy = _pos2(o)
-    steps = [((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2) ** 0.5 for i in range(len(pts) - 1)]
+    pts = [_pos3(c) for c in strip]
+    ox, oy, oz = _pos3(o)
+    steps = [((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2 + (pts[i + 1][2] - pts[i][2]) ** 2) ** 0.5 for i in range(len(pts) - 1)]
     pairs = list(range(len(pts) - 1))
-    close = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2) ** 0.5
+    close = ((pts[0][0] - pts[-1][0]) ** 2 + (pts[0][1] - pts[-1][1]) ** 2 + (pts[0][2] - pts[-1][2]) ** 2) ** 0.5
     if len(pts) > 2 and close <= 1.6 * sorted(steps)[len(steps) // 2]:
         pairs.append(-1)                   # le ruban fait le tour : le dernier segment touche le premier
     best = None
     for i in pairs:
         a, b = (len(pts) - 1, 0) if i == -1 else (i, i + 1)
-        (ax, ay), (bx, by) = pts[a], pts[b]
-        dx, dy = bx - ax, by - ay
-        L = dx * dx + dy * dy
-        f = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy) / L))
-        d = (ax + dx * f - ox) ** 2 + (ay + dy * f - oy) ** 2
+        (ax, ay, az), (bx, by, bz) = pts[a], pts[b]
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        L = dx * dx + dy * dy + dz * dz
+        f = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((ox - ax) * dx + (oy - ay) * dy + (oz - az) * dz) / L))
+        d = (ax + dx * f - ox) ** 2 + (ay + dy * f - oy) ** 2 + (az + dz * f - oz) ** 2
         if best is None or d < best[0]:
             best = (d, strip[a]["channel_id"], strip[b]["channel_id"], f)
     return best[1], best[2], best[3]
@@ -878,6 +880,8 @@ class Effects:
         self.sparks = None
         self.vu = 0.0
         self.vu_peak = 0.0
+        self.vuz = 0.0
+        self.vuz_peak = 0.0
         self.phase = 0.0
         self.push = 0.0                  # élan donné par la grosse caisse (effet Glissé)
         self.lr_ref = 1e-3
@@ -1034,6 +1038,29 @@ class Effects:
                 if abs(x - self.vu_peak) < 0.5 / n + 1e-6 and self.vu_peak > 0.08:
                     b = max(b, 0.85)
                 res.append((self.palette_at(x * 0.75), b, True))
+
+        elif mode == "colonne":
+            # Vu-mètre vertical : les lampes s'allument de bas en haut avec le niveau.
+            # Chaque lampe joue selon sa hauteur (z = -1 au sol, +1 au plafond, 0 par défaut) ;
+            # sans hauteurs renseignées, tout respire ensemble avec le niveau.
+            target = min(1.0, max(dyn["all"], 0.85 * dyn["bass"], 0.7 * dyn["mid"]) ** 0.9)
+            rise = 1 - np.exp(-dt / 0.04)
+            fall = 1 - np.exp(-dt / (0.35 / sp))
+            self.vuz += (target - self.vuz) * (rise if target > self.vuz else fall)
+            self.vuz_peak = max(self.vuz, self.vuz_peak - dt * 0.35 * sp)
+            zs = sorted({round(float(ch["position"].get("z", 0)), 3) for ch in self.channels})
+            if len(zs) == 1:
+                res.append((self.palette_at(self.vuz * 0.75), 0.05 + 0.95 * self.vuz, True))
+            else:
+                rk = {z: i / (len(zs) - 1) for i, z in enumerate(zs)}
+                m = len(zs)
+                for ch in self.channels:
+                    r = rk[round(float(ch["position"].get("z", 0)), 3)]
+                    fill = max(0.0, min(1.0, (self.vuz * 1.1 - r) * m))
+                    b = 0.03 + 0.97 * fill
+                    if abs(r - self.vuz_peak) < 0.5 / m + 1e-6 and self.vuz_peak > 0.08:
+                        b = max(b, 0.85)
+                    res.append((self.palette_at(r * 0.75), b, True))
 
         elif mode == "stereo":
             l, r = bands.get("lr", (0.0, 0.0))
@@ -1923,15 +1950,17 @@ class VideoMapper:
         for c in channels:
             p = c.get("position", {})
             # Plan Lueur comme repères du pont : x et y de -1 à 1, y = +1 du côté de la TV.
-            # « sx » est la vraie position gauche-droite (« x » sert à l'ordre de parcours).
+            # « sx » est la vraie position gauche-droite (« x » sert à l'ordre de parcours),
+            # « z » la hauteur (-1 au sol, +1 au plafond).
             x = float(p["sx"]) if "sx" in p else float(p.get("x", 0))
             u, v = (x + 1) / 2, (1 - float(p.get("y", 0))) / 2   # u : 0 à gauche, 1 à droite ; v : 0 au mur de la TV
+            z = max(-1.0, min(1.0, float(p.get("z", 0))))
             du = (u - xc) * W
             if abs(du) <= hw:
                 spec = ("top", (du / hw + 1) / 2, 0.0)
             else:
                 spec = ("left" if du < 0 else "right", 0.0, min(1.0, (abs(du) - hw) / 0.6))
-            self.pos[c["channel_id"]] = (u, v, kinds.get(c["channel_id"]))
+            self.pos[c["channel_id"]] = (u, v, z, kinds.get(c["channel_id"]))
             bri = 1 - (1 - back) * _smooth(0.1, 0.9, v)
             if kinds.get(c["channel_id"]) == "spots":
                 bri *= spots
@@ -1977,14 +2006,15 @@ class VideoMapper:
         if not colors or not self.pos:
             return None
         xc, hu, W, D = self.geo
-        lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors and k != "spots"]
+        H = 2.5                       # hauteur de pièce supposée : la TV est à mi-hauteur (z = 0)
+        lamps = [(u, v, z, colors[c]) for c, (u, v, z, k) in self.pos.items() if c in colors and k != "spots"]
         if not lamps:
-            lamps = [(u, v, colors[c]) for c, (u, v, k) in self.pos.items() if c in colors]
+            lamps = [(u, v, z, colors[c]) for c, (u, v, z, k) in self.pos.items() if c in colors]
         if not lamps:
             return None
 
         def at(u):
-            near = sorted(((math.hypot((u - lu) * W, lv * D), col) for lu, lv, col in lamps), key=lambda x: x[0])[:2]
+            near = sorted(((math.hypot((u - lu) * W, lv * D, lz * H / 2), col) for lu, lv, lz, col in lamps), key=lambda x: x[0])[:2]
             ws = [1 / (d + 0.05) for d, _ in near]
             return [sum(w * col[i] for w, (_, col) in zip(ws, near)) / sum(ws) for i in range(3)]
 
@@ -2013,9 +2043,11 @@ class VideoMapper:
 # ---------------------------------------------------------------------------
 # Commande "run"
 # ---------------------------------------------------------------------------
-MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "stereo", "etincelles", "respiration")
+MODES = ("pulse", "spectrum", "glisse", "comete", "vague", "vumetre", "colonne", "stereo", "etincelles", "respiration")
 SPEEDS = (0.5, 1.0, 2.0)          # demi-temps, normal, double
 ALONG = ("glisse", "comete", "vague", "vumetre", "etincelles", "respiration")   # effets qui suivent le ruban
+# (« colonne » n'en fait pas partie : chaque lampe joue selon sa propre hauteur,
+# la recopier sur le ruban casserait le sens vertical)
 
 SETTINGS_DEFAULTS = {"area": "", "palette": "sunset", "intensity": "high", "mode": "pulse", "speed": 1.0,
                      "layers": {}, "plans": {}, "test": {},
