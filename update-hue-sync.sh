@@ -5591,7 +5591,7 @@ function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mu
   });
   const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100"); svg.innerHTML = h;
 }
-function drawRender() {   // la pièce éclairée : nappes de couleur sur murs et sol, faisceaux, halos
+function drawRender() {   // la pièce éclairée, style maquette claire : parquet, murs crème, nappes douces
   const cv = $("#planRender"), ctx = cv.getContext("2d"), W = cv.width = 480, H = cv.height = 480;
   $("#planHint").textContent = "Rendu d'ambiance : à peu près ce que donne la pièce une fois éclairée.";
   const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
@@ -5602,13 +5602,20 @@ function drawRender() {   // la pièce éclairée : nappes de couleur sur murs e
   const BACK = [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]];
   const LEFT = [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]];
   const F_FLOOR = path(FLOOR), F_BACK = path(BACK), F_LEFT = path(LEFT);
-  let g = ctx.createRadialGradient(S4(50), S4(74), 10, S4(50), S4(74), S4(58));
-  g.addColorStop(0, "#23242b"); g.addColorStop(1, "#0f1013");
-  ctx.fillStyle = g; ctx.fill(F_FLOOR);
+  let g = ctx.createRadialGradient(S4(50), S4(55), 40, S4(50), S4(55), S4(75));
+  g.addColorStop(0, "#f2eee7"); g.addColorStop(1, "#e3ded4");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
-  g.addColorStop(0, "#27282f"); g.addColorStop(1, "#131418");
-  ctx.fillStyle = g; ctx.fill(F_BACK); ctx.fill(F_LEFT);
-  ctx.strokeStyle = "#3a3b40"; ctx.lineWidth = 1.5;
+  g.addColorStop(0, "#f7f4ef"); g.addColorStop(1, "#e9e4d9");
+  ctx.fillStyle = g; ctx.fill(F_BACK);
+  g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
+  g.addColorStop(0, "#f1ece3"); g.addColorStop(1, "#e0d7c6");
+  ctx.fillStyle = g; ctx.fill(F_LEFT);
+  ctx.fillStyle = "#d9c09c"; ctx.fill(F_FLOOR);
+  ctx.save(); ctx.clip(F_FLOOR); ctx.strokeStyle = "rgba(150,120,85,.5)"; ctx.lineWidth = 1;
+  for (let f = 0.15; f < 1; f += 0.15) { const A = P4(-1, -1 + 2 * f, -1), B = P4(1, -1 + 2 * f, -1); ctx.beginPath(); ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); ctx.stroke(); }
+  ctx.restore();
+  ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.lineWidth = 1;
   ctx.stroke(F_FLOOR); ctx.stroke(F_BACK); ctx.stroke(F_LEFT);
   const { rub, single } = planDevs(), feux = [];
   rub.forEach(([d, cs]) => { const zh = chanZ(cs[0]);
@@ -5620,58 +5627,66 @@ function drawRender() {   // la pièce éclairée : nappes de couleur sur murs e
     const A = P4(x, y, z);
     ctx.save(); ctx.clip(face);
     const gg = ctx.createRadialGradient(A[0], A[1], 4, A[0], A[1], r);
-    gg.addColorStop(0, rgba(col, a)); gg.addColorStop(0.45, rgba(col, a * 0.32)); gg.addColorStop(1, rgba(col, 0));
+    gg.addColorStop(0, rgba(col, a)); gg.addColorStop(0.55, rgba(col, a * 0.3)); gg.addColorStop(1, rgba(col, 0));
     ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
     ctx.restore();
   };
-  ctx.globalCompositeOperation = "lighter";
+  const ombre = (face, x, y, r, a) => {
+    const A = P4(x, y, -1);
+    ctx.save(); ctx.clip(face);
+    const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], r);
+    gg.addColorStop(0, `rgba(90,80,70,${a})`); gg.addColorStop(1, "rgba(90,80,70,0)");
+    ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  };
   feux.forEach(fx => {
-    const r = S4(9 + (fx.z + 1) * 4.5);
-    wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.34);
-    wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.4), fx.col, r * 0.85, 0.3);
-    wash(F_LEFT, -1, fx.y, Math.max(fx.z, -0.4), fx.col, r * 0.85, 0.26);
+    const r = S4(8 + (fx.z + 1) * 4);
+    wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.3);
+    wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.26);
+    wash(F_LEFT, -1, fx.y, Math.max(fx.z, -0.4), fx.col, r * 0.9, 0.22);
   });
+  ombre(F_BACK, 0, 1, S4(9), 0.1); ombre(F_LEFT, -1, 0, S4(9), 0.1); ombre(F_FLOOR, 0, 0, S4(14), 0.08);
   const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
-  const cx = tv.reduce((a, p) => a + p[0], 0) / 4, cy = tv.reduce((a, p) => a + p[1], 0) / 4, cz = tv.reduce((a, p) => a + p[2], 0) / 4;
-  const ecran = tv.map(p => [cx + (p[0] - cx) * 0.78, cy + (p[1] - cy) * 0.78, cz + (p[2] - cz) * 0.78]);
-  const T = P4(cx, 1, cz);
-  const halo = ctx.createRadialGradient(T[0], T[1], 4, T[0], T[1], S4(22));
-  halo.addColorStop(0, rgba(pal[0], 0.55)); halo.addColorStop(1, rgba(pal[0], 0));
-  ctx.fillStyle = halo; ctx.fill(F_BACK);
-  ctx.fillStyle = "#050506"; ctx.fill(path(tv));
-  ctx.fillStyle = rgba(pal[0], 0.5); ctx.fill(path(ecran));
-  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (!q) return;
-    const fx = feux.find(f => f.nom === c.name); if (!fx || fx.z < -0.5) return;
-    const A = P4(fx.x, fx.y, fx.z), G = P4(fx.x, fx.y, -1);
-    const bg = ctx.createLinearGradient(A[0], A[1], G[0], G[1]);
-    bg.addColorStop(0, rgba(fx.col, 0.15)); bg.addColorStop(1, rgba(fx.col, 0));
-    ctx.fillStyle = bg;
-    ctx.beginPath(); ctx.moveTo(A[0] - 5, A[1]); ctx.lineTo(A[0] + 5, A[1]);
-    ctx.lineTo(G[0] + 15, G[1]); ctx.lineTo(G[0] - 15, G[1]); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = rgba(fx.col, 0.22);
-    ctx.beginPath(); ctx.ellipse(G[0], G[1], 12, 5, 0, 0, 7); ctx.fill();
-  }));
+  const T = P4(0, 1, 0);
+  ctx.save(); ctx.clip(F_BACK);
+  const halo = ctx.createRadialGradient(T[0], T[1], 4, T[0], T[1], S4(20));
+  halo.addColorStop(0, rgba(pal[0], 0.3)); halo.addColorStop(1, rgba(pal[0], 0));
+  ctx.fillStyle = halo; ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+  ctx.fillStyle = "#1e1e22"; ctx.fill(path(tv));
+  ctx.strokeStyle = "rgba(120,112,100,.6)"; ctx.stroke(path(tv));
+  rub.forEach(([d, cs]) => { const r = PED.rubans[d], pts = [];
+    for (let j = 0; j <= 60; j++) { const q = alongP(r, j / 60, PED.dims); pts.push(P4(q[0] * 2 - 1, 1 - q[1] * 2, chanZ(cs[0]))); }
+    ctx.strokeStyle = "rgba(255,253,248,.55)"; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath(); pts.forEach((A, i) => i ? ctx.lineTo(A[0], A[1]) : ctx.moveTo(A[0], A[1])); ctx.stroke(); });
   feux.forEach(fx => {
-    const A = P4(fx.x, fx.y, fx.z);
-    const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], fx.ruban ? 16 : 30);
-    gg.addColorStop(0, rgba(fx.col, 0.9)); gg.addColorStop(1, rgba(fx.col, 0));
-    ctx.fillStyle = gg;
-    ctx.beginPath(); ctx.arc(A[0], A[1], fx.ruban ? 16 : 30, 0, 7); ctx.fill();
-  });
-  ctx.globalCompositeOperation = "source-over";
-  feux.forEach(fx => {
-    const A = P4(fx.x, fx.y, fx.z);
-    ctx.fillStyle = "#fff";
-    ctx.beginPath(); ctx.arc(A[0], A[1], fx.ruban ? 5 : 8, 0, 7); ctx.fill();
     if (!fx.ruban) {
-      ctx.font = "600 15px system-ui"; ctx.textAlign = "center";
-      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.85)";
-      ctx.strokeText(fx.nom.slice(0, 14), A[0], A[1] - 22);
-      ctx.fillStyle = "#f2f2f5";
-      ctx.fillText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+      const A = P4(fx.x, fx.y, fx.z), G = P4(fx.x, fx.y, -1);
+      ctx.fillStyle = "rgba(90,80,70,.12)";
+      ctx.beginPath(); ctx.ellipse(G[0], G[1], 13, 5, 0, 0, 7); ctx.fill();
+      const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], 24);
+      gg.addColorStop(0, rgba(fx.col, 0.35)); gg.addColorStop(1, rgba(fx.col, 0));
+      ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(A[0], A[1], 24, 0, 7); ctx.fill();
+      ctx.fillStyle = fx.col;
+      ctx.beginPath(); ctx.arc(A[0], A[1], 7, 0, 7); ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.beginPath(); ctx.arc(A[0], A[1], 3, 0, 7); ctx.fill();
+    } else {
+      const A = P4(fx.x, fx.y, fx.z);
+      ctx.fillStyle = fx.col;
+      ctx.beginPath(); ctx.arc(A[0], A[1], 6, 0, 7); ctx.fill();
     }
   });
-  const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100");
+  ctx.font = "600 15px system-ui"; ctx.textAlign = "center";
+  feux.forEach(fx => {
+    if (fx.ruban) return;
+    const A = P4(fx.x, fx.y, fx.z);
+    ctx.lineWidth = 4; ctx.strokeStyle = "rgba(255,255,255,.9)";
+    ctx.strokeText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+    ctx.fillStyle = "#57534e";
+    ctx.fillText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+  });
 }
 function drawPlan() {
   $("#planSvg").classList.toggle("hidden", planView === "render");
