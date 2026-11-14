@@ -5013,8 +5013,8 @@ button:active{transform:scale(.96);opacity:.82}
   <section class="view" data-view="plan">
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t" id="planTitle">Plan</span><button class="txtbtn" id="planSave">OK</button></div>
     <div class="pad" style="padding-top:14px">
-      <div class="proom"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg></div>
-      <div class="seg" style="margin:10px 0 0"><button id="view2d" class="on">Vue de dessus</button><button id="view3d">Vue 3D</button></div>
+      <div class="proom"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg><canvas id="planRender" class="hidden" style="width:100%;border-radius:12px;display:block"></canvas></div>
+      <div class="seg" style="margin:10px 0 0"><button id="view2d" class="on">Vue de dessus</button><button id="view3d">Vue 3D</button><button id="viewRender">Rendu</button></div>
       <p class="hint" id="planHint" style="margin:10px 4px 0">Fais glisser les lampes sur le plan.</p>
       <div id="planRubans"></div>
       <button class="row" id="planReset" style="margin-top:18px;background:var(--card);border-radius:16px;min-height:56px;justify-content:center;color:var(--blue);font-weight:600">Reprendre les positions de l'app Hue</button>
@@ -5381,7 +5381,7 @@ async function renderPlan() {
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
     PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) }, heights: { ...(pl.heights || {}) } };
-    planView = "2d"; $("#view2d").classList.add("on"); $("#view3d").classList.remove("on");
+    planView = "2d"; ["view2d", "view3d", "viewRender"].forEach((id, i) => $("#" + id).classList.toggle("on", i === 0));
     COLORTEST = null;
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
@@ -5527,9 +5527,10 @@ function colorField(pts, cols, W, H) {   // image de fond (calculée une fois pa
   return FIELD.url;
 }
 let planView = "2d";
-function setPlanView(v) { planView = v; $("#view2d").classList.toggle("on", v === "2d"); $("#view3d").classList.toggle("on", v === "3d"); if (typeof PED !== "undefined" && PED) drawPlan(); }
+function setPlanView(v) { planView = v; $("#view2d").classList.toggle("on", v === "2d"); $("#view3d").classList.toggle("on", v === "3d"); $("#viewRender").classList.toggle("on", v === "render"); if (typeof PED !== "undefined" && PED) drawPlan(); }
 $("#view2d").onclick = () => setPlanView("2d");
 $("#view3d").onclick = () => setPlanView("3d");
+$("#viewRender").onclick = () => setPlanView("render");
 function isoSetup() {   // projection isométrique : x de gauche à droite, y du fond vers la TV, z en hauteur
   const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0;
   const k = dw && dd ? Math.max(0.5, Math.min(1.25, dd / dw)) : 1;
@@ -5542,24 +5543,34 @@ function chanZ(c) {   // hauteur d'un canal : réglage de sa lampe (pièce) ou p
 }
 function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mur gauche, lampes à leur hauteur
   const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
-  $("#planHint").textContent = "Vue 3D : chaque lampe à sa hauteur (fil à plomb jusqu'au sol). Reviens en vue de dessus pour les déplacer.";
+  $("#planHint").textContent = "Vue 3D : chaque lampe à sa hauteur. Reviens en vue de dessus pour les déplacer.";
   const f = v => v.toFixed(1);
-  const poly = pts => pts.map(p => { const A = P(p[0], p[1], p[2]); return f(A[0]) + "," + f(A[1]); }).join(" ");
+  const XY = p => { const A = P(p[0], p[1], p[2]); return f(A[0]) + "," + f(A[1]); };
+  const poly = pts => pts.map(XY).join(" ");
   const seg2 = (a, b, extra) => { const A = P(a[0], a[1], a[2]), B = P(b[0], b[1], b[2]); return `<line x1="${f(A[0])}" y1="${f(A[1])}" x2="${f(B[0])}" y2="${f(B[1])}"${extra}/>`; };
-  let h = `<polygon points="${poly([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]])}" fill="#1b1c20" stroke="#3a3b40" stroke-width=".5"/>`;
-  h += seg2([-1, 0, -1], [1, 0, -1], ` stroke="#2c2c30" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
-  h += seg2([0, -1, -1], [0, 1, -1], ` stroke="#2c2c30" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
-  h += `<polygon points="${poly([[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]])}" fill="#232329" opacity=".55" stroke="#3a3b40" stroke-width=".5"/>`;
-  h += `<polygon points="${poly([[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]])}" fill="#232329" opacity=".35" stroke="#3a3b40" stroke-width=".5"/>`;
-  h += `<polygon points="${poly([[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]])}" fill="#0b0b0d" stroke="#4a4b52" stroke-width=".6"/>`;
+  const inset = (pts, t) => { const c = [0, 0, 0]; pts.forEach(p => { c[0] += p[0] / pts.length; c[1] += p[1] / pts.length; c[2] += p[2] / pts.length; }); return pts.map(p => [c[0] + (p[0] - c[0]) * (1 - t), c[1] + (p[1] - c[1]) * (1 - t), c[2] + (p[2] - c[2]) * (1 - t)]); };
+  let h = `<defs><radialGradient id="isofloor"><stop offset="0" stop-color="#24252b"/><stop offset="1" stop-color="#141416"/></radialGradient>`
+    + `<linearGradient id="isowall" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b2c33"/><stop offset="1" stop-color="#17181c"/></linearGradient>`
+    + `<radialGradient id="isoglow"><stop offset="0" stop-color="#fff" stop-opacity=".85"/><stop offset=".45" stop-color="#fff" stop-opacity=".22"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>`
+    + `<linearGradient id="isobeam" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".3"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>`;
+  h += `<polygon points="${poly([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]])}" fill="url(#isofloor)" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += seg2([-1, 0, -1], [1, 0, -1], ` stroke="#33333a" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
+  h += seg2([0, -1, -1], [0, 1, -1], ` stroke="#33333a" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
+  h += `<polygon points="${poly([[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]])}" fill="url(#isowall)" opacity=".55" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += `<polygon points="${poly([[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]])}" fill="url(#isowall)" opacity=".32" stroke="#3a3b40" stroke-width=".5"/>`;
+  const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
+  h += `<polygon points="${poly(tv)}" fill="#0b0b0d" stroke="#4a4b52" stroke-width=".6"/>`;
+  h += `<polygon points="${poly(inset(tv, 0.22))}" fill="${pal[0]}" opacity=".3"/>`;
   const { rub, single } = planDevs();
+  const dot = (A, col, r) => `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="${(r + 1.6).toFixed(1)}" fill="${col}" opacity=".28"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="${r}" fill="${col}" stroke="#fff" stroke-width=".45"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r=".6" fill="#fff" opacity=".9"/>`;
   rub.forEach(([d, cs]) => {
     const r = PED.rubans[d], zh = chanZ(cs[0]), pts = [];
     for (let j = 0; j <= 60; j++) { const q = alongP(r, j / 60, PED.dims); pts.push([q[0] * 2 - 1, 1 - q[1] * 2, zh]); }
-    h += `<polyline points="${poly(pts)}" fill="none" stroke="#8e8e93" stroke-width="1.4"/>`;
+    h += `<polyline points="${poly(pts)}" fill="none" stroke="#fff" stroke-width="3.2" opacity=".16" stroke-linecap="round"/>`;
+    h += `<polyline points="${poly(pts)}" fill="none" stroke="#d7d7de" stroke-width="1.1" stroke-linecap="round"/>`;
     cs.forEach((c, i) => { const q = pos[c.id]; if (!q) return; const A = P(q.p[0] * 2 - 1, 1 - q.p[1] * 2, zh);
       const col = (CT && CT.segments[i]) || (i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade");
-      h += `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="1.7" fill="${col}"/>`; });
+      h += dot(A, col, 1.6) + `<text x="${f(A[0])}" y="${f(A[1] - 3.4)}" text-anchor="middle" font-size="2.8" font-weight="700" fill="#fff" stroke="#000" stroke-width=".7" style="paint-order:stroke">${i + 1}</text>`; });
   });
   const lamps = [];
   single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (q) lamps.push([c, q.p[0] * 2 - 1, 1 - q.p[1] * 2, chanZ(c)]); }));
@@ -5567,13 +5578,103 @@ function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mu
   lamps.forEach(([c, wx, wy, wz]) => {
     const A = P(wx, wy, wz), G = P(wx, wy, -1);
     const col = (CT && CT.spots[c.light || c.id]) || boost(pal[Math.min(pal.length - 1, Math.floor((wx + 1) / 2 * pal.length))], 190);
-    h += seg2([wx, wy, wz], [wx, wy, -1], ` stroke="#55554f" stroke-width=".5" opacity=".7"`);
-    h += `<circle cx="${f(G[0])}" cy="${f(G[1])}" r="1" fill="${col}" opacity=".5"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="3" fill="${col}" stroke="#fff" stroke-width=".6"/><text x="${f(A[0])}" y="${f(A[1] - 4.4)}" text-anchor="middle" font-size="3.6" fill="#c7c7cc">${esc(c.name.slice(0, 14))}</text>`;
+    const dx = G[0] - A[0], dy = G[1] - A[1], L = Math.hypot(dx, dy);
+    if (L > 1) {
+      const nx = -dy / L, ny = dx / L;
+      h += `<polygon points="${f(A[0] + nx * 1.1)},${f(A[1] + ny * 1.1)} ${f(A[0] - nx * 1.1)},${f(A[1] - ny * 1.1)} ${f(G[0] - nx * 3)},${f(G[1] - ny * 3)} ${f(G[0] + nx * 3)},${f(G[1] + ny * 3)}" fill="url(#isobeam)" opacity=".5"/>`;
+    }
+    h += `<ellipse cx="${f(G[0])}" cy="${f(G[1])}" rx="3.2" ry="1.2" fill="${col}" opacity=".22"/>`;
+    h += `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="5.2" fill="url(#isoglow)" opacity=".5"/>`;
+    h += `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="2.9" fill="${col}" stroke="#fff" stroke-width=".6"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="1" fill="#fff"/>`;
+    h += `<text x="${f(A[0])}" y="${f(A[1] - 4.6)}" text-anchor="middle" font-size="3.6" fill="#ececf0" stroke="#000" stroke-width=".8" style="paint-order:stroke">${esc(c.name.slice(0, 14))}</text>`;
   });
   const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100"); svg.innerHTML = h;
 }
+function drawRender() {   // la pièce éclairée : nappes de couleur sur murs et sol, faisceaux, halos
+  const cv = $("#planRender"), ctx = cv.getContext("2d"), W = cv.width = 480, H = cv.height = 480;
+  $("#planHint").textContent = "Rendu d'ambiance : à peu près ce que donne la pièce une fois éclairée.";
+  const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
+  const S4 = v => v * 4.8, P4 = (x, y, z) => { const A = P(x, y, z); return [A[0] * 4.8, A[1] * 4.8]; };
+  const rgba = (hex, a) => { const c = hexRgb(hex); return `rgba(${c[0]},${c[1]},${c[2]},${a})`; };
+  const path = pts => { const p = new Path2D(); pts.forEach((q, i) => { const A = P4(q[0], q[1], q[2]); i ? p.lineTo(A[0], A[1]) : p.moveTo(A[0], A[1]); }); p.closePath(); return p; };
+  const FLOOR = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]];
+  const BACK = [[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]];
+  const LEFT = [[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]];
+  const F_FLOOR = path(FLOOR), F_BACK = path(BACK), F_LEFT = path(LEFT);
+  let g = ctx.createRadialGradient(S4(50), S4(74), 10, S4(50), S4(74), S4(58));
+  g.addColorStop(0, "#23242b"); g.addColorStop(1, "#0f1013");
+  ctx.fillStyle = g; ctx.fill(F_FLOOR);
+  g = ctx.createLinearGradient(0, S4(28), 0, S4(92));
+  g.addColorStop(0, "#27282f"); g.addColorStop(1, "#131418");
+  ctx.fillStyle = g; ctx.fill(F_BACK); ctx.fill(F_LEFT);
+  ctx.strokeStyle = "#3a3b40"; ctx.lineWidth = 1.5;
+  ctx.stroke(F_FLOOR); ctx.stroke(F_BACK); ctx.stroke(F_LEFT);
+  const { rub, single } = planDevs(), feux = [];
+  rub.forEach(([d, cs]) => { const zh = chanZ(cs[0]);
+    cs.forEach((c, i) => { const q = pos[c.id]; if (q) feux.push({ x: q.p[0] * 2 - 1, y: 1 - q.p[1] * 2, z: zh, col: (CT && CT.segments[i]) || pal[i % pal.length], ruban: true }); }); });
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (!q) return;
+    const x = q.p[0] * 2 - 1, y = 1 - q.p[1] * 2;
+    feux.push({ x, y, z: chanZ(c), col: (CT && CT.spots[c.light || c.id]) || pal[Math.min(pal.length - 1, Math.floor(q.p[0] * pal.length))], nom: c.name }); }));
+  const wash = (face, x, y, z, col, r, a) => {
+    const A = P4(x, y, z);
+    ctx.save(); ctx.clip(face);
+    const gg = ctx.createRadialGradient(A[0], A[1], 4, A[0], A[1], r);
+    gg.addColorStop(0, rgba(col, a)); gg.addColorStop(1, rgba(col, 0));
+    ctx.fillStyle = gg; ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+  };
+  ctx.globalCompositeOperation = "lighter";
+  feux.forEach(fx => {
+    const r = S4(13 + (fx.z + 1) * 7);
+    wash(F_FLOOR, fx.x, fx.y, -1, fx.col, r, 0.5);
+    wash(F_BACK, fx.x, 1, Math.max(fx.z, -0.2), fx.col, r * 0.8, 0.45);
+    wash(F_LEFT, -1, fx.y, Math.max(fx.z, -0.2), fx.col, r * 0.8, 0.4);
+  });
+  const tv = [[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]];
+  const cx = tv.reduce((a, p) => a + p[0], 0) / 4, cy = tv.reduce((a, p) => a + p[1], 0) / 4, cz = tv.reduce((a, p) => a + p[2], 0) / 4;
+  const ecran = tv.map(p => [cx + (p[0] - cx) * 0.78, cy + (p[1] - cy) * 0.78, cz + (p[2] - cz) * 0.78]);
+  const T = P4(cx, 1, cz);
+  const halo = ctx.createRadialGradient(T[0], T[1], 4, T[0], T[1], S4(22));
+  halo.addColorStop(0, rgba(pal[0], 0.55)); halo.addColorStop(1, rgba(pal[0], 0));
+  ctx.fillStyle = halo; ctx.fill(F_BACK);
+  ctx.fillStyle = "#050506"; ctx.fill(path(tv));
+  ctx.fillStyle = rgba(pal[0], 0.5); ctx.fill(path(ecran));
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (!q) return;
+    const fx = feux.find(f => f.nom === c.name); if (!fx || fx.z < -0.5) return;
+    const A = P4(fx.x, fx.y, fx.z), G = P4(fx.x, fx.y, -1);
+    const bg = ctx.createLinearGradient(A[0], A[1], G[0], G[1]);
+    bg.addColorStop(0, rgba(fx.col, 0.35)); bg.addColorStop(1, rgba(fx.col, 0));
+    ctx.fillStyle = bg;
+    ctx.beginPath(); ctx.moveTo(A[0] - 5, A[1]); ctx.lineTo(A[0] + 5, A[1]);
+    ctx.lineTo(G[0] + 15, G[1]); ctx.lineTo(G[0] - 15, G[1]); ctx.closePath(); ctx.fill();
+  }));
+  feux.forEach(fx => {
+    const A = P4(fx.x, fx.y, fx.z);
+    const gg = ctx.createRadialGradient(A[0], A[1], 2, A[0], A[1], fx.ruban ? 16 : 30);
+    gg.addColorStop(0, rgba(fx.col, 0.9)); gg.addColorStop(1, rgba(fx.col, 0));
+    ctx.fillStyle = gg;
+    ctx.beginPath(); ctx.arc(A[0], A[1], fx.ruban ? 16 : 30, 0, 7); ctx.fill();
+  });
+  ctx.globalCompositeOperation = "source-over";
+  feux.forEach(fx => {
+    const A = P4(fx.x, fx.y, fx.z);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(A[0], A[1], fx.ruban ? 5 : 8, 0, 7); ctx.fill();
+    if (!fx.ruban) {
+      ctx.font = "600 15px system-ui"; ctx.textAlign = "center";
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.85)";
+      ctx.strokeText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+      ctx.fillStyle = "#f2f2f5";
+      ctx.fillText(fx.nom.slice(0, 14), A[0], A[1] - 22);
+    }
+  });
+  const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100");
+}
 function drawPlan() {
+  $("#planSvg").classList.toggle("hidden", planView === "render");
+  $("#planRender").classList.toggle("hidden", planView !== "render");
   if (planView === "3d") return drawIso();
+  if (planView === "render") return drawRender();
   const nSingle = planDevs().single.length;
   $("#planHint").textContent = nSingle ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   // proportions de la pièce : largeur (mur de l'écran) × profondeur, carré si non renseignées
