@@ -5014,6 +5014,7 @@ button:active{transform:scale(.96);opacity:.82}
     <div class="nh"><button class="rb" data-back aria-label="Retour"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12H5M11 5l-7 7 7 7"/></svg></button><span class="t" id="planTitle">Plan</span><button class="txtbtn" id="planSave">OK</button></div>
     <div class="pad" style="padding-top:14px">
       <div class="proom"><span class="front">ÉCRAN · DEVANT</span><svg id="planSvg" viewBox="0 0 100 75"></svg></div>
+      <div class="seg" style="margin:10px 0 0"><button id="view2d" class="on">Vue de dessus</button><button id="view3d">Vue 3D</button></div>
       <p class="hint" id="planHint" style="margin:10px 4px 0">Fais glisser les lampes sur le plan.</p>
       <div id="planRubans"></div>
       <button class="row" id="planReset" style="margin-top:18px;background:var(--card);border-radius:16px;min-height:56px;justify-content:center;color:var(--blue);font-weight:600">Reprendre les positions de l'app Hue</button>
@@ -5380,6 +5381,7 @@ async function renderPlan() {
     try { PLAN = await api(id.startsWith("r:") ? "/api/plan?room=" + encodeURIComponent(id.slice(2)) : "/api/plan?area=" + encodeURIComponent(id)); PLAN.key = id; } catch (e) { toast(e.message); return; }
     const pl = PLAN.plan || {}, clamp = v => Math.max(PM, Math.min(1 - PM, v));
     PED = { rubans: {}, spots: {}, eq: { ...(pl.eq || {}) }, dims: { w: 0, d: 0, ...(pl.dims || {}) }, heights: { ...(pl.heights || {}) } };
+    planView = "2d"; $("#view2d").classList.add("on"); $("#view3d").classList.remove("on");
     COLORTEST = null;
     const { rub, single } = planDevs();
     rub.forEach(([d]) => PED.rubans[d] = { walls: PLAN.type === "room" ? 1 : 4, corner: 0, dir: 1, ...(pl.rubans || {})[d] });
@@ -5388,7 +5390,6 @@ async function renderPlan() {
   $("#planTitle").textContent = "Plan · " + PLAN.name;
   drawPlan();
   const { rub, single } = planDevs();
-  $("#planHint").textContent = single.length ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   const seg = (k, d, opts, cur) => `<div class="seg">${opts.map(([v, n]) => `<button data-rk="${k}" data-rd="${esc(d)}" data-rv="${v}" class="${cur === v ? "on" : ""}">${n}</button>`).join("")}</div>`;
   $("#planRubans").innerHTML = dimsCard() + rub.map(([d, cs]) => { const r = PED.rubans[d]; return `<div class="rcard"><div class="h"><span class="ic" style="width:auto">${icon(lampKind(cs[0].archetype), 22)}</span><span><b>${esc(cs[0].name)}</b><br><small>${PLAN.type === "room" ? (cs[0].sync_segments ? `Synchro : ${cs[0].sync_segments} segments · scènes : ${cs[0].grad_points || 5} points de couleur` : `Dégradé à ${cs[0].grad_points || cs.length} points de couleur · pas encore de zone de synchro`) : `${cs.length} segments dans cette zone${cs[0].max_segments ? ` (max ${cs[0].max_segments})` : ""}${cs[0].grad_points ? ` · ${cs[0].grad_points} points de dégradé` : ""}`}</small></span></div>
     <div class="seg" style="margin-bottom:4px;background:var(--card2)"><button data-ident="${esc(cs[0].light || "")}">Montrer le début</button>${PLAN.type === "room" ? (cs[0].sync_segments ? `<button data-ctest class="${COLORTEST ? "on" : ""}">${COLORTEST ? "Arrêter le test" : "Couleurs par segment"}</button>` : "") : `<button data-ordre>Tester l'ordre</button>`}</div>
@@ -5525,7 +5526,56 @@ function colorField(pts, cols, W, H) {   // image de fond (calculée une fois pa
   FIELD = { key, url: cv.toDataURL() };
   return FIELD.url;
 }
+let planView = "2d";
+function setPlanView(v) { planView = v; $("#view2d").classList.toggle("on", v === "2d"); $("#view3d").classList.toggle("on", v === "3d"); if (typeof PED !== "undefined" && PED) drawPlan(); }
+$("#view2d").onclick = () => setPlanView("2d");
+$("#view3d").onclick = () => setPlanView("3d");
+function isoSetup() {   // projection isométrique : x de gauche à droite, y du fond vers la TV, z en hauteur
+  const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0;
+  const k = dw && dd ? Math.max(0.5, Math.min(1.25, dd / dw)) : 1;
+  return { k, P: (wx, wy, wz) => [50 + (wx - wy * k) * 20, 60 + (wx + wy * k) * 6.5 - wz * 13] };
+}
+function chanZ(c) {   // hauteur d'un canal : réglage de sa lampe (pièce) ou plan de zone enregistré
+  if (PLAN.type === "room") return heightOf(c.dev);
+  const q = (PLAN.plan.ch || {})[c.id], z = q ? +q.z : NaN;
+  return z >= -1 && z <= 1 ? z : 0;
+}
+function drawIso() {   // la pièce en maison de poupée : sol, mur de la TV, mur gauche, lampes à leur hauteur
+  const { k, P } = isoSetup(), pos = planLayout(), pal = palColors(S.settings.palette), CT = COLORTEST;
+  $("#planHint").textContent = "Vue 3D : chaque lampe à sa hauteur (fil à plomb jusqu'au sol). Reviens en vue de dessus pour les déplacer.";
+  const f = v => v.toFixed(1);
+  const poly = pts => pts.map(p => { const A = P(p[0], p[1], p[2]); return f(A[0]) + "," + f(A[1]); }).join(" ");
+  const seg2 = (a, b, extra) => { const A = P(a[0], a[1], a[2]), B = P(b[0], b[1], b[2]); return `<line x1="${f(A[0])}" y1="${f(A[1])}" x2="${f(B[0])}" y2="${f(B[1])}"${extra}/>`; };
+  let h = `<polygon points="${poly([[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1]])}" fill="#1b1c20" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += seg2([-1, 0, -1], [1, 0, -1], ` stroke="#2c2c30" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
+  h += seg2([0, -1, -1], [0, 1, -1], ` stroke="#2c2c30" stroke-width=".4" stroke-dasharray="1.5 1.2"`);
+  h += `<polygon points="${poly([[-1, 1, -1], [1, 1, -1], [1, 1, 1], [-1, 1, 1]])}" fill="#232329" opacity=".55" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += `<polygon points="${poly([[-1, -1, -1], [-1, 1, -1], [-1, 1, 1], [-1, -1, 1]])}" fill="#232329" opacity=".35" stroke="#3a3b40" stroke-width=".5"/>`;
+  h += `<polygon points="${poly([[-0.35, 1, -0.3], [0.35, 1, -0.3], [0.35, 1, 0.3], [-0.35, 1, 0.3]])}" fill="#0b0b0d" stroke="#4a4b52" stroke-width=".6"/>`;
+  const { rub, single } = planDevs();
+  rub.forEach(([d, cs]) => {
+    const r = PED.rubans[d], zh = chanZ(cs[0]), pts = [];
+    for (let j = 0; j <= 60; j++) { const q = alongP(r, j / 60, PED.dims); pts.push([q[0] * 2 - 1, 1 - q[1] * 2, zh]); }
+    h += `<polyline points="${poly(pts)}" fill="none" stroke="#8e8e93" stroke-width="1.4"/>`;
+    cs.forEach((c, i) => { const q = pos[c.id]; if (!q) return; const A = P(q.p[0] * 2 - 1, 1 - q.p[1] * 2, zh);
+      const col = (CT && CT.segments[i]) || (i === 0 ? "#ff5a4a" : i === cs.length - 1 ? "#4b8dff" : "#d9dade");
+      h += `<circle cx="${f(A[0])}" cy="${f(A[1])}" r="1.7" fill="${col}"/>`; });
+  });
+  const lamps = [];
+  single.forEach(([, cs]) => cs.forEach(c => { const q = pos[c.id]; if (q) lamps.push([c, q.p[0] * 2 - 1, 1 - q.p[1] * 2, chanZ(c)]); }));
+  lamps.sort((a, b) => (a[1] + a[2] * k) - (b[1] + b[2] * k));
+  lamps.forEach(([c, wx, wy, wz]) => {
+    const A = P(wx, wy, wz), G = P(wx, wy, -1);
+    const col = (CT && CT.spots[c.light || c.id]) || boost(pal[Math.min(pal.length - 1, Math.floor((wx + 1) / 2 * pal.length))], 190);
+    h += seg2([wx, wy, wz], [wx, wy, -1], ` stroke="#55554f" stroke-width=".5" opacity=".7"`);
+    h += `<circle cx="${f(G[0])}" cy="${f(G[1])}" r="1" fill="${col}" opacity=".5"/><circle cx="${f(A[0])}" cy="${f(A[1])}" r="3" fill="${col}" stroke="#fff" stroke-width=".6"/><text x="${f(A[0])}" y="${f(A[1] - 4.4)}" text-anchor="middle" font-size="3.6" fill="#c7c7cc">${esc(c.name.slice(0, 14))}</text>`;
+  });
+  const svg = $("#planSvg"); svg.setAttribute("viewBox", "0 0 100 100"); svg.innerHTML = h;
+}
 function drawPlan() {
+  if (planView === "3d") return drawIso();
+  const nSingle = planDevs().single.length;
+  $("#planHint").textContent = nSingle ? "Fais glisser les lampes à leur place. La ligne du ruban montre son point de départ (flèche) et son sens." : "La ligne montre le départ du ruban (flèche) et son sens.";
   // proportions de la pièce : largeur (mur de l'écran) × profondeur, carré si non renseignées
   const dw = +PED.dims.w || 0, dd = +PED.dims.d || 0, W = 100, H = dw && dd ? Math.max(35, Math.min(150, 100 * dd / dw)) : 75;
   const pos = planLayout(), pal = palColors(S.settings.palette), X = p => p[0] * W, Y = p => p[1] * H;
